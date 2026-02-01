@@ -19,6 +19,36 @@ pub const MIN_FONT_SIZE: f32 = 10.0;
 /// Maximum font size
 pub const MAX_FONT_SIZE: f32 = 24.0;
 
+/// Default window width
+pub const DEFAULT_WINDOW_WIDTH: f64 = 1000.0;
+
+/// Default window height
+pub const DEFAULT_WINDOW_HEIGHT: f64 = 700.0;
+
+/// Window geometry (size and position)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    /// Window width in logical pixels
+    pub width: f64,
+    /// Window height in logical pixels
+    pub height: f64,
+    /// Window X position (optional, None means let OS decide)
+    pub x: Option<i32>,
+    /// Window Y position (optional, None means let OS decide)
+    pub y: Option<i32>,
+}
+
+impl Default for WindowGeometry {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_WINDOW_WIDTH,
+            height: DEFAULT_WINDOW_HEIGHT,
+            x: None,
+            y: None,
+        }
+    }
+}
+
 /// Color scheme options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ColorScheme {
@@ -91,11 +121,51 @@ impl ColorScheme {
         }
     }
 
+    /// Get the bell indicator tab background color (visual bell)
+    pub fn bell_tab_background(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::from_rgb(100, 60, 40), // Orange-brown tint
+            ColorScheme::Light => egui::Color32::from_rgb(255, 220, 180), // Light orange tint
+        }
+    }
+
     /// Get the accent color (for links, session counts, etc.)
     pub fn accent_color(&self) -> egui::Color32 {
         match self {
             ColorScheme::Dark => egui::Color32::from_rgb(100, 149, 237), // Cornflower blue
             ColorScheme::Light => egui::Color32::from_rgb(65, 105, 225), // Royal blue
+        }
+    }
+
+    /// Get the popup/context menu background color
+    pub fn popup_background(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::from_rgb(45, 45, 45),
+            ColorScheme::Light => egui::Color32::from_rgb(255, 255, 255),
+        }
+    }
+
+    /// Get the popup/context menu border color
+    pub fn popup_border(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::from_rgb(70, 70, 70),
+            ColorScheme::Light => egui::Color32::from_rgb(200, 200, 200),
+        }
+    }
+
+    /// Get the disabled/grayed out text color
+    pub fn disabled_foreground(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::from_rgb(100, 100, 100),
+            ColorScheme::Light => egui::Color32::from_rgb(160, 160, 160),
+        }
+    }
+
+    /// Get the secondary/dimmed text color
+    pub fn secondary_foreground(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::from_rgb(150, 150, 150),
+            ColorScheme::Light => egui::Color32::from_rgb(120, 120, 120),
         }
     }
 }
@@ -114,6 +184,10 @@ pub struct Settings {
     /// Color scheme
     #[serde(default)]
     pub color_scheme: ColorScheme,
+
+    /// Window geometry (size and position)
+    #[serde(default)]
+    pub window_geometry: WindowGeometry,
 }
 
 fn default_font_family() -> String {
@@ -130,6 +204,7 @@ impl Default for Settings {
             font_family: default_font_family(),
             font_size: default_font_size(),
             color_scheme: ColorScheme::default(),
+            window_geometry: WindowGeometry::default(),
         }
     }
 }
@@ -207,6 +282,8 @@ mod tests {
         assert_eq!(settings.font_family, DEFAULT_FONT_FAMILY);
         assert_eq!(settings.font_size, DEFAULT_FONT_SIZE);
         assert_eq!(settings.color_scheme, ColorScheme::Dark);
+        assert_eq!(settings.window_geometry.width, DEFAULT_WINDOW_WIDTH);
+        assert_eq!(settings.window_geometry.height, DEFAULT_WINDOW_HEIGHT);
     }
 
     #[test]
@@ -241,6 +318,12 @@ mod tests {
             font_family: "Menlo".to_string(),
             font_size: 14.0,
             color_scheme: ColorScheme::Light,
+            window_geometry: WindowGeometry {
+                width: 1200.0,
+                height: 800.0,
+                x: Some(100),
+                y: Some(50),
+            },
         };
 
         let toml_str = toml::to_string(&settings).unwrap();
@@ -249,5 +332,31 @@ mod tests {
         assert_eq!(parsed.font_family, "Menlo");
         assert_eq!(parsed.font_size, 14.0);
         assert_eq!(parsed.color_scheme, ColorScheme::Light);
+        assert_eq!(parsed.window_geometry.width, 1200.0);
+        assert_eq!(parsed.window_geometry.height, 800.0);
+        assert_eq!(parsed.window_geometry.x, Some(100));
+        assert_eq!(parsed.window_geometry.y, Some(50));
+    }
+
+    #[test]
+    fn test_window_geometry_default() {
+        let geometry = WindowGeometry::default();
+        assert_eq!(geometry.width, DEFAULT_WINDOW_WIDTH);
+        assert_eq!(geometry.height, DEFAULT_WINDOW_HEIGHT);
+        assert_eq!(geometry.x, None);
+        assert_eq!(geometry.y, None);
+    }
+
+    #[test]
+    fn test_settings_backward_compatible() {
+        // Test that settings without window_geometry can still be parsed
+        let old_toml = r#"
+font_family = "Monaco"
+font_size = 16.0
+color_scheme = "Dark"
+"#;
+        let parsed: Settings = toml::from_str(old_toml).unwrap();
+        assert_eq!(parsed.font_family, "Monaco");
+        assert_eq!(parsed.window_geometry, WindowGeometry::default());
     }
 }
