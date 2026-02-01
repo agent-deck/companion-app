@@ -13,6 +13,10 @@ use std::time::Instant;
 
 /// SVG icons
 const ARROW_LEFT_SVG: &[u8] = include_bytes!("../../assets/icons/arrow-left.svg");
+const REFRESH_SVG: &[u8] = include_bytes!("../../assets/icons/refresh-cw.svg");
+
+/// Auto-reload interval for session list (15 seconds)
+const SESSION_AUTO_RELOAD_SECS: u64 = 15;
 
 /// Cached information about a directory's sessions
 #[derive(Clone, Default)]
@@ -92,6 +96,8 @@ pub enum NewTabState {
     SelectSession {
         path: PathBuf,
         sessions: Vec<ClaudeSession>,
+        /// Timestamp of last session list refresh
+        last_refresh: Instant,
     },
 }
 
@@ -185,8 +191,8 @@ pub fn render_new_tab_page(
         NewTabState::SelectDirectory => {
             render_directory_selection(ui, bookmark_manager, color_scheme, fg_color, &mut cache, &mut state, &mut nav)
         }
-        NewTabState::SelectSession { path, sessions } => {
-            render_session_selection(ui, color_scheme, fg_color, &path, &sessions, &mut state, &mut nav)
+        NewTabState::SelectSession { path, sessions, last_refresh } => {
+            render_session_selection(ui, color_scheme, fg_color, &path, &sessions, last_refresh, &mut state, &mut nav)
         }
     };
 
@@ -621,10 +627,25 @@ fn render_session_selection(
     fg_color: egui::Color32,
     path: &PathBuf,
     sessions: &[ClaudeSession],
+    last_refresh: Instant,
     state: &mut NewTabState,
     nav: &mut KeyboardNavState,
 ) -> Option<NewTabAction> {
     let mut action = None;
+
+    // Check if we need to auto-reload (every 15 seconds)
+    let needs_reload = last_refresh.elapsed().as_secs() >= SESSION_AUTO_RELOAD_SECS;
+    if needs_reload {
+        // Reload sessions from disk
+        let fresh_sessions = get_sessions_for_directory(path);
+        *state = NewTabState::SelectSession {
+            path: path.clone(),
+            sessions: fresh_sessions,
+            last_refresh: Instant::now(),
+        };
+        // Request repaint to show updated sessions
+        ui.ctx().request_repaint();
+    }
 
     // Total selectable items: "Start New" button + all sessions
     let item_count = 1 + sessions.len();
@@ -652,16 +673,10 @@ fn render_session_selection(
                         resume_session: Some(String::new()),
                     });
                 } else if let Some(session) = sessions.get(idx - 1) {
-                    // Session selected
-                    let is_most_recent = idx == 1;
-                    let resume_session = if is_most_recent {
-                        None // Use --continue
-                    } else {
-                        Some(session.session_id.clone())
-                    };
+                    // Session selected - always use --resume with session ID
                     action = Some(NewTabAction::OpenDirectory {
                         path: path.clone(),
-                        resume_session,
+                        resume_session: Some(session.session_id.clone()),
                     });
                 }
             }
@@ -688,26 +703,54 @@ fn render_session_selection(
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
         ui.add_space(20.0);
 
-            // Header with back button and path
-            ui.horizontal(|ui| {
-                let back_response = ui.add(
-                    egui::Image::from_bytes("bytes://arrow-left.svg", ARROW_LEFT_SVG)
-                        .fit_to_exact_size(egui::vec2(18.0, 18.0))
-                        .tint(fg_color)
-                        .sense(egui::Sense::click()),
-                );
-                if back_response.on_hover_text("Back to directory selection").clicked() {
-                    *state = NewTabState::SelectDirectory;
-                }
+            // Header with back button, path, and reload button
+            let header_height = 24.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), header_height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let back_response = ui.add(
+                        egui::Image::from_bytes("bytes://arrow-left.svg", ARROW_LEFT_SVG)
+                            .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                            .tint(fg_color)
+                            .sense(egui::Sense::click()),
+                    );
+                    if back_response.on_hover_text("Back to directory selection").clicked() {
+                        *state = NewTabState::SelectDirectory;
+                    }
 
-                ui.add_space(8.0);
+                    ui.add_space(8.0);
 
-                ui.label(
-                    egui::RichText::new(shorten_path(path))
-                        .size(16.0)
-                        .color(fg_color),
-                );
-            });
+                    ui.label(
+                        egui::RichText::new(shorten_path(path))
+                            .size(16.0)
+                            .color(fg_color),
+                    );
+
+                    // Spacer to push reload button to the right
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let reload_response = ui.add(
+                            egui::Image::from_bytes("bytes://refresh-cw.svg", REFRESH_SVG)
+                                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                .tint(if ui.ctx().input(|i| i.pointer.any_down()) {
+                                    egui::Color32::GRAY
+                                } else {
+                                    fg_color
+                                })
+                                .sense(egui::Sense::click()),
+                        );
+                        if reload_response.on_hover_text("Reload session list").clicked() {
+                            // Reload sessions from disk
+                            let fresh_sessions = get_sessions_for_directory(path);
+                            *state = NewTabState::SelectSession {
+                                path: path.clone(),
+                                sessions: fresh_sessions,
+                                last_refresh: Instant::now(),
+                            };
+                        }
+                    });
+                },
+            );
 
             ui.add_space(20.0);
             ui.separator();
@@ -716,7 +759,7 @@ fn render_session_selection(
             // "Start New Session" button (index 0)
             let new_session_selected = nav.selected_index == Some(0);
             let (new_rect, new_response) = ui.allocate_exact_size(
-                egui::vec2(max_width - 10.0, 44.0),
+                egui::vec2(ui.available_width(), 44.0),
                 egui::Sense::click(),
             );
 
@@ -778,7 +821,7 @@ fn render_session_selection(
                     .id_salt("session_list_scroll")
                     .max_height(scroll_height)
                     .show(ui, |ui| {
-                        ui.set_min_width(max_width - 10.0);
+                        let item_width = ui.available_width();
 
                         for (idx, session) in sessions.iter().enumerate() {
                             let is_most_recent = idx == 0;
@@ -786,7 +829,7 @@ fn render_session_selection(
                             let is_selected = nav.selected_index == Some(idx + 1);
 
                             let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(max_width - 10.0, 56.0),
+                                egui::vec2(item_width, 56.0),
                                 egui::Sense::click(),
                             );
 
@@ -849,18 +892,11 @@ fn render_session_selection(
                                 );
                             }
 
-                            // Click opens directly
+                            // Click opens directly - always use --resume with session ID
                             if response.clicked() {
-                                // For most recent session, use --continue (None) which is more reliable
-                                // For other sessions, use --resume with specific ID
-                                let resume_session = if is_most_recent {
-                                    None // Will use --continue
-                                } else {
-                                    Some(session.session_id.clone())
-                                };
                                 action = Some(NewTabAction::OpenDirectory {
                                     path: path.clone(),
-                                    resume_session,
+                                    resume_session: Some(session.session_id.clone()),
                                 });
                             }
 
@@ -897,6 +933,7 @@ fn handle_directory_click(path: &PathBuf, state: &mut NewTabState) -> Option<New
             *state = NewTabState::SelectSession {
                 path: path.clone(),
                 sessions,
+                last_refresh: Instant::now(),
             };
             None
         }
