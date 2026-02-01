@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Debug files
+*.log
+*.dSYM/
+
+# Coverage and profiling
+*.profraw
+*.profdata
+coverage/
