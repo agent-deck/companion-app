@@ -39,7 +39,7 @@ use wezterm_cell::color::ColorAttribute;
 use wezterm_cell::Hyperlink;
 use wezterm_surface::CursorShape;
 use wezterm_term::color::ColorPalette;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, MouseButton, Modifiers, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
@@ -75,6 +75,19 @@ pub type InputSender = mpsc::UnboundedSender<Vec<u8>>;
 /// Callback type for PTY resize notifications
 pub type ResizeCallback = Box<dyn Fn(u16, u16) + Send + Sync>;
 
+use crate::core::claude_sessions::{find_most_recent_session, get_sessions_for_directory, ClaudeSession};
+
+/// Context menu state for right-click popup
+#[derive(Default)]
+pub struct ContextMenuState {
+    pub is_open: bool,
+    pub position: egui::Pos2,
+    pub submenu_open: bool,
+    pub available_sessions: Vec<ClaudeSession>,
+    /// Time when menu was opened (to prevent immediate close)
+    pub opened_time: f64,
+}
+
 /// Actions that can be triggered from the terminal UI
 #[derive(Debug, Clone)]
 pub enum TerminalAction {
@@ -85,7 +98,7 @@ pub enum TerminalAction {
     /// Switch to a tab by session ID
     SwitchTab(SessionId),
     /// Open a directory in a new or current tab
-    /// resume_session: None = fresh start, Some(id) = --resume {session-id}
+    /// resume_session: None = --continue, Some("") = fresh start, Some(id) = --resume {session-id}
     OpenDirectory { path: PathBuf, resume_session: Option<String> },
     /// Browse for a directory using native dialog
     BrowseDirectory,
@@ -101,6 +114,16 @@ pub enum TerminalAction {
     OpenSettings,
     /// Apply settings
     ApplySettings(Settings),
+    /// Copy selected text to clipboard
+    Copy,
+    /// Paste from clipboard
+    Paste,
+    /// Open fresh session from current directory
+    FreshSessionCurrentDir,
+    /// Load a specific Claude session by ID
+    LoadSession { session_id: String },
+    /// Save tabs to persistent storage
+    SaveTabs,
 }
 
 /// Terminal window state managed within the main app
@@ -157,6 +180,8 @@ pub struct TerminalWindowState {
     pending_actions: Vec<TerminalAction>,
     /// Whether egui image loaders have been installed
     image_loaders_installed: bool,
+    /// Context menu state for right-click popup
+    context_menu: ContextMenuState,
 }
 
 impl TerminalWindowState {
@@ -195,6 +220,7 @@ impl TerminalWindowState {
             hovered_hyperlink: None,
             pending_actions: Vec::new(),
             image_loaders_installed: false,
+            context_menu: ContextMenuState::default(),
         }
     }
 
@@ -279,6 +305,46 @@ impl TerminalWindowState {
         }
     }
 
+    /// Try to resolve the actual Claude session ID for a fresh session
+    ///
+    /// When a fresh session is started (claude_session_id == Some("")), we need to
+    /// discover the actual session ID from Claude's session index after it starts.
+    fn try_resolve_session_id(&mut self, session_id: SessionId) {
+        let working_dir = {
+            let session = match self.session_manager.get_session(session_id) {
+                Some(s) => s,
+                None => return,
+            };
+
+            // Only resolve if we have a start time and it's been at least 1 second
+            let start = match session.session_start_time {
+                Some(t) => t,
+                None => return,
+            };
+
+            if start.elapsed().as_secs() < 1 {
+                return; // Wait a bit for session to be indexed
+            }
+
+            session.working_directory.clone()
+        };
+
+        // Try to find the most recent session
+        if let Some(found_id) = find_most_recent_session(&working_dir) {
+            if let Some(session) = self.session_manager.get_session_mut(session_id) {
+                info!(
+                    "Resolved session {} to Claude session ID: {}",
+                    session_id, found_id
+                );
+                session.claude_session_id = Some(found_id);
+                session.needs_session_resolution = false;
+            }
+
+            // Trigger save to persist the resolved ID
+            self.pending_actions.push(TerminalAction::SaveTabs);
+        }
+    }
+
     pub fn is_visible(&self) -> bool {
         self.visible.load(Ordering::Relaxed)
     }
@@ -323,6 +389,11 @@ impl TerminalWindowState {
         }
     }
 
+    /// Send input bytes to the active session's PTY (public wrapper)
+    pub fn send_to_active_pty(&self, data: &[u8]) {
+        self.send_to_pty(data);
+    }
+
     /// Scroll the view (positive = scroll up into history, negative = scroll down)
     pub fn scroll_view(&self, delta: i32) {
         if let Some(session_info) = self.session_manager.active_session() {
@@ -351,9 +422,35 @@ impl TerminalWindowState {
         self.is_selecting = false;
     }
 
-    /// Check if there is an active selection
+    /// Check if there is an active selection with actual content
     pub fn has_selection(&self) -> bool {
-        self.selection_start.is_some() && self.selection_end.is_some()
+        match (self.selection_start, self.selection_end) {
+            (Some(start), Some(end)) => start != end,
+            _ => false,
+        }
+    }
+
+    /// Open context menu at the specified position
+    fn open_context_menu(&mut self, x: f32, y: f32) {
+        // Cache available sessions for the current directory (limit to 5 most recent)
+        if let Some(session) = self.session_manager.active_session() {
+            let mut sessions = get_sessions_for_directory(&session.working_directory);
+            sessions.truncate(5);
+            self.context_menu.available_sessions = sessions;
+        } else {
+            self.context_menu.available_sessions = Vec::new();
+        }
+
+        self.context_menu.position = egui::Pos2::new(x, y);
+        self.context_menu.is_open = true;
+        self.context_menu.submenu_open = false;
+    }
+
+    /// Close context menu
+    fn close_context_menu(&mut self) {
+        self.context_menu.is_open = false;
+        self.context_menu.submenu_open = false;
+        self.context_menu.opened_time = 0.0;
     }
 
     /// Select all text in the terminal
@@ -377,7 +474,7 @@ impl TerminalWindowState {
     }
 
     /// Get selected text from terminal
-    fn get_selection_text(&self) -> Option<String> {
+    pub fn get_selection_text(&self) -> Option<String> {
         let (start, end) = match (self.selection_start, self.selection_end) {
             (Some(s), Some(e)) => (s, e),
             _ => return None,
@@ -546,10 +643,16 @@ impl TerminalWindowState {
 
         info!("Creating terminal window");
 
-        let window_attrs = WindowAttributes::default()
+        let geometry = &self.settings.window_geometry;
+        let mut window_attrs = WindowAttributes::default()
             .with_title("Agent Deck")
-            .with_inner_size(LogicalSize::new(1000.0, 700.0))
+            .with_inner_size(LogicalSize::new(geometry.width, geometry.height))
             .with_visible(false);
+
+        // Set position if we have saved coordinates
+        if let (Some(x), Some(y)) = (geometry.x, geometry.y) {
+            window_attrs = window_attrs.with_position(LogicalPosition::new(x, y));
+        }
 
         let template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
@@ -671,6 +774,32 @@ impl TerminalWindowState {
         info!("Terminal window created");
     }
 
+    /// Get the current window geometry (size and position)
+    pub fn get_window_geometry(&self) -> Option<crate::core::settings::WindowGeometry> {
+        let window = self.window.as_ref()?;
+        let size = window.inner_size();
+        let scale_factor = window.scale_factor();
+
+        // Convert physical size to logical
+        let logical_width = size.width as f64 / scale_factor;
+        let logical_height = size.height as f64 / scale_factor;
+
+        // Get position (may fail on some platforms)
+        let position = window.outer_position().ok().map(|pos| {
+            // Convert physical position to logical
+            let logical_x = (pos.x as f64 / scale_factor) as i32;
+            let logical_y = (pos.y as f64 / scale_factor) as i32;
+            (logical_x, logical_y)
+        });
+
+        Some(crate::core::settings::WindowGeometry {
+            width: logical_width,
+            height: logical_height,
+            x: position.map(|(x, _)| x),
+            y: position.map(|(_, y)| y),
+        })
+    }
+
     /// Handle window event - returns true if event was consumed
     pub fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
         if let Some(ref mut egui_glow) = self.egui_glow {
@@ -693,6 +822,26 @@ impl TerminalWindowState {
                 }
 
                 if event.state == ElementState::Pressed {
+                    // Close context menu on Escape
+                    if let Key::Named(NamedKey::Escape) = &event.logical_key {
+                        if self.context_menu.is_open {
+                            self.close_context_menu();
+                            if let Some(ref window) = self.window {
+                                window.request_redraw();
+                            }
+                            return true;
+                        }
+                    }
+
+                    // Close context menu on any other key input
+                    if self.context_menu.is_open {
+                        self.close_context_menu();
+                        if let Some(ref window) = self.window {
+                            window.request_redraw();
+                        }
+                        // Don't consume the event, let it be processed normally
+                    }
+
                     // Handle Cmd+T for new tab, Cmd+W for close tab
                     let state = self.modifiers.state();
                     if state.super_key() && !state.control_key() && !state.alt_key() {
@@ -744,6 +893,10 @@ impl TerminalWindowState {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // Don't scroll terminal when context menu is open (let egui handle it)
+                if self.context_menu.is_open {
+                    return true;
+                }
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => *y as i32 * 3,
                     MouseScrollDelta::PixelDelta(pos) => (pos.y / 20.0) as i32,
@@ -759,14 +912,33 @@ impl TerminalWindowState {
             WindowEvent::MouseInput { state, button, .. } => {
                 if *button == MouseButton::Left {
                     if *state == ElementState::Pressed {
-                        if let Some((x, y)) = self.cursor_position {
-                            self.handle_mouse_press(x, y);
-                            if let Some(ref window) = self.window {
-                                window.request_redraw();
+                        // Don't close context menu here - let egui handle it so menu items can be clicked
+                        // The context menu will close itself when clicked outside (handled in render_context_menu)
+                        if !self.context_menu.is_open {
+                            if let Some((x, y)) = self.cursor_position {
+                                self.handle_mouse_press(x, y);
+                                if let Some(ref window) = self.window {
+                                    window.request_redraw();
+                                }
                             }
                         }
                     } else {
-                        self.handle_mouse_release();
+                        if !self.context_menu.is_open {
+                            self.handle_mouse_release();
+                        }
+                    }
+                    return true;
+                } else if *button == MouseButton::Right && *state == ElementState::Pressed {
+                    // Right-click to open context menu
+                    if let Some(session) = self.session_manager.active_session() {
+                        if !session.is_new_tab() {
+                            if let Some((x, y)) = self.cursor_position {
+                                self.open_context_menu(x as f32, y as f32);
+                                if let Some(ref window) = self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                        }
                     }
                     return true;
                 }
@@ -1095,17 +1267,21 @@ impl TerminalWindowState {
         let Some(ref glow_context) = self.glow_context else {
             return;
         };
+
+        // Capture values that need immutable self access before mutable borrow
+        let scroll_offset = self.scroll_offset.load(Ordering::Relaxed) as usize;
+        let font_size = self.font_size;
+        let color_scheme = self.settings.color_scheme;
+        let has_selection_for_menu = self.has_selection();
+
         let Some(ref mut egui_glow) = self.egui_glow else {
             return;
         };
 
-        let scroll_offset = self.scroll_offset.load(Ordering::Relaxed) as usize;
         let cached_char_width = &self.cached_char_width;
         let cached_line_height = &self.cached_line_height;
-        let font_size = self.font_size;
         let glyph_cache = &self.glyph_cache;
         let hovered_hyperlink = &self.hovered_hyperlink;
-        let color_scheme = self.settings.color_scheme;
 
         // Capture selection state for rendering
         let selection = match (self.selection_start, self.selection_end) {
@@ -1124,7 +1300,7 @@ impl TerminalWindowState {
         // Compute disambiguated titles for all sessions
         let display_titles = self.session_manager.compute_display_titles(MAX_TAB_TITLE_LEN);
 
-        // Tuple: (id, title, is_new_tab, is_running, working_dir, is_loading, terminal_title)
+        // Tuple: (id, title, is_new_tab, is_running, working_dir, is_loading, terminal_title, bell_active)
         let sessions_data: Vec<_> = self
             .session_manager
             .sessions()
@@ -1137,6 +1313,7 @@ impl TerminalWindowState {
                 s.working_directory.display().to_string(),
                 s.is_loading,
                 s.terminal_title.clone(),
+                s.bell_active,
             ))
             .collect();
         let active_session_idx = self.session_manager.active_session_index();
@@ -1212,10 +1389,13 @@ impl TerminalWindowState {
                                 ui.set_clip_rect(ui.max_rect());
 
                         // Render only tabs that fit
-                        for (idx, (id, title, _is_new, is_running, working_dir, is_loading, terminal_title)) in sessions_data.iter().take(max_visible_tabs).enumerate() {
+                        for (idx, (id, title, _is_new, is_running, working_dir, is_loading, terminal_title, bell_active)) in sessions_data.iter().take(max_visible_tabs).enumerate() {
                             let is_active = idx == active_session_idx;
                             let tab_bg = if is_active {
                                 color_scheme.active_tab_background()
+                            } else if *bell_active {
+                                // Visual bell indicator
+                                color_scheme.bell_tab_background()
                             } else {
                                 color_scheme.inactive_tab_background()
                             };
@@ -1249,9 +1429,10 @@ impl TerminalWindowState {
 
                             // Close button rect (positioned at right side of tab)
                             let close_size = 18.0;
+                            let close_btn_margin = 4.0;
                             let close_rect = egui::Rect::from_min_size(
                                 egui::pos2(
-                                    tab_rect.right() - close_size - 4.0,
+                                    tab_rect.right() - close_size - close_btn_margin,
                                     tab_rect.center().y - close_size / 2.0,
                                 ),
                                 egui::vec2(close_size, close_size),
@@ -1264,7 +1445,13 @@ impl TerminalWindowState {
                                     .unwrap_or(false);
 
                             // Render tab content inside the allocated area
-                            let content_rect = tab_rect.shrink2(egui::vec2(4.0, 0.0));
+                            // Account for close button space on the right
+                            let content_padding = 4.0;
+                            let close_btn_total_width = close_size + close_btn_margin + content_padding;
+                            let content_rect = egui::Rect::from_min_max(
+                                tab_rect.min + egui::vec2(content_padding, 0.0),
+                                tab_rect.max - egui::vec2(close_btn_total_width, 0.0),
+                            );
                             let mut content_ui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
                             content_ui.set_width(tab_width);
                             content_ui.set_height(TAB_BAR_HEIGHT - 4.0);
@@ -1894,6 +2081,17 @@ impl TerminalWindowState {
                 SettingsModalResult::None => {}
             }
 
+            // Render context menu (if open)
+            if self.context_menu.is_open {
+                let context_actions = render_context_menu(
+                    ctx,
+                    &mut self.context_menu,
+                    color_scheme,
+                    has_selection_for_menu,
+                );
+                new_actions.extend(context_actions);
+            }
+
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         });
 
@@ -1927,8 +2125,10 @@ impl TerminalWindowState {
     pub fn process_notifications(&mut self) {
         use wezterm_term::Alert;
 
-        // Collect title changes from all sessions
+        // Collect title changes and bell events from all sessions
         let mut title_changes: Vec<(SessionId, String)> = Vec::new();
+        let mut bell_sessions: Vec<SessionId> = Vec::new();
+        let active_session_id = self.session_manager.active_session_id();
 
         for session_info in self.session_manager.iter() {
             let session = session_info.session.lock();
@@ -1941,16 +2141,21 @@ impl TerminalWindowState {
                         );
                     }
                     Alert::Bell => {
-                        debug!("Terminal bell");
+                        debug!("Terminal bell for session {}", session_info.id);
+                        // Only show visual bell for non-active tabs
+                        if Some(session_info.id) != active_session_id {
+                            bell_sessions.push(session_info.id);
+                        }
                     }
                     Alert::CurrentWorkingDirectoryChanged => {
                         debug!("Working directory changed");
                     }
                     Alert::WindowTitleChanged(title) => {
                         debug!("Window title changed for session {}: {}", session_info.id, title);
-                        // Skip Claude Code's default title - it's not useful context
-                        if !is_default_claude_title(&title) {
-                            title_changes.push((session_info.id, title));
+                        // Clean once and check if it's useful
+                        let clean = clean_terminal_title(&title);
+                        if !clean.is_empty() && clean != "Claude Code" {
+                            title_changes.push((session_info.id, clean));
                         }
                     }
                     Alert::IconTitleChanged(title) => {
@@ -1959,9 +2164,10 @@ impl TerminalWindowState {
                     Alert::TabTitleChanged(title) => {
                         debug!("Tab title changed for session {}: {:?}", session_info.id, title);
                         if let Some(t) = title {
-                            // Skip Claude Code's default title
-                            if !is_default_claude_title(&t) {
-                                title_changes.push((session_info.id, t));
+                            // Clean once and check if it's useful
+                            let clean = clean_terminal_title(&t);
+                            if !clean.is_empty() && clean != "Claude Code" {
+                                title_changes.push((session_info.id, clean));
                             }
                         }
                     }
@@ -1979,13 +2185,30 @@ impl TerminalWindowState {
         }
 
         // Apply title changes (outside of the immutable iter loop)
-        for (session_id, title) in title_changes {
+        // Titles are already cleaned during collection
+        // Collect session IDs that need resolution
+        let mut sessions_needing_resolution: Vec<SessionId> = Vec::new();
+
+        for (session_id, clean_title) in title_changes {
             if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
-                // Clean the title by removing leading symbols/emojis
-                let clean = clean_terminal_title(&title);
-                if !clean.is_empty() {
-                    session_info.terminal_title = Some(clean);
+                session_info.terminal_title = Some(clean_title);
+
+                // Check if this session needs session ID resolution
+                if session_info.needs_session_resolution {
+                    sessions_needing_resolution.push(session_id);
                 }
+            }
+        }
+
+        // Try to resolve session IDs for fresh sessions
+        for session_id in sessions_needing_resolution {
+            self.try_resolve_session_id(session_id);
+        }
+
+        // Apply bell indicators
+        for session_id in bell_sessions {
+            if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
+                session_info.bell_active = true;
             }
         }
     }
@@ -2015,11 +2238,288 @@ impl Default for TerminalWindowState {
     }
 }
 
-/// Check if a title is Claude Code's default (not useful for display)
-fn is_default_claude_title(title: &str) -> bool {
-    // Claude Code sets "✳ Claude Code" as default - skip it
-    let clean = clean_terminal_title(title);
-    clean == "Claude Code" || clean.is_empty()
+use crate::core::settings::ColorScheme;
+
+/// Render context menu and return any triggered actions
+fn render_context_menu(
+    ctx: &egui::Context,
+    context_menu: &mut ContextMenuState,
+    color_scheme: ColorScheme,
+    has_selection: bool,
+) -> Vec<TerminalAction> {
+    let mut actions = Vec::new();
+    let mut close_menu = false;
+
+    // Get current time
+    let current_time = ctx.input(|i| i.time);
+
+    // If menu just opened, record the time and don't process close events yet
+    if context_menu.opened_time == 0.0 {
+        context_menu.opened_time = current_time;
+    }
+
+    // Don't allow closing for 150ms after opening (prevents immediate close from right-click)
+    let can_close = current_time > context_menu.opened_time + 0.15;
+
+    // Get menu position, clamped to window bounds
+    let screen_rect = ctx.screen_rect();
+    let menu_width = 220.0;
+    let menu_item_height = 28.0;
+    let has_sessions = !context_menu.available_sessions.is_empty();
+
+    // Calculate menu height
+    let menu_height = (5.0 * menu_item_height) + 24.0;
+
+    let mut pos = context_menu.position;
+    if pos.x + menu_width > screen_rect.max.x {
+        pos.x = screen_rect.max.x - menu_width - 10.0;
+    }
+    if pos.y + menu_height > screen_rect.max.y {
+        pos.y = screen_rect.max.y - menu_height - 10.0;
+    }
+
+    // Check clipboard
+    let has_clipboard = Clipboard::new()
+        .ok()
+        .and_then(|mut c| c.get_text().ok())
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+
+    let mut submenu_rect = egui::Rect::NOTHING;
+    let mut load_session_rect = egui::Rect::NOTHING;
+    let submenu_sessions = context_menu.available_sessions.clone();
+
+    // Main context menu using egui's menu styling
+    let menu_response = egui::Area::new(egui::Id::new("context_menu"))
+        .fixed_pos(pos)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .fill(color_scheme.popup_background())
+                .stroke(egui::Stroke::new(1.0, color_scheme.popup_border()))
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(6.0, 6.0))
+                .show(ui, |ui| {
+                    ui.set_width(menu_width - 12.0);
+                    ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 2.0);
+                    ui.style_mut().visuals.widgets.hovered.bg_fill = color_scheme.selection_background();
+
+                    // New Session
+                    let btn = egui::Button::new(
+                        egui::RichText::new("New Session").size(13.0).color(color_scheme.foreground())
+                    )
+                    .fill(egui::Color32::TRANSPARENT)
+                    .min_size(egui::vec2(menu_width - 12.0, menu_item_height));
+
+                    if ui.add(btn).clicked() {
+                        actions.push(TerminalAction::NewTab);
+                        close_menu = true;
+                    }
+
+                    ui.add_space(2.0);
+                    ui.separator();
+                    ui.add_space(2.0);
+
+                    // Fresh Session
+                    let btn = egui::Button::new(
+                        egui::RichText::new("Fresh session from here").size(13.0).color(color_scheme.foreground())
+                    )
+                    .fill(egui::Color32::TRANSPARENT)
+                    .min_size(egui::vec2(menu_width - 12.0, menu_item_height));
+
+                    if ui.add(btn).clicked() {
+                        actions.push(TerminalAction::FreshSessionCurrentDir);
+                        close_menu = true;
+                    }
+
+                    // Load session submenu trigger
+                    let label_text = if has_sessions { "Load recent session  >" } else { "Load recent session" };
+                    let text_color = if has_sessions { color_scheme.foreground() } else { color_scheme.disabled_foreground() };
+
+                    let btn = egui::Button::new(
+                        egui::RichText::new(label_text).size(13.0).color(text_color)
+                    )
+                    .fill(egui::Color32::TRANSPARENT)
+                    .min_size(egui::vec2(menu_width - 12.0, menu_item_height));
+
+                    let load_response = ui.add(btn);
+                    load_session_rect = load_response.rect;
+
+                    ui.add_space(2.0);
+                    ui.separator();
+                    ui.add_space(2.0);
+
+                    // Copy
+                    let text_color = if has_selection { color_scheme.foreground() } else { color_scheme.disabled_foreground() };
+                    let btn = egui::Button::new(
+                        egui::RichText::new("Copy").size(13.0).color(text_color)
+                    )
+                    .fill(egui::Color32::TRANSPARENT)
+                    .min_size(egui::vec2(menu_width - 12.0, menu_item_height));
+
+                    if ui.add(btn).clicked() && has_selection {
+                        actions.push(TerminalAction::Copy);
+                        close_menu = true;
+                    }
+
+                    // Paste
+                    let text_color = if has_clipboard { color_scheme.foreground() } else { color_scheme.disabled_foreground() };
+                    let btn = egui::Button::new(
+                        egui::RichText::new("Paste").size(13.0).color(text_color)
+                    )
+                    .fill(egui::Color32::TRANSPARENT)
+                    .min_size(egui::vec2(menu_width - 12.0, menu_item_height));
+
+                    if ui.add(btn).clicked() && has_clipboard {
+                        actions.push(TerminalAction::Paste);
+                        close_menu = true;
+                    }
+                });
+        });
+
+    let main_menu_rect = menu_response.response.rect;
+
+    // Determine if submenu should be shown
+    let load_session_hovered = ctx.input(|i| {
+        i.pointer.hover_pos().map(|p| load_session_rect.contains(p)).unwrap_or(false)
+    });
+
+    if has_sessions && load_session_hovered {
+        context_menu.submenu_open = true;
+    }
+
+    // Render submenu if open
+    if context_menu.submenu_open && has_sessions {
+        let submenu_x = load_session_rect.right() + 2.0;
+        let submenu_y = load_session_rect.top() - 6.0;
+
+        let submenu_width = 260.0;
+        let submenu_item_height = 44.0;
+        let max_visible_sessions = 8;
+        let visible_sessions = submenu_sessions.len().min(max_visible_sessions);
+        let submenu_height = visible_sessions as f32 * submenu_item_height + 12.0;
+
+        let mut submenu_pos = egui::pos2(submenu_x, submenu_y);
+        if submenu_pos.x + submenu_width > screen_rect.max.x {
+            submenu_pos.x = load_session_rect.left() - submenu_width - 2.0;
+        }
+        if submenu_pos.y + submenu_height > screen_rect.max.y {
+            submenu_pos.y = screen_rect.max.y - submenu_height - 10.0;
+        }
+
+        let submenu_response = egui::Area::new(egui::Id::new("context_submenu"))
+            .fixed_pos(submenu_pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(color_scheme.popup_background())
+                    .stroke(egui::Stroke::new(1.0, color_scheme.popup_border()))
+                    .rounding(6.0)
+                    .inner_margin(egui::Margin::symmetric(6.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.set_width(submenu_width - 12.0);
+                        ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 2.0);
+                        ui.style_mut().visuals.widgets.hovered.bg_fill = color_scheme.selection_background();
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("context_submenu_scroll")
+                            .max_height(max_visible_sessions as f32 * submenu_item_height)
+                            .show(ui, |ui| {
+                                for (idx, session) in submenu_sessions.iter().enumerate() {
+                                    let title = session.display_title();
+                                    let time_str = session.relative_modified_time();
+
+                                    // Truncate title if too long
+                                    let max_title_chars = 35;
+                                    let display_title = if title.chars().count() > max_title_chars {
+                                        format!("{}...", title.chars().take(max_title_chars - 3).collect::<String>())
+                                    } else {
+                                        title
+                                    };
+
+                                    // Use a vertical layout inside a button-like container
+                                    let btn_id = ui.make_persistent_id(format!("session_btn_{}", idx));
+                                    let response = ui.push_id(btn_id, |ui| {
+                                        let (rect, response) = ui.allocate_exact_size(
+                                            egui::vec2(submenu_width - 24.0, submenu_item_height),
+                                            egui::Sense::click(),
+                                        );
+
+                                        // Draw background on hover
+                                        if response.hovered() {
+                                            ui.painter().rect_filled(rect, 4.0, color_scheme.selection_background());
+                                        }
+
+                                        // Draw title and time with clipping
+                                        let clip_rect = rect.shrink(4.0);
+                                        ui.painter().with_clip_rect(clip_rect).text(
+                                            egui::pos2(rect.left() + 8.0, rect.top() + 14.0),
+                                            egui::Align2::LEFT_CENTER,
+                                            &display_title,
+                                            egui::FontId::proportional(12.0),
+                                            if response.hovered() { egui::Color32::WHITE } else { color_scheme.foreground() },
+                                        );
+
+                                        ui.painter().with_clip_rect(clip_rect).text(
+                                            egui::pos2(rect.left() + 8.0, rect.top() + 32.0),
+                                            egui::Align2::LEFT_CENTER,
+                                            &time_str,
+                                            egui::FontId::proportional(10.0),
+                                            if response.hovered() { egui::Color32::from_gray(200) } else { color_scheme.secondary_foreground() },
+                                        );
+
+                                        response
+                                    }).inner;
+
+                                    if response.clicked() {
+                                        actions.push(TerminalAction::LoadSession {
+                                            session_id: session.session_id.clone(),
+                                        });
+                                        close_menu = true;
+                                    }
+                                }
+                            });
+                    });
+            });
+
+        submenu_rect = submenu_response.response.rect;
+    }
+
+    // Check if mouse is outside all menu areas
+    let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
+    if let Some(mouse) = mouse_pos {
+        let expanded_load_rect = load_session_rect.expand(4.0);
+        let in_main_menu = main_menu_rect.contains(mouse);
+        let in_submenu = submenu_rect.contains(mouse);
+        let in_load_item = expanded_load_rect.contains(mouse);
+
+        // Close submenu if mouse is not in relevant areas
+        if context_menu.submenu_open && !in_submenu && !in_load_item {
+            let gap_rect = egui::Rect::from_min_max(
+                egui::pos2(load_session_rect.right(), load_session_rect.top() - 10.0),
+                egui::pos2(submenu_rect.left(), load_session_rect.bottom() + 10.0),
+            );
+            if !gap_rect.contains(mouse) && !in_main_menu {
+                context_menu.submenu_open = false;
+            }
+        }
+
+        // Close menu on left-click outside (after grace period)
+        if can_close {
+            let left_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
+            if left_clicked && !in_main_menu && !in_submenu {
+                close_menu = true;
+            }
+        }
+    }
+
+    if close_menu {
+        context_menu.is_open = false;
+        context_menu.submenu_open = false;
+        context_menu.opened_time = 0.0;
+    }
+
+    actions
 }
 
 /// Clean terminal title by removing leading symbols/emojis

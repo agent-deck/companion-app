@@ -93,7 +93,7 @@ impl App {
     /// Start Claude in PTY for a specific session
     ///
     /// # Arguments
-    /// * `resume_session` - None = fresh start (no flags), Some(id) = --resume {id}
+    /// * `resume_session` - None = --continue, Some("") = fresh start, Some(id) = --resume {id}
     fn start_claude_for_session(
         &mut self,
         session_id: SessionId,
@@ -124,16 +124,40 @@ impl App {
         // Create terminal window if not exists
         self.terminal_window.create_window(event_loop);
 
+        // For fresh sessions (Some("")), generate a UUID upfront.
+        // This ensures we know the session ID immediately and can persist it.
+        // The PTY wrapper will use --session-id <uuid> for new sessions.
+        let (actual_resume_session, needs_session_id_resolution) = match &resume_session {
+            Some(id) if id.is_empty() => {
+                // Fresh session: generate UUID and use it
+                let uuid = uuid::Uuid::new_v4().to_string();
+                info!("Generated UUID for fresh session {}: {}", session_id, uuid);
+
+                // Update SessionInfo with the generated UUID
+                if let Some(session) = self.terminal_window.session_manager.get_session_mut(session_id) {
+                    session.claude_session_id = Some(uuid.clone());
+                }
+
+                (Some(uuid), false)
+            }
+            Some(id) => {
+                // Explicit session ID (resuming) - no resolution needed
+                (Some(id.clone()), false)
+            }
+            None => {
+                // Auto-continue - still need resolution to find which session was continued
+                (None, true)
+            }
+        };
+
         // Create PTY wrapper with custom working directory
         let claude_config = self.config.claude.clone();
-        // The PTY wrapper will use the working directory from the config
-        // We need to modify it to use the session's working directory
         let pty = Arc::new(PtyWrapper::new_with_cwd(
             claude_config,
             self.event_tx.clone(),
             working_directory.clone(),
             session_id,
-            resume_session,
+            actual_resume_session,
         ));
 
         match pty.start() {
@@ -156,6 +180,15 @@ impl App {
 
                 // Mark session as running
                 self.terminal_window.mark_session_started(session_id);
+
+                // Set up resolution tracking for auto-continue sessions (None).
+                // Fresh sessions already have UUIDs assigned; explicit resumes have their IDs.
+                if needs_session_id_resolution {
+                    if let Some(session) = self.terminal_window.session_manager.get_session_mut(session_id) {
+                        session.session_start_time = Some(std::time::Instant::now());
+                        session.needs_session_resolution = true;
+                    }
+                }
 
                 // Update state
                 {
@@ -225,7 +258,7 @@ impl App {
                             .file_name()
                             .and_then(|n| n.to_str())
                             .map(|s| s.to_string())
-                            .unwrap_or_else(|| "Claude".to_string());
+                            .unwrap_or_else(|| "New Session".to_string());
                     }
                     id
                 } else if self.session_ptys.contains_key(&id) {
@@ -265,9 +298,12 @@ impl App {
             .map(|s| (s.id, TabEntry {
                 working_directory: s.working_directory.clone(),
                 title: s.title.clone(),
-                // Convert empty string (explicit fresh) to None (--continue) for persistence
-                // This ensures that after restart, we auto-continue the most recent session
-                claude_session_id: s.claude_session_id.clone().filter(|id| !id.is_empty()),
+                // Preserve session intent:
+                // - None = auto-continue most recent session
+                // - Some("") = explicit fresh start
+                // - Some(id) = resume specific session
+                claude_session_id: s.claude_session_id.clone(),
+                terminal_title: s.terminal_title.clone(),
             }))
             .collect();
 
@@ -305,7 +341,7 @@ impl App {
                 for tab in tab_state.tabs {
                     self.terminal_window
                         .session_manager
-                        .create_placeholder(tab.working_directory, tab.title, tab.claude_session_id);
+                        .create_placeholder(tab.working_directory, tab.title, tab.claude_session_id, tab.terminal_title);
                 }
                 // Set active tab (clamped to valid range)
                 let active = tab_state.active_tab.min(
@@ -381,6 +417,11 @@ impl App {
                     .session_manager
                     .set_active_session(session_id);
 
+                // Clear bell indicator when tab becomes active
+                if let Some(session) = self.terminal_window.session_manager.get_session_mut(session_id) {
+                    session.bell_active = false;
+                }
+
                 // Update window title to reflect active tab
                 self.terminal_window.update_window_title();
 
@@ -424,7 +465,7 @@ impl App {
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .map(|s| s.to_string())
-                                .unwrap_or_else(|| "Claude".to_string());
+                                .unwrap_or_else(|| "New Session".to_string());
                             // Store the claude session ID for persistence
                             s.claude_session_id = resume_session.clone();
                         }
@@ -432,10 +473,20 @@ impl App {
                     }
                     Some((_, false)) => {
                         // Create a new session for this directory
-                        self.terminal_window.session_manager.create_session(path.clone())
+                        let id = self.terminal_window.session_manager.create_session(path.clone());
+                        // Store the claude session ID for persistence
+                        if let Some(s) = self.terminal_window.session_manager.get_session_mut(id) {
+                            s.claude_session_id = resume_session.clone();
+                        }
+                        id
                     }
                     None => {
-                        self.terminal_window.session_manager.create_session(path.clone())
+                        let id = self.terminal_window.session_manager.create_session(path.clone());
+                        // Store the claude session ID for persistence
+                        if let Some(s) = self.terminal_window.session_manager.get_session_mut(id) {
+                            s.claude_session_id = resume_session.clone();
+                        }
+                        id
                     }
                 };
 
@@ -478,6 +529,53 @@ impl App {
                 self.terminal_window.settings = settings.clone();
                 let _ = settings.save();
                 // TODO: Apply font size changes to glyph cache
+            }
+            TerminalAction::Copy => {
+                // Copy selected text to clipboard
+                if let Some(text) = self.terminal_window.get_selection_text() {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(text);
+                    }
+                }
+            }
+            TerminalAction::Paste => {
+                // Paste from clipboard to PTY
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Ok(text) = clipboard.get_text() {
+                        self.terminal_window.send_to_active_pty(text.as_bytes());
+                    }
+                }
+            }
+            TerminalAction::FreshSessionCurrentDir => {
+                // Get current directory and open fresh session
+                if let Some(session) = self.terminal_window.session_manager.active_session() {
+                    let path = session.working_directory.clone();
+                    // Some("") means fresh start (no --continue, no --resume)
+                    self.handle_terminal_action(
+                        TerminalAction::OpenDirectory {
+                            path,
+                            resume_session: Some(String::new()),
+                        },
+                        event_loop,
+                    );
+                }
+            }
+            TerminalAction::LoadSession { session_id } => {
+                // Get current directory and load specific session
+                if let Some(session) = self.terminal_window.session_manager.active_session() {
+                    let path = session.working_directory.clone();
+                    // Some(id) means --resume {id}
+                    self.handle_terminal_action(
+                        TerminalAction::OpenDirectory {
+                            path,
+                            resume_session: Some(session_id),
+                        },
+                        event_loop,
+                    );
+                }
+            }
+            TerminalAction::SaveTabs => {
+                self.save_tabs();
             }
         }
     }
@@ -597,6 +695,13 @@ impl App {
                     }
                     tray::TrayAction::Quit => {
                         info!("Quitting application...");
+                        // Save window geometry before quitting
+                        if let Some(geometry) = self.terminal_window.get_window_geometry() {
+                            self.terminal_window.settings.window_geometry = geometry;
+                            if let Err(e) = self.terminal_window.settings.save() {
+                                error!("Failed to save window geometry: {}", e);
+                            }
+                        }
                         // Save tabs before quitting
                         self.save_tabs();
                         // Stop all sessions
@@ -712,6 +817,13 @@ impl ApplicationHandler for App {
         if self.terminal_window.is_our_window(window_id) {
             match &event {
                 WindowEvent::CloseRequested => {
+                    // Save window geometry before closing
+                    if let Some(geometry) = self.terminal_window.get_window_geometry() {
+                        self.terminal_window.settings.window_geometry = geometry;
+                        if let Err(e) = self.terminal_window.settings.save() {
+                            error!("Failed to save window geometry: {}", e);
+                        }
+                    }
                     // Save tabs when window is closed
                     self.save_tabs();
                     self.terminal_window.hide();
@@ -768,6 +880,44 @@ impl ApplicationHandler for App {
             if let Some(ref window) = self.terminal_window.window {
                 window.request_redraw();
             }
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        info!("Application exiting, saving state...");
+
+        // Save window geometry before exiting
+        if let Some(geometry) = self.terminal_window.get_window_geometry() {
+            self.terminal_window.settings.window_geometry = geometry;
+            if let Err(e) = self.terminal_window.settings.save() {
+                error!("Failed to save window geometry on exit: {}", e);
+            }
+        }
+
+        // Save tabs before closing sessions (preserves resolved session IDs)
+        self.save_tabs();
+
+        // Gracefully stop all Claude sessions by sending Ctrl-D twice
+        // This ensures Claude saves the conversation before exiting
+        for (session_id, session_pty) in &self.session_ptys {
+            if session_pty.pty.is_running() {
+                info!("Sending Ctrl-D to session {} to save conversation", session_id);
+                // First Ctrl-D signals EOF/exit intent
+                if let Err(e) = session_pty.pty.send_key("ctrl-d") {
+                    warn!("Failed to send first Ctrl-D to session {}: {}", session_id, e);
+                }
+                // Brief pause between signals
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                // Second Ctrl-D confirms exit
+                if let Err(e) = session_pty.pty.send_key("ctrl-d") {
+                    warn!("Failed to send second Ctrl-D to session {}: {}", session_id, e);
+                }
+            }
+        }
+
+        // Give Claude a moment to process and save
+        if !self.session_ptys.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
     }
 }
