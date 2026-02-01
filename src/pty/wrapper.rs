@@ -106,10 +106,10 @@ impl PtyWrapper {
             cmd.arg(arg);
         }
 
-        // Handle session resume:
+        // Handle session:
         // - None = --continue (auto-continue most recent, if sessions exist)
-        // - Some("") = fresh start (no flags)
-        // - Some(id) = --resume {id}
+        // - Some(id) with non-empty id = --resume {id} (always resume, trust stored ID)
+        // - Some("") = fresh start, no flags
         match &self.resume_session {
             None => {
                 // Auto-continue most recent session, but only if sessions exist
@@ -123,9 +123,13 @@ impl PtyWrapper {
                 }
             }
             Some(id) if !id.is_empty() => {
-                // Resume specific session
+                // Always use --resume for stored session IDs.
+                // We only store IDs from sessions that were actually created/used,
+                // so they should exist. Using --session-id would incorrectly start
+                // a NEW session instead of resuming.
                 cmd.arg("--resume");
                 cmd.arg(id);
+                info!("Resuming Claude session: {}", id);
             }
             Some(_) => {
                 // Empty string = fresh start, no flags
