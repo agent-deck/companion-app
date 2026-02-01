@@ -49,7 +49,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 const TAB_BAR_HEIGHT: f32 = 32.0;
 
 /// Maximum tab title length
-const MAX_TAB_TITLE_LEN: usize = 20;
+const MAX_TAB_TITLE_LEN: usize = 50; // Generous limit; UI handles actual truncation
 
 /// Convert ColorAttribute to egui Color32 using the provided palette
 fn color_attr_to_egui(
@@ -620,6 +620,23 @@ impl TerminalWindowState {
         let scale_factor = window.scale_factor();
         debug!("Initializing glyph cache with scale_factor {}", scale_factor);
 
+        // Configure egui fonts - keep defaults for proportional (has Unicode support),
+        // add JetBrainsMono for monospace
+        {
+            let mut fonts = egui::FontDefinitions::default();
+            let jetbrains_mono = include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
+            fonts.font_data.insert(
+                "JetBrainsMono".to_owned(),
+                egui::FontData::from_static(jetbrains_mono).into(),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "JetBrainsMono".to_owned());
+            egui_glow.egui_ctx.set_fonts(fonts);
+        }
+
         match GlyphCache::new(scale_factor) {
             Ok(cache) => {
                 let cell_width = cache.cell_width() as f32;
@@ -633,19 +650,7 @@ impl TerminalWindowState {
                 *self.glyph_cache.borrow_mut() = Some(cache);
             }
             Err(e) => {
-                error!("Failed to initialize glyph cache: {}. Falling back to egui text rendering.", e);
-                let mut fonts = egui::FontDefinitions::default();
-                let jetbrains_mono = include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
-                fonts.font_data.insert(
-                    "JetBrainsMono".to_owned(),
-                    egui::FontData::from_static(jetbrains_mono).into(),
-                );
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Monospace)
-                    .or_default()
-                    .insert(0, "JetBrainsMono".to_owned());
-                egui_glow.egui_ctx.set_fonts(fonts);
+                error!("Failed to initialize glyph cache: {}. Will use egui text rendering.", e);
             }
         }
 
@@ -1116,18 +1121,22 @@ impl TerminalWindowState {
         };
 
         // Collect data needed for rendering
-        // Tuple: (id, title, is_new_tab, is_running, working_dir, is_loading)
+        // Compute disambiguated titles for all sessions
+        let display_titles = self.session_manager.compute_display_titles(MAX_TAB_TITLE_LEN);
+
+        // Tuple: (id, title, is_new_tab, is_running, working_dir, is_loading, terminal_title)
         let sessions_data: Vec<_> = self
             .session_manager
             .sessions()
             .iter()
             .map(|s| (
                 s.id,
-                s.display_title(MAX_TAB_TITLE_LEN),
+                display_titles.get(&s.id).cloned().unwrap_or_else(|| s.title.clone()),
                 s.is_new_tab(),
                 s.is_running,
                 s.working_directory.display().to_string(),
                 s.is_loading,
+                s.terminal_title.clone(),
             ))
             .collect();
         let active_session_idx = self.session_manager.active_session_index();
@@ -1172,21 +1181,38 @@ impl TerminalWindowState {
 
                     // Calculate available width for tabs
                     let total_width = ui.available_width();
-                    let right_icons_width = 60.0; // Settings + indicator + padding
+                    let right_icons_width = 70.0; // Settings + indicator + padding
                     let new_tab_btn_width = 32.0;
-                    let tabs_area_width = total_width - right_icons_width - new_tab_btn_width - 4.0;
+                    let tab_spacing = 1.0; // Gap between tabs
+                    let tab_padding = 8.0; // Internal padding per tab
+                    let tabs_area_width = total_width - right_icons_width - new_tab_btn_width - 8.0;
 
-                    // Calculate per-tab width
-                    let num_tabs = sessions_data.len().max(1) as f32;
-                    let min_tab_width = 100.0_f32;
-                    let max_tab_width = 200.0_f32;
-                    let tab_width = (tabs_area_width / num_tabs).clamp(min_tab_width, max_tab_width);
+                    // Calculate per-tab width (including padding) to fill available space
+                    let num_tabs = sessions_data.len().max(1);
+                    let min_tab_width = 108.0_f32; // Minimum total tab width including padding
+                    // Account for spacing between tabs: (n-1) gaps for n tabs
+                    let total_spacing = if num_tabs > 1 { (num_tabs - 1) as f32 * tab_spacing } else { 0.0 };
+                    let available_for_tabs = tabs_area_width - total_spacing;
+                    // Calculate full tab width (including padding)
+                    let full_tab_width = (available_for_tabs / num_tabs as f32).max(min_tab_width);
+                    // Calculate how many tabs actually fit
+                    let max_visible_tabs = ((tabs_area_width + tab_spacing) / (full_tab_width + tab_spacing)).floor() as usize;
+                    // The base tab_width without padding (for internal use)
+                    let tab_width = full_tab_width - tab_padding;
 
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 1.0; // Minimal gap between tabs
+                        ui.spacing_mut().item_spacing.x = tab_spacing;
 
-                        // Render tabs
-                        for (idx, (id, title, _is_new, is_running, working_dir, is_loading)) in sessions_data.iter().enumerate() {
+                        // Constrain tabs + new tab button to their allocated area
+                        let tabs_plus_btn_width = tabs_area_width + new_tab_btn_width + 4.0;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(tabs_plus_btn_width, TAB_BAR_HEIGHT),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_clip_rect(ui.max_rect());
+
+                        // Render only tabs that fit
+                        for (idx, (id, title, _is_new, is_running, working_dir, is_loading, terminal_title)) in sessions_data.iter().take(max_visible_tabs).enumerate() {
                             let is_active = idx == active_session_idx;
                             let tab_bg = if is_active {
                                 color_scheme.active_tab_background()
@@ -1203,7 +1229,7 @@ impl TerminalWindowState {
                             };
 
                             // Allocate the entire tab area with click sensing
-                            let tab_size = egui::vec2(tab_width + 8.0, TAB_BAR_HEIGHT - 4.0);
+                            let tab_size = egui::vec2(full_tab_width, TAB_BAR_HEIGHT - 4.0);
                             let (tab_rect, tab_response) = ui.allocate_exact_size(
                                 tab_size,
                                 egui::Sense::click(),
@@ -1320,7 +1346,8 @@ impl TerminalWindowState {
                                                             .size(13.0)
                                                             .color(text_color),
                                                     )
-                                                    .selectable(false),
+                                                    .selectable(false)
+                                                    .truncate(),
                                                 );
                                             },
                                         );
@@ -1350,8 +1377,20 @@ impl TerminalWindowState {
                                 ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
                             }
 
-                            // Add tooltip with full directory path
-                            tab_response.clone().on_hover_text(working_dir);
+                            // Add tooltip with conversation title (if available) and full directory path
+                            // Skip tooltip for new tabs (empty working directory)
+                            if !working_dir.is_empty() {
+                                let tooltip_text = if let Some(term_title) = terminal_title {
+                                    if !term_title.is_empty() {
+                                        format!("{}\n{}", term_title, working_dir)
+                                    } else {
+                                        working_dir.clone()
+                                    }
+                                } else {
+                                    working_dir.clone()
+                                };
+                                tab_response.clone().on_hover_text(tooltip_text);
+                            }
 
                             // Handle clicks
                             if close_clicked {
@@ -1384,10 +1423,12 @@ impl TerminalWindowState {
                                 })
                                 .min_size(egui::vec2(new_tab_btn_width, TAB_BAR_HEIGHT - 4.0)),
                             )
+                            .on_hover_text("New Tab (Cmd+T)")
                             .clicked()
                         {
                             new_actions.push(TerminalAction::NewTab);
                         }
+                            }); // End of allocate_ui_with_layout for tabs + new tab button
 
                         // Right side: settings and connection indicator
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1883,10 +1924,13 @@ impl TerminalWindowState {
         gl_surface.swap_buffers(gl_context).unwrap();
     }
 
-    pub fn process_notifications(&self) {
+    pub fn process_notifications(&mut self) {
         use wezterm_term::Alert;
 
-        if let Some(session_info) = self.session_manager.active_session() {
+        // Collect title changes from all sessions
+        let mut title_changes: Vec<(SessionId, String)> = Vec::new();
+
+        for session_info in self.session_manager.iter() {
             let session = session_info.session.lock();
             for alert in session.poll_notifications() {
                 match alert {
@@ -1903,13 +1947,23 @@ impl TerminalWindowState {
                         debug!("Working directory changed");
                     }
                     Alert::WindowTitleChanged(title) => {
-                        debug!("Window title changed: {}", title);
+                        debug!("Window title changed for session {}: {}", session_info.id, title);
+                        // Skip Claude Code's default title - it's not useful context
+                        if !is_default_claude_title(&title) {
+                            title_changes.push((session_info.id, title));
+                        }
                     }
                     Alert::IconTitleChanged(title) => {
                         debug!("Icon title changed: {:?}", title);
                     }
                     Alert::TabTitleChanged(title) => {
-                        debug!("Tab title changed: {:?}", title);
+                        debug!("Tab title changed for session {}: {:?}", session_info.id, title);
+                        if let Some(t) = title {
+                            // Skip Claude Code's default title
+                            if !is_default_claude_title(&t) {
+                                title_changes.push((session_info.id, t));
+                            }
+                        }
                     }
                     Alert::SetUserVar { name, value } => {
                         debug!("User var set: {}={}", name, value);
@@ -1920,6 +1974,17 @@ impl TerminalWindowState {
                     _ => {
                         debug!("Other alert received");
                     }
+                }
+            }
+        }
+
+        // Apply title changes (outside of the immutable iter loop)
+        for (session_id, title) in title_changes {
+            if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
+                // Clean the title by removing leading symbols/emojis
+                let clean = clean_terminal_title(&title);
+                if !clean.is_empty() {
+                    session_info.terminal_title = Some(clean);
                 }
             }
         }
@@ -1948,4 +2013,19 @@ impl Default for TerminalWindowState {
     fn default() -> Self {
         Self::new(17.0)
     }
+}
+
+/// Check if a title is Claude Code's default (not useful for display)
+fn is_default_claude_title(title: &str) -> bool {
+    // Claude Code sets "✳ Claude Code" as default - skip it
+    let clean = clean_terminal_title(title);
+    clean == "Claude Code" || clean.is_empty()
+}
+
+/// Clean terminal title by removing leading symbols/emojis
+fn clean_terminal_title(title: &str) -> String {
+    title
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim()
+        .to_string()
 }

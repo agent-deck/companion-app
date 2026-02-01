@@ -90,6 +90,14 @@ impl ColorScheme {
             ColorScheme::Light => egui::Color32::from_rgb(220, 220, 220),
         }
     }
+
+    /// Get the accent color (for links, session counts, etc.)
+    pub fn accent_color(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::from_rgb(100, 149, 237), // Cornflower blue
+            ColorScheme::Light => egui::Color32::from_rgb(65, 105, 225), // Royal blue
+        }
+    }
 }
 
 /// Application settings

@@ -3,11 +3,13 @@
 //! Manages multiple terminal sessions, each with its own PTY, working directory,
 //! and Claude state.
 
+use crate::core::claude_sessions::get_sessions_for_directory;
 use crate::core::state::ClaudeState;
 use crate::terminal::Session;
 use crate::window::InputSender;
 use parking_lot::Mutex;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Unique identifier for a session
@@ -21,6 +23,9 @@ pub struct SessionInfo {
     pub working_directory: PathBuf,
     /// Display title (auto-derived from CWD or user-set)
     pub title: String,
+    /// Terminal-set title (from OSC escape sequence, e.g., Claude Code's status)
+    /// Used as suffix in tab title for disambiguation
+    pub terminal_title: Option<String>,
     /// Terminal session (WezTerm-based)
     pub session: Arc<Mutex<Session>>,
     /// Input sender to PTY (None if session not started)
@@ -48,6 +53,7 @@ impl SessionInfo {
             id,
             working_directory,
             title,
+            terminal_title: None,
             session: Arc::new(Mutex::new(Session::new(0, 120, 50))),
             pty_input_tx: None,
             claude_state: Arc::new(Mutex::new(ClaudeState::default())),
@@ -63,6 +69,7 @@ impl SessionInfo {
             id,
             working_directory: PathBuf::new(),
             title: "New Session".to_string(),
+            terminal_title: None,
             session: Arc::new(Mutex::new(Session::new(0, 120, 50))),
             pty_input_tx: None,
             claude_state: Arc::new(Mutex::new(ClaudeState::default())),
@@ -240,11 +247,358 @@ impl SessionManager {
     pub fn sessions(&self) -> &[SessionInfo] {
         &self.sessions
     }
+
+    /// Compute disambiguated display titles for all sessions
+    ///
+    /// This handles:
+    /// 1. Same-named directories under different paths (e.g., project1/app vs project2/app)
+    /// 2. Same directory with different Claude sessions
+    ///
+    /// Returns a map of session ID to display title
+    pub fn compute_display_titles(&self, max_len: usize) -> HashMap<SessionId, String> {
+        let mut result = HashMap::new();
+
+        // Skip if no sessions
+        if self.sessions.is_empty() {
+            return result;
+        }
+
+        // Step 1: Group sessions by their base directory name
+        let mut groups: HashMap<String, Vec<&SessionInfo>> = HashMap::new();
+        for session in &self.sessions {
+            if session.is_new_tab() {
+                // New tabs just use their title directly
+                result.insert(session.id, session.title.clone());
+                continue;
+            }
+
+            let base_name = session
+                .working_directory
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Unknown")
+                .to_string();
+
+            groups.entry(base_name).or_default().push(session);
+        }
+
+        // Step 2: Process each group
+        for (_base_name, sessions_in_group) in groups {
+            if sessions_in_group.len() == 1 {
+                // No conflict - but still show parent/dir format for context
+                let session = sessions_in_group[0];
+                let title = build_title_with_parent(&session.working_directory, session, max_len);
+                result.insert(session.id, title);
+            } else {
+                // Conflict - need disambiguation
+                disambiguate_sessions(&sessions_in_group, max_len, &mut result);
+            }
+        }
+
+        result
+    }
+}
+
+/// Build a title showing parent/directory format (always includes parent for context)
+fn build_title_with_parent(path: &PathBuf, session: &SessionInfo, max_len: usize) -> String {
+    let base_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Unknown");
+
+    // Get the immediate parent directory name
+    let parent_name = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+
+    let path_title = if let Some(parent) = parent_name {
+        format!("{}/{}", parent, base_name)
+    } else {
+        base_name.to_string()
+    };
+
+    // Add terminal title context if available
+    if let Some(ref term_title) = session.terminal_title {
+        if !term_title.is_empty() {
+            let suffix_max = max_len.saturating_sub(path_title.len() + 2);
+            let short_suffix = if term_title.len() > suffix_max {
+                format!("{}...", &term_title[..suffix_max.saturating_sub(3)])
+            } else {
+                term_title.clone()
+            };
+            return truncate_title(&format!("{}: {}", path_title, short_suffix), max_len);
+        }
+    }
+
+    truncate_title(&path_title, max_len)
 }
 
 impl Default for SessionManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Truncate a title to max length, adding ellipsis if needed
+fn truncate_title(title: &str, max_len: usize) -> String {
+    if title.len() <= max_len {
+        title.to_string()
+    } else {
+        format!("{}...", &title[..max_len.saturating_sub(3)])
+    }
+}
+
+/// Get parent directories as path components, from innermost to outermost
+fn get_parent_components(path: &Path) -> Vec<&str> {
+    path.ancestors()
+        .skip(1) // Skip the path itself
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .collect()
+}
+
+/// Shorten a path for display, using ~ for home directory
+fn shorten_path(path: &Path) -> String {
+    let path_str = path.to_string_lossy();
+
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy();
+        if path_str.starts_with(home_str.as_ref()) {
+            return format!("~{}", &path_str[home_str.len()..]);
+        }
+    }
+
+    path_str.to_string()
+}
+
+/// Disambiguate sessions with the same base directory name
+fn disambiguate_sessions(
+    sessions: &[&SessionInfo],
+    max_len: usize,
+    result: &mut HashMap<SessionId, String>,
+) {
+    // First, group by working directory path to find same-directory conflicts
+    let mut by_path: HashMap<&PathBuf, Vec<&SessionInfo>> = HashMap::new();
+    for session in sessions {
+        by_path
+            .entry(&session.working_directory)
+            .or_default()
+            .push(session);
+    }
+
+    // Check if all sessions are in the same directory
+    if by_path.len() == 1 {
+        // All sessions are for the same directory - disambiguate by Claude session
+        disambiguate_by_session(sessions, max_len, result);
+    } else if by_path.values().all(|v| v.len() == 1) {
+        // All different directories - disambiguate by path
+        disambiguate_by_path(sessions, max_len, result);
+    } else {
+        // Mix: some same directory, some different
+        // First, add path context for different directories
+        // Then, for same-directory groups, add session context
+        for (_path, group) in &by_path {
+            if group.len() == 1 {
+                // Single session for this path - use path disambiguation
+                let session = group[0];
+                let title = build_path_title(&session.working_directory, sessions, max_len);
+                result.insert(session.id, title);
+            } else {
+                // Multiple sessions for same path - need session disambiguation
+                disambiguate_same_path_sessions(group, sessions, max_len, result);
+            }
+        }
+    }
+}
+
+/// Disambiguate sessions that are all in different directories (same base name)
+fn disambiguate_by_path(
+    sessions: &[&SessionInfo],
+    max_len: usize,
+    result: &mut HashMap<SessionId, String>,
+) {
+    for session in sessions {
+        let path_title = build_path_title(&session.working_directory, sessions, max_len);
+
+        // Add terminal title context if available
+        let title = if let Some(ref term_title) = session.terminal_title {
+            if !term_title.is_empty() {
+                build_title_with_suffix(&path_title, term_title, max_len)
+            } else {
+                path_title
+            }
+        } else {
+            path_title
+        };
+
+        result.insert(session.id, title);
+    }
+}
+
+/// Build a title with enough path context to be unique
+fn build_path_title(path: &PathBuf, all_sessions: &[&SessionInfo], max_len: usize) -> String {
+    let base_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Unknown");
+
+    let parent_components = get_parent_components(path);
+
+    // Try adding parent directories one by one until unique
+    for depth in 1..=parent_components.len() {
+        let mut parts: Vec<&str> = parent_components[..depth].iter().copied().collect();
+        parts.reverse();
+        parts.push(base_name);
+        let candidate = parts.join("/");
+
+        // Check if this is unique among all sessions
+        let is_unique = all_sessions
+            .iter()
+            .filter(|s| s.working_directory != *path)
+            .all(|other| {
+                let other_components = get_parent_components(&other.working_directory);
+                let other_base = other
+                    .working_directory
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+
+                if depth > other_components.len() {
+                    return true; // Different depth means unique
+                }
+
+                let mut other_parts: Vec<&str> =
+                    other_components[..depth].iter().copied().collect();
+                other_parts.reverse();
+                other_parts.push(other_base);
+                let other_candidate = other_parts.join("/");
+
+                candidate != other_candidate
+            });
+
+        if is_unique {
+            return truncate_title(&candidate, max_len);
+        }
+    }
+
+    // Fallback: use shortened full path
+    truncate_title(&shorten_path(path), max_len)
+}
+
+/// Disambiguate sessions that are all for the same directory (different Claude sessions)
+fn disambiguate_by_session(
+    sessions: &[&SessionInfo],
+    max_len: usize,
+    result: &mut HashMap<SessionId, String>,
+) {
+    let base_name = sessions
+        .first()
+        .and_then(|s| s.working_directory.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("Unknown");
+
+    // Get Claude session info for each (fallback if no terminal_title)
+    let claude_sessions = sessions
+        .first()
+        .map(|s| get_sessions_for_directory(&s.working_directory))
+        .unwrap_or_default();
+
+    // Build a lookup from session ID to summary
+    let session_summaries: HashMap<&str, String> = claude_sessions
+        .iter()
+        .map(|s| (s.session_id.as_str(), s.display_title()))
+        .collect();
+
+    for session in sessions {
+        // Prefer terminal_title (from OSC) over Claude session metadata
+        let title = if let Some(ref term_title) = session.terminal_title {
+            if !term_title.is_empty() {
+                build_title_with_suffix(base_name, term_title, max_len)
+            } else {
+                build_session_title(session, base_name, &session_summaries, max_len)
+            }
+        } else {
+            build_session_title(session, base_name, &session_summaries, max_len)
+        };
+
+        result.insert(session.id, title);
+    }
+}
+
+/// Build a title with base name and suffix
+fn build_title_with_suffix(base: &str, suffix: &str, max_len: usize) -> String {
+    let suffix_max = max_len.saturating_sub(base.len() + 2);
+    let short_suffix = if suffix.len() > suffix_max {
+        format!("{}...", &suffix[..suffix_max.saturating_sub(3)])
+    } else {
+        suffix.to_string()
+    };
+    truncate_title(&format!("{}: {}", base, short_suffix), max_len)
+}
+
+/// Build a title using Claude session metadata as fallback
+fn build_session_title(
+    session: &SessionInfo,
+    base_name: &str,
+    session_summaries: &HashMap<&str, String>,
+    max_len: usize,
+) -> String {
+    let title = if let Some(ref claude_id) = session.claude_session_id {
+        if claude_id.is_empty() {
+            // Explicit new session
+            format!("{}: New", base_name)
+        } else if let Some(summary) = session_summaries.get(claude_id.as_str()) {
+            // Has a summary - append truncated version
+            build_title_with_suffix(base_name, summary, max_len)
+        } else {
+            // Has session ID but no summary found
+            format!("{}: Session", base_name)
+        }
+    } else {
+        // No explicit session - will auto-continue
+        format!("{}: Continue", base_name)
+    };
+
+    truncate_title(&title, max_len)
+}
+
+/// Disambiguate sessions for the same path when there are also other paths
+fn disambiguate_same_path_sessions(
+    same_path_sessions: &[&SessionInfo],
+    all_sessions: &[&SessionInfo],
+    max_len: usize,
+    result: &mut HashMap<SessionId, String>,
+) {
+    // First, get the path-disambiguated prefix
+    let path = &same_path_sessions[0].working_directory;
+    let path_prefix = build_path_title(path, all_sessions, max_len);
+
+    // Remove trailing components to make room for session context
+    let base = path_prefix
+        .split('/')
+        .last()
+        .unwrap_or(&path_prefix);
+
+    // Get Claude session info (fallback if no terminal_title)
+    let claude_sessions = get_sessions_for_directory(path);
+    let session_summaries: HashMap<&str, String> = claude_sessions
+        .iter()
+        .map(|s| (s.session_id.as_str(), s.display_title()))
+        .collect();
+
+    for session in same_path_sessions {
+        // Prefer terminal_title (from OSC) over Claude session metadata
+        let title = if let Some(ref term_title) = session.terminal_title {
+            if !term_title.is_empty() {
+                build_title_with_suffix(base, term_title, max_len)
+            } else {
+                build_session_title(session, base, &session_summaries, max_len)
+            }
+        } else {
+            build_session_title(session, base, &session_summaries, max_len)
+        };
+
+        result.insert(session.id, title);
     }
 }
 
@@ -314,9 +668,97 @@ mod tests {
 
     #[test]
     fn test_display_title_truncation() {
-        let session = SessionInfo::new(0, PathBuf::from("/very/long/directory/name/here"));
+        // Use a path with a long final component to test truncation
+        let session = SessionInfo::new(0, PathBuf::from("/path/to/very_long_directory_name_here"));
         let title = session.display_title(10);
         assert!(title.len() <= 10);
         assert!(title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_compute_display_titles_unique() {
+        // When all directories have different names, use simple names
+        let mut manager = SessionManager::new();
+        manager.create_session(PathBuf::from("/home/user/project1"));
+        manager.create_session(PathBuf::from("/home/user/project2"));
+        manager.create_session(PathBuf::from("/work/different"));
+
+        let titles = manager.compute_display_titles(50);
+        assert_eq!(titles.len(), 3);
+
+        // All should have simple names since they're unique
+        let values: Vec<_> = titles.values().collect();
+        assert!(values.iter().any(|v| *v == "project1"));
+        assert!(values.iter().any(|v| *v == "project2"));
+        assert!(values.iter().any(|v| *v == "different"));
+    }
+
+    #[test]
+    fn test_compute_display_titles_same_name_different_path() {
+        // When directories have the same name but different paths, disambiguate
+        let mut manager = SessionManager::new();
+        let id1 = manager.create_session(PathBuf::from("/work/project1/app"));
+        let id2 = manager.create_session(PathBuf::from("/work/project2/app"));
+
+        let titles = manager.compute_display_titles(50);
+        assert_eq!(titles.len(), 2);
+
+        // Both should have parent context to disambiguate
+        let title1 = titles.get(&id1).unwrap();
+        let title2 = titles.get(&id2).unwrap();
+
+        assert!(title1.contains("project1") || title1.contains("app"));
+        assert!(title2.contains("project2") || title2.contains("app"));
+        assert_ne!(title1, title2); // They should be different
+    }
+
+    #[test]
+    fn test_compute_display_titles_new_tab() {
+        // New tabs should just show "New Session"
+        let mut manager = SessionManager::new();
+        let id = manager.create_new_tab();
+
+        let titles = manager.compute_display_titles(50);
+        assert_eq!(titles.get(&id), Some(&"New Session".to_string()));
+    }
+
+    #[test]
+    fn test_truncate_title() {
+        assert_eq!(truncate_title("short", 10), "short");
+        assert_eq!(truncate_title("very long title here", 10), "very lo...");
+        assert_eq!(truncate_title("exactly10!", 10), "exactly10!");
+    }
+
+    #[test]
+    fn test_get_parent_components() {
+        let path = PathBuf::from("/home/user/work/project");
+        let components = get_parent_components(&path);
+        // Should be [work, user, home] - innermost to outermost
+        assert_eq!(components, vec!["work", "user", "home"]);
+    }
+
+    #[test]
+    fn test_compute_display_titles_with_terminal_title() {
+        // When a session has a terminal_title set, it should be included in the display
+        let mut manager = SessionManager::new();
+        let id = manager.create_session(PathBuf::from("/home/user/project"));
+
+        // Set the terminal title (simulating OSC title change from Claude)
+        if let Some(session) = manager.get_session_mut(id) {
+            session.terminal_title = Some("Building feature X".to_string());
+        }
+
+        let titles = manager.compute_display_titles(50);
+        let title = titles.get(&id).unwrap();
+
+        // Should include both the directory name and terminal title
+        assert!(title.contains("project"));
+        assert!(title.contains("Building feature X"));
+    }
+
+    #[test]
+    fn test_build_title_with_suffix() {
+        assert_eq!(build_title_with_suffix("app", "Testing", 20), "app: Testing");
+        assert_eq!(build_title_with_suffix("app", "Very long title here", 15), "app: Very lo...");
     }
 }
