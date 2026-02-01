@@ -84,8 +84,9 @@ pub enum TerminalAction {
     CloseTab(SessionId),
     /// Switch to a tab by session ID
     SwitchTab(SessionId),
-    /// Open a directory in a new or current tab (resume = true to continue conversation)
-    OpenDirectory { path: PathBuf, resume: bool },
+    /// Open a directory in a new or current tab
+    /// resume_session: None = fresh start, Some(id) = --resume {session-id}
+    OpenDirectory { path: PathBuf, resume_session: Option<String> },
     /// Browse for a directory using native dialog
     BrowseDirectory,
     /// Add a bookmark
@@ -1132,9 +1133,9 @@ impl TerminalWindowState {
         let active_session_idx = self.session_manager.active_session_index();
         let hid_connected = self.hid_connected;
 
-        // Get active session data
+        // Get active session data (session, claude_state, is_new_tab, session_id)
         let active_session_data = self.session_manager.active_session().map(|s| {
-            (Arc::clone(&s.session), Arc::clone(&s.claude_state), s.is_new_tab())
+            (Arc::clone(&s.session), Arc::clone(&s.claude_state), s.is_new_tab(), s.id)
         });
 
         // Clone bookmark manager for new tab rendering
@@ -1201,22 +1202,49 @@ impl TerminalWindowState {
                                 egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 150)
                             };
 
-                            // Render tab as a frame
-                            let tab_frame = egui::Frame::none()
-                                .fill(tab_bg)
-                                .rounding(egui::Rounding {
+                            // Allocate the entire tab area with click sensing
+                            let tab_size = egui::vec2(tab_width + 8.0, TAB_BAR_HEIGHT - 4.0);
+                            let (tab_rect, tab_response) = ui.allocate_exact_size(
+                                tab_size,
+                                egui::Sense::click(),
+                            );
+
+                            // Draw tab background
+                            ui.painter().rect_filled(
+                                tab_rect,
+                                egui::Rounding {
                                     nw: 4.0,
                                     ne: 4.0,
                                     sw: 0.0,
                                     se: 0.0,
-                                })
-                                .inner_margin(egui::Margin::symmetric(4.0, 0.0));
+                                },
+                                tab_bg,
+                            );
 
-                            let mut close_clicked = false;
-                            let tab_response = tab_frame
-                                .show(ui, |ui| {
-                                    ui.set_width(tab_width);
-                                    ui.set_height(TAB_BAR_HEIGHT - 4.0);
+                            // Close button rect (positioned at right side of tab)
+                            let close_size = 18.0;
+                            let close_rect = egui::Rect::from_min_size(
+                                egui::pos2(
+                                    tab_rect.right() - close_size - 4.0,
+                                    tab_rect.center().y - close_size / 2.0,
+                                ),
+                                egui::vec2(close_size, close_size),
+                            );
+
+                            // Check if close button was clicked
+                            let close_clicked = tab_response.clicked()
+                                && tab_response.interact_pointer_pos()
+                                    .map(|pos| close_rect.contains(pos))
+                                    .unwrap_or(false);
+
+                            // Render tab content inside the allocated area
+                            let content_rect = tab_rect.shrink2(egui::vec2(4.0, 0.0));
+                            let mut content_ui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                            content_ui.set_width(tab_width);
+                            content_ui.set_height(TAB_BAR_HEIGHT - 4.0);
+
+                            {
+                                let ui = &mut content_ui;
 
                                     // Use a horizontal layout with title taking remaining space
                                     ui.horizontal_centered(|ui| {
@@ -1297,41 +1325,43 @@ impl TerminalWindowState {
                                             },
                                         );
 
-                                        // Close button on the right
-                                        let close_btn = ui.add(
-                                            egui::Button::new(
-                                                egui::RichText::new("×")
-                                                    .size(14.0)
-                                                    .color(egui::Color32::GRAY),
-                                            )
-                                            .frame(false)
-                                            .fill(egui::Color32::TRANSPARENT)
-                                            .min_size(egui::vec2(18.0, 18.0)),
-                                        );
-                                        if close_btn.clicked() {
-                                            close_clicked = true;
-                                            new_actions.push(TerminalAction::CloseTab(*id));
-                                        }
+                                        // Space for close button (rendered separately below)
+                                        ui.add_space(close_size + 4.0);
                                     });
-                                })
-                                .response;
+                            }
 
-                            // Set cursor to pointer for tab (not text cursor)
-                            // Check hovered OR contains_pointer (for when mouse is pressed)
-                            if tab_response.hovered() || tab_response.contains_pointer() {
+                            // Draw close button
+                            let close_hovered = ui.rect_contains_pointer(close_rect);
+                            let close_color = if close_hovered {
+                                egui::Color32::WHITE
+                            } else {
+                                egui::Color32::GRAY
+                            };
+                            ui.painter().text(
+                                close_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "×",
+                                egui::FontId::proportional(14.0),
+                                close_color,
+                            );
+
+                            // Set cursor to pointer for tab
+                            if tab_response.hovered() {
                                 ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
                             }
 
                             // Add tooltip with full directory path
-                            let tab_response = tab_response.on_hover_text(working_dir);
+                            tab_response.clone().on_hover_text(working_dir);
 
-                            // Click on tab background to switch (only if close wasn't clicked)
-                            if !close_clicked && tab_response.interact(egui::Sense::click()).clicked() {
+                            // Handle clicks
+                            if close_clicked {
+                                new_actions.push(TerminalAction::CloseTab(*id));
+                            } else if tab_response.clicked() {
                                 new_actions.push(TerminalAction::SwitchTab(*id));
                             }
 
                             // Middle-click to close
-                            if tab_response.interact(egui::Sense::click()).middle_clicked() {
+                            if tab_response.middle_clicked() {
                                 new_actions.push(TerminalAction::CloseTab(*id));
                             }
                         }
@@ -1407,15 +1437,15 @@ impl TerminalWindowState {
                         .inner_margin(8.0),
                 )
                 .show(ctx, |ui| {
-                    if let Some((session, _claude_state, is_new_tab)) = &active_session_data {
+                    if let Some((session, _claude_state, is_new_tab, session_id)) = &active_session_data {
                         if *is_new_tab {
-                            // Render new tab page
+                            // Render new tab page with session_id for per-tab state
                             if let Some(action) =
-                                render_new_tab_page(ui, &bookmark_manager, color_scheme)
+                                render_new_tab_page(ui, &bookmark_manager, color_scheme, *session_id)
                             {
                                 match action {
-                                    NewTabAction::OpenDirectory { path, resume } => {
-                                        new_actions.push(TerminalAction::OpenDirectory { path, resume });
+                                    NewTabAction::OpenDirectory { path, resume_session } => {
+                                        new_actions.push(TerminalAction::OpenDirectory { path, resume_session });
                                     }
                                     NewTabAction::BrowseDirectory => {
                                         new_actions.push(TerminalAction::BrowseDirectory);

@@ -1,5 +1,6 @@
 //! PTY wrapper for spawning and managing Claude CLI
 
+use crate::core::claude_sessions::get_session_count;
 use crate::core::config::ClaudeConfig;
 use crate::core::events::AppEvent;
 use crate::core::sessions::SessionId;
@@ -32,8 +33,11 @@ pub struct PtyWrapper {
     working_directory: Option<PathBuf>,
     /// Session ID (optional, for per-session events)
     session_id: Option<SessionId>,
-    /// Whether to resume the last conversation (true) or start fresh (false)
-    resume: bool,
+    /// Session to resume:
+    /// - None = --continue (auto-continue most recent session)
+    /// - Some("") = fresh start (no flags, explicit "New Session")
+    /// - Some(id) = --resume {id} (specific session)
+    resume_session: Option<String>,
 }
 
 impl PtyWrapper {
@@ -48,17 +52,20 @@ impl PtyWrapper {
             running: Arc::new(Mutex::new(false)),
             working_directory: None,
             session_id: None,
-            resume: true, // Default to resuming
+            resume_session: None, // Default to fresh start for legacy usage
         }
     }
 
     /// Create a new PTY wrapper with a specific working directory and session ID
+    ///
+    /// # Arguments
+    /// * `resume_session` - None = --continue, Some("") = fresh, Some(id) = --resume {id}
     pub fn new_with_cwd(
         config: ClaudeConfig,
         event_tx: mpsc::UnboundedSender<AppEvent>,
         working_directory: PathBuf,
         session_id: SessionId,
-        resume: bool,
+        resume_session: Option<String>,
     ) -> Self {
         Self {
             master: Arc::new(Mutex::new(None)),
@@ -69,7 +76,7 @@ impl PtyWrapper {
             running: Arc::new(Mutex::new(false)),
             working_directory: Some(working_directory),
             session_id: Some(session_id),
-            resume,
+            resume_session,
         }
     }
 
@@ -99,9 +106,30 @@ impl PtyWrapper {
             cmd.arg(arg);
         }
 
-        // Add --continue flag to resume last conversation (only if resume is true)
-        if self.resume {
-            cmd.arg("--continue");
+        // Handle session resume:
+        // - None = --continue (auto-continue most recent, if sessions exist)
+        // - Some("") = fresh start (no flags)
+        // - Some(id) = --resume {id}
+        match &self.resume_session {
+            None => {
+                // Auto-continue most recent session, but only if sessions exist
+                // (claude --continue fails if no conversations exist)
+                let has_sessions = self.working_directory
+                    .as_ref()
+                    .map(|dir| get_session_count(dir) > 0)
+                    .unwrap_or(false);
+                if has_sessions {
+                    cmd.arg("--continue");
+                }
+            }
+            Some(id) if !id.is_empty() => {
+                // Resume specific session
+                cmd.arg("--resume");
+                cmd.arg(id);
+            }
+            Some(_) => {
+                // Empty string = fresh start, no flags
+            }
         }
 
         // Use provided working directory or fall back to current

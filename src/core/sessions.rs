@@ -31,6 +31,8 @@ pub struct SessionInfo {
     pub is_running: bool,
     /// Whether PTY is currently being started (for loading indicator)
     pub is_loading: bool,
+    /// Claude session ID to resume (None = fresh start, Some(id) = --resume {id})
+    pub claude_session_id: Option<String>,
 }
 
 impl SessionInfo {
@@ -40,7 +42,7 @@ impl SessionInfo {
             .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| "New Tab".to_string());
+            .unwrap_or_else(|| "New Session".to_string());
 
         Self {
             id,
@@ -51,6 +53,7 @@ impl SessionInfo {
             claude_state: Arc::new(Mutex::new(ClaudeState::default())),
             is_running: false,
             is_loading: false,
+            claude_session_id: None,
         }
     }
 
@@ -59,12 +62,13 @@ impl SessionInfo {
         Self {
             id,
             working_directory: PathBuf::new(),
-            title: "New Tab".to_string(),
+            title: "New Session".to_string(),
             session: Arc::new(Mutex::new(Session::new(0, 120, 50))),
             pty_input_tx: None,
             claude_state: Arc::new(Mutex::new(ClaudeState::default())),
             is_running: false,
             is_loading: false,
+            claude_session_id: None,
         }
     }
 
@@ -126,11 +130,17 @@ impl SessionManager {
 
     /// Create a placeholder session (has working directory but PTY not started)
     /// Used for restoring tabs from saved state with lazy loading
-    pub fn create_placeholder(&mut self, working_directory: PathBuf, title: String) -> SessionId {
+    pub fn create_placeholder(
+        &mut self,
+        working_directory: PathBuf,
+        title: String,
+        claude_session_id: Option<String>,
+    ) -> SessionId {
         let id = self.next_id;
         self.next_id += 1;
         let mut session = SessionInfo::new(id, working_directory);
         session.title = title;
+        session.claude_session_id = claude_session_id;
         // is_running remains false - PTY will be started on demand
         self.sessions.push(session);
         id
@@ -299,7 +309,7 @@ mod tests {
 
         let session = manager.get_session(id).unwrap();
         assert!(session.is_new_tab());
-        assert_eq!(session.title, "New Tab");
+        assert_eq!(session.title, "New Session");
     }
 
     #[test]

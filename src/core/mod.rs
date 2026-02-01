@@ -1,6 +1,7 @@
 //! Core module - Application state, configuration, and events
 
 pub mod bookmarks;
+pub mod claude_sessions;
 pub mod config;
 pub mod events;
 pub mod sessions;

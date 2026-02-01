@@ -91,11 +91,14 @@ impl App {
     }
 
     /// Start Claude in PTY for a specific session
+    ///
+    /// # Arguments
+    /// * `resume_session` - None = fresh start (no flags), Some(id) = --resume {id}
     fn start_claude_for_session(
         &mut self,
         session_id: SessionId,
         working_directory: PathBuf,
-        resume: bool,
+        resume_session: Option<String>,
         event_loop: &ActiveEventLoop,
     ) {
         if self.session_ptys.contains_key(&session_id) {
@@ -104,8 +107,8 @@ impl App {
         }
 
         info!(
-            "Starting Claude in PTY for session {} at {:?} (resume={})",
-            session_id, working_directory, resume
+            "Starting Claude in PTY for session {} at {:?} (resume_session={:?})",
+            session_id, working_directory, resume_session
         );
 
         // Mark session as loading
@@ -130,7 +133,7 @@ impl App {
             self.event_tx.clone(),
             working_directory.clone(),
             session_id,
-            resume,
+            resume_session,
         ));
 
         match pty.start() {
@@ -241,8 +244,8 @@ impl App {
             }
         };
 
-        // Default to resuming the conversation when started from tray/HID
-        self.start_claude_for_session(session_id, working_dir, true, event_loop);
+        // Start fresh when started from tray/HID (user can use new tab page for session selection)
+        self.start_claude_for_session(session_id, working_dir, None, event_loop);
     }
 
     /// Save current tabs to persistent storage
@@ -262,6 +265,9 @@ impl App {
             .map(|s| (s.id, TabEntry {
                 working_directory: s.working_directory.clone(),
                 title: s.title.clone(),
+                // Convert empty string (explicit fresh) to None (--continue) for persistence
+                // This ensures that after restart, we auto-continue the most recent session
+                claude_session_id: s.claude_session_id.clone().filter(|id| !id.is_empty()),
             }))
             .collect();
 
@@ -299,7 +305,7 @@ impl App {
                 for tab in tab_state.tabs {
                     self.terminal_window
                         .session_manager
-                        .create_placeholder(tab.working_directory, tab.title);
+                        .create_placeholder(tab.working_directory, tab.title, tab.claude_session_id);
                 }
                 // Set active tab (clamped to valid range)
                 let active = tab_state.active_tab.min(
@@ -358,6 +364,17 @@ impl App {
                 self.terminal_window.update_window_title();
                 // Save tabs after closing
                 self.save_tabs();
+
+                // Start PTY for newly active session if needed (lazy loading)
+                if let Some(new_active) = self.terminal_window.session_manager.active_session() {
+                    let needs_start = !new_active.is_running && !new_active.is_loading && !new_active.is_new_tab();
+                    if needs_start {
+                        let new_session_id = new_active.id;
+                        let working_dir = new_active.working_directory.clone();
+                        let claude_session_id = new_active.claude_session_id.clone();
+                        self.start_claude_for_session(new_session_id, working_dir, claude_session_id, event_loop);
+                    }
+                }
             }
             TerminalAction::SwitchTab(session_id) => {
                 self.terminal_window
@@ -382,11 +399,13 @@ impl App {
                 if needs_start {
                     if let Some(session) = self.terminal_window.session_manager.get_session(session_id) {
                         let working_dir = session.working_directory.clone();
-                        self.start_claude_for_session(session_id, working_dir, true, event_loop);
+                        let claude_session_id = session.claude_session_id.clone();
+                        // Resume the stored session if available
+                        self.start_claude_for_session(session_id, working_dir, claude_session_id, event_loop);
                     }
                 }
             }
-            TerminalAction::OpenDirectory { path, resume } => {
+            TerminalAction::OpenDirectory { path, resume_session } => {
                 // Get the active session info first to avoid borrow conflicts
                 let session_info = self
                     .terminal_window
@@ -406,6 +425,8 @@ impl App {
                                 .and_then(|n| n.to_str())
                                 .map(|s| s.to_string())
                                 .unwrap_or_else(|| "Claude".to_string());
+                            // Store the claude session ID for persistence
+                            s.claude_session_id = resume_session.clone();
                         }
                         id
                     }
@@ -422,7 +443,7 @@ impl App {
                     .session_manager
                     .set_active_session(session_id);
                 self.terminal_window.update_window_title();
-                self.start_claude_for_session(session_id, path, resume, event_loop);
+                self.start_claude_for_session(session_id, path, resume_session, event_loop);
                 // Save tabs after opening a directory
                 self.save_tabs();
             }
@@ -430,7 +451,8 @@ impl App {
                 // Use rfd for native file dialog (default to resume)
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     // Recursively handle the open directory action
-                    self.handle_terminal_action(TerminalAction::OpenDirectory { path, resume: true }, event_loop);
+                    // Start fresh when browsing for a directory (user can use session picker for existing sessions)
+                    self.handle_terminal_action(TerminalAction::OpenDirectory { path, resume_session: None }, event_loop);
                 }
             }
             TerminalAction::AddBookmark(path) => {
@@ -521,7 +543,8 @@ impl App {
                                 if !session.is_new_tab() && !session.is_running {
                                     let session_id = session.id;
                                     let working_dir = session.working_directory.clone();
-                                    self.start_claude_for_session(session_id, working_dir, true, event_loop);
+                                    let claude_session_id = session.claude_session_id.clone();
+                                    self.start_claude_for_session(session_id, working_dir, claude_session_id, event_loop);
                                 }
                             }
                         } else {
@@ -548,7 +571,8 @@ impl App {
                                 if !session.is_new_tab() && !session.is_running {
                                     let session_id = session.id;
                                     let working_dir = session.working_directory.clone();
-                                    self.start_claude_for_session(session_id, working_dir, true, event_loop);
+                                    let claude_session_id = session.claude_session_id.clone();
+                                    self.start_claude_for_session(session_id, working_dir, claude_session_id, event_loop);
                                 }
                             }
                         } else {

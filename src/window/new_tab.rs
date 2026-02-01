@@ -1,16 +1,96 @@
 //! New tab page UI
 //!
 //! Displays bookmarks, recent directories, and directory picker for new tabs.
+//! Now with two-phase selection: first choose a directory, then choose a session.
 
 use crate::core::bookmarks::{Bookmark, BookmarkManager, RecentEntry};
+use crate::core::claude_sessions::{get_session_count, get_sessions_for_directory, ClaudeSession};
 use crate::core::settings::ColorScheme;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
+
+/// Cache for session counts to avoid repeated file reads
+#[derive(Clone)]
+struct SessionCountCache {
+    counts: HashMap<PathBuf, usize>,
+    last_refresh: Instant,
+}
+
+impl Default for SessionCountCache {
+    fn default() -> Self {
+        Self {
+            counts: HashMap::new(),
+            last_refresh: Instant::now(),
+        }
+    }
+}
+
+impl SessionCountCache {
+    /// Check if cache needs refresh (stale after 30 seconds)
+    fn needs_refresh(&self) -> bool {
+        self.last_refresh.elapsed().as_secs() > 30
+    }
+
+    /// Get cached count or load it
+    fn get_count(&mut self, path: &PathBuf) -> usize {
+        if self.needs_refresh() {
+            self.counts.clear();
+            self.last_refresh = Instant::now();
+        }
+
+        if let Some(&count) = self.counts.get(path) {
+            count
+        } else {
+            let count = get_session_count(path);
+            self.counts.insert(path.clone(), count);
+            count
+        }
+    }
+
+    /// Preload counts for multiple directories
+    fn preload(&mut self, paths: &[PathBuf]) {
+        if self.needs_refresh() {
+            self.counts.clear();
+            self.last_refresh = Instant::now();
+        }
+
+        for path in paths {
+            if !self.counts.contains_key(path) {
+                let count = get_session_count(path);
+                self.counts.insert(path.clone(), count);
+            }
+        }
+    }
+}
+
+/// State machine for the new tab UI
+#[derive(Debug, Clone)]
+pub enum NewTabState {
+    /// User is selecting a directory
+    SelectDirectory,
+    /// User is selecting a session for the chosen directory
+    SelectSession {
+        path: PathBuf,
+        sessions: Vec<ClaudeSession>,
+    },
+}
+
+impl Default for NewTabState {
+    fn default() -> Self {
+        Self::SelectDirectory
+    }
+}
 
 /// Actions that can be triggered from the new tab page
 #[derive(Debug, Clone)]
 pub enum NewTabAction {
-    /// Open a directory and start Claude there (with resume flag: true = continue, false = fresh)
-    OpenDirectory { path: PathBuf, resume: bool },
+    /// Open a directory with optional session resume
+    /// None = fresh start, Some(id) = --resume {session-id}
+    OpenDirectory {
+        path: PathBuf,
+        resume_session: Option<String>,
+    },
     /// Open the native directory picker
     BrowseDirectory,
     /// Add a bookmark
@@ -24,18 +104,60 @@ pub enum NewTabAction {
 }
 
 /// Renders the new tab page and returns any action triggered
+/// The session_id is used to maintain separate state per new-tab instance
 pub fn render_new_tab_page(
     ui: &mut egui::Ui,
     bookmark_manager: &BookmarkManager,
     color_scheme: ColorScheme,
+    session_id: usize,
 ) -> Option<NewTabAction> {
-    let mut action = None;
-
     let fg_color = color_scheme.foreground();
 
-    // Get/set fresh session toggle state from egui memory
-    let fresh_session_id = egui::Id::new("new_tab_fresh_session");
-    let mut fresh_session = ui.data_mut(|d| *d.get_temp_mut_or(fresh_session_id, false));
+    // Get/set state from egui memory - keyed by session_id for per-tab state
+    let state_id = egui::Id::new(("new_tab_state", session_id));
+    let cache_id = egui::Id::new("new_tab_session_cache");
+
+    let mut state: NewTabState = ui.data_mut(|d| d.get_temp(state_id).unwrap_or_default());
+    let mut cache: SessionCountCache = ui.data_mut(|d| d.get_temp(cache_id).unwrap_or_default());
+
+    // Preload session counts for visible directories
+    let all_paths: Vec<PathBuf> = bookmark_manager
+        .get_bookmarks()
+        .iter()
+        .map(|b| b.path.clone())
+        .chain(bookmark_manager.get_recent().iter().map(|r| r.path.clone()))
+        .collect();
+    cache.preload(&all_paths);
+
+    let action = match state.clone() {
+        NewTabState::SelectDirectory => {
+            render_directory_selection(ui, bookmark_manager, color_scheme, fg_color, &mut cache, &mut state)
+        }
+        NewTabState::SelectSession {
+            path,
+            sessions,
+        } => {
+            render_session_selection(ui, color_scheme, fg_color, &path, &sessions, &mut state)
+        }
+    };
+
+    // Save state back to memory
+    ui.data_mut(|d| d.insert_temp(state_id, state));
+    ui.data_mut(|d| d.insert_temp(cache_id, cache));
+
+    action
+}
+
+/// Render the directory selection phase
+fn render_directory_selection(
+    ui: &mut egui::Ui,
+    bookmark_manager: &BookmarkManager,
+    color_scheme: ColorScheme,
+    fg_color: egui::Color32,
+    cache: &mut SessionCountCache,
+    state: &mut NewTabState,
+) -> Option<NewTabAction> {
+    let mut action = None;
 
     // Center the content
     ui.vertical_centered(|ui| {
@@ -43,57 +165,13 @@ pub fn render_new_tab_page(
 
         // Title
         ui.label(
-            egui::RichText::new("New Tab")
+            egui::RichText::new("New Session")
                 .size(28.0)
                 .color(fg_color)
                 .strong(),
         );
 
-        ui.add_space(20.0);
-
-        // Session mode toggle
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Session mode:")
-                    .size(14.0)
-                    .color(egui::Color32::GRAY),
-            );
-            ui.add_space(10.0);
-
-            // Resume button
-            let resume_selected = !fresh_session;
-            if ui
-                .add(
-                    egui::SelectableLabel::new(
-                        resume_selected,
-                        egui::RichText::new("Resume conversation")
-                            .size(13.0),
-                    ),
-                )
-                .clicked()
-            {
-                fresh_session = false;
-            }
-
-            ui.add_space(5.0);
-
-            // Fresh button
-            let fresh_selected = fresh_session;
-            if ui
-                .add(
-                    egui::SelectableLabel::new(
-                        fresh_selected,
-                        egui::RichText::new("Fresh session")
-                            .size(13.0),
-                    ),
-                )
-                .clicked()
-            {
-                fresh_session = true;
-            }
-        });
-
-        ui.add_space(20.0);
+        ui.add_space(30.0);
 
         // Browse button
         if ui
@@ -150,9 +228,14 @@ pub fn render_new_tab_page(
                         .max_height(300.0)
                         .show(ui, |ui| {
                             for bookmark in bookmark_manager.get_bookmarks() {
-                                if let Some(a) =
-                                    render_bookmark_item(ui, bookmark, color_scheme, fresh_session)
-                                {
+                                let session_count = cache.get_count(&bookmark.path);
+                                if let Some(a) = render_bookmark_item(
+                                    ui,
+                                    bookmark,
+                                    session_count,
+                                    color_scheme,
+                                    state,
+                                ) {
                                     action = Some(a);
                                 }
                             }
@@ -205,14 +288,15 @@ pub fn render_new_tab_page(
                         .max_height(300.0)
                         .show(ui, |ui| {
                             for recent in bookmark_manager.get_recent() {
-                                let is_bookmarked =
-                                    bookmark_manager.is_bookmarked(&recent.path);
+                                let is_bookmarked = bookmark_manager.is_bookmarked(&recent.path);
+                                let session_count = cache.get_count(&recent.path);
                                 if let Some(a) = render_recent_item(
                                     ui,
                                     recent,
                                     is_bookmarked,
+                                    session_count,
                                     color_scheme,
-                                    fresh_session,
+                                    state,
                                 ) {
                                     action = Some(a);
                                 }
@@ -245,31 +329,241 @@ pub fn render_new_tab_page(
         );
     });
 
-    // Save fresh_session state back to memory
-    ui.data_mut(|d| d.insert_temp(fresh_session_id, fresh_session));
+    action
+}
+
+/// Render the session selection phase
+fn render_session_selection(
+    ui: &mut egui::Ui,
+    color_scheme: ColorScheme,
+    fg_color: egui::Color32,
+    path: &PathBuf,
+    sessions: &[ClaudeSession],
+    state: &mut NewTabState,
+) -> Option<NewTabAction> {
+    let mut action = None;
+
+    // Fixed width for all session items
+    let item_width = 500.0;
+
+    ui.vertical(|ui| {
+        ui.add_space(20.0);
+
+        // Header with back button and path
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("<").size(18.0).color(fg_color),
+                    )
+                    .frame(false),
+                )
+                .on_hover_text("Back to directory selection")
+                .clicked()
+            {
+                *state = NewTabState::SelectDirectory;
+            }
+
+            ui.add_space(8.0);
+
+            ui.label(
+                egui::RichText::new(path.display().to_string())
+                    .size(16.0)
+                    .color(fg_color),
+            );
+        });
+
+        ui.add_space(20.0);
+        ui.separator();
+        ui.add_space(20.0);
+
+        // Center the content
+        ui.vertical_centered(|ui| {
+            // "Start New Session" button - click opens directly
+            let (new_rect, new_response) = ui.allocate_exact_size(
+                egui::vec2(item_width, 44.0),
+                egui::Sense::click(),
+            );
+
+            if ui.is_rect_visible(new_rect) {
+                let bg = if new_response.hovered() {
+                    color_scheme.active_tab_background()
+                } else {
+                    color_scheme.inactive_tab_background()
+                };
+                ui.painter().rect_filled(new_rect, 6.0, bg);
+
+                let text_pos = new_rect.left_center() + egui::vec2(16.0, 0.0);
+                ui.painter().text(
+                    text_pos,
+                    egui::Align2::LEFT_CENTER,
+                    "+",
+                    egui::FontId::proportional(18.0),
+                    egui::Color32::from_rgb(100, 200, 100),
+                );
+                ui.painter().text(
+                    text_pos + egui::vec2(24.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    "Start New Session",
+                    egui::FontId::proportional(15.0),
+                    fg_color,
+                );
+            }
+
+            if new_response.clicked() {
+                // Empty string = explicit fresh start (no --continue flag)
+                action = Some(NewTabAction::OpenDirectory {
+                    path: path.clone(),
+                    resume_session: Some(String::new()),
+                });
+            }
+
+            ui.add_space(20.0);
+
+            if !sessions.is_empty() {
+                ui.label(
+                    egui::RichText::new("Recent Sessions")
+                        .size(14.0)
+                        .color(egui::Color32::GRAY),
+                );
+                ui.add_space(10.0);
+
+                // Session list with scroll - click opens directly
+                egui::ScrollArea::vertical()
+                    .id_salt("session_list_scroll")
+                    .max_height(400.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(item_width);
+
+                        for (idx, session) in sessions.iter().enumerate() {
+                            let is_most_recent = idx == 0;
+
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(item_width, 56.0),
+                                egui::Sense::click(),
+                            );
+
+                            if ui.is_rect_visible(rect) {
+                                let bg = if response.hovered() {
+                                    color_scheme.active_tab_background()
+                                } else {
+                                    color_scheme.inactive_tab_background()
+                                };
+                                ui.painter().rect_filled(rect, 6.0, bg);
+
+                                let title_x = rect.left() + 16.0;
+                                let title_y = rect.top() + 18.0;
+
+                                // Session title
+                                ui.painter().text(
+                                    egui::pos2(title_x, title_y),
+                                    egui::Align2::LEFT_CENTER,
+                                    session.display_title(),
+                                    egui::FontId::proportional(14.0),
+                                    fg_color,
+                                );
+
+                                // "(last session)" label for most recent
+                                if is_most_recent {
+                                    // Measure title width to position label after it
+                                    let title_galley = ui.painter().layout_no_wrap(
+                                        session.display_title().to_string(),
+                                        egui::FontId::proportional(14.0),
+                                        fg_color,
+                                    );
+                                    ui.painter().text(
+                                        egui::pos2(title_x + title_galley.size().x + 8.0, title_y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "(last session)",
+                                        egui::FontId::proportional(12.0),
+                                        egui::Color32::from_rgb(100, 149, 237),
+                                    );
+                                }
+
+                                // Metadata line
+                                ui.painter().text(
+                                    egui::pos2(title_x, rect.top() + 40.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    format!(
+                                        "{} messages  {}",
+                                        session.message_count,
+                                        session.relative_modified_time()
+                                    ),
+                                    egui::FontId::proportional(12.0),
+                                    egui::Color32::GRAY,
+                                );
+                            }
+
+                            // Click opens directly
+                            if response.clicked() {
+                                // For most recent session, use --continue (None) which is more reliable
+                                // For other sessions, use --resume with specific ID
+                                let resume_session = if is_most_recent {
+                                    None // Will use --continue
+                                } else {
+                                    Some(session.session_id.clone())
+                                };
+                                action = Some(NewTabAction::OpenDirectory {
+                                    path: path.clone(),
+                                    resume_session,
+                                });
+                            }
+
+                            ui.add_space(4.0);
+                        }
+                    });
+            }
+        });
+    });
 
     action
+}
+
+/// Handle directory selection - transitions to session picker or opens directly
+fn handle_directory_click(path: &PathBuf, state: &mut NewTabState) -> Option<NewTabAction> {
+    let sessions = get_sessions_for_directory(path);
+
+    match sessions.len() {
+        0 => {
+            // No sessions - start fresh directly (empty string = no flags)
+            Some(NewTabAction::OpenDirectory {
+                path: path.clone(),
+                resume_session: Some(String::new()),
+            })
+        }
+        1 => {
+            // One session - open directly with that session
+            Some(NewTabAction::OpenDirectory {
+                path: path.clone(),
+                resume_session: Some(sessions[0].session_id.clone()),
+            })
+        }
+        _ => {
+            // Multiple sessions - show session picker
+            *state = NewTabState::SelectSession {
+                path: path.clone(),
+                sessions,
+            };
+            None
+        }
+    }
 }
 
 /// Render a bookmark item and return any action triggered
 fn render_bookmark_item(
     ui: &mut egui::Ui,
     bookmark: &Bookmark,
+    session_count: usize,
     color_scheme: ColorScheme,
-    fresh_session_toggle: bool,
+    state: &mut NewTabState,
 ) -> Option<NewTabAction> {
     let mut action = None;
-
-    // Check if Option/Alt is held (for toggling fresh session)
-    let alt_held = ui.input(|i| i.modifiers.alt);
-    // Alt key inverts the toggle setting
-    let resume = if alt_held { fresh_session_toggle } else { !fresh_session_toggle };
 
     let response = ui.horizontal(|ui| {
         // Star icon (filled for bookmarks)
         if ui
             .add(
-                egui::Button::new(egui::RichText::new("★").size(14.0).color(egui::Color32::GOLD))
+                egui::Button::new(egui::RichText::new("*").size(14.0).color(egui::Color32::GOLD))
                     .frame(false),
             )
             .on_hover_text("Remove bookmark")
@@ -289,13 +583,24 @@ fn render_bookmark_item(
             .on_hover_text(bookmark.path.display().to_string())
             .clicked()
         {
-            action = Some(NewTabAction::OpenDirectory { path: bookmark.path.clone(), resume });
+            action = handle_directory_click(&bookmark.path, state);
+        }
+
+        // Session count badge
+        if session_count > 0 {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("[{}]", session_count))
+                        .size(12.0)
+                        .color(egui::Color32::GRAY),
+                );
+            });
         }
     });
 
     // Make the whole row clickable
     if response.response.clicked() && action.is_none() {
-        action = Some(NewTabAction::OpenDirectory { path: bookmark.path.clone(), resume });
+        action = handle_directory_click(&bookmark.path, state);
     }
 
     action
@@ -306,19 +611,15 @@ fn render_recent_item(
     ui: &mut egui::Ui,
     recent: &RecentEntry,
     is_bookmarked: bool,
+    session_count: usize,
     color_scheme: ColorScheme,
-    fresh_session_toggle: bool,
+    state: &mut NewTabState,
 ) -> Option<NewTabAction> {
     let mut action = None;
 
-    // Check if Option/Alt is held (for toggling fresh session)
-    let alt_held = ui.input(|i| i.modifiers.alt);
-    // Alt key inverts the toggle setting
-    let resume = if alt_held { fresh_session_toggle } else { !fresh_session_toggle };
-
     let response = ui.horizontal(|ui| {
         // Star icon (toggle bookmark)
-        let star = if is_bookmarked { "★" } else { "☆" };
+        let star = if is_bookmarked { "*" } else { "o" };
         let star_color = if is_bookmarked {
             egui::Color32::GOLD
         } else {
@@ -355,15 +656,16 @@ fn render_recent_item(
             .on_hover_text(recent.path.display().to_string())
             .clicked()
         {
-            action = Some(NewTabAction::OpenDirectory { path: recent.path.clone(), resume });
+            action = handle_directory_click(&recent.path, state);
         }
 
-        // Close button
+        // Session count badge and close button
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Close button
             if ui
                 .add(
                     egui::Button::new(
-                        egui::RichText::new("×").size(14.0).color(egui::Color32::GRAY),
+                        egui::RichText::new("x").size(14.0).color(egui::Color32::GRAY),
                     )
                     .frame(false),
                 )
@@ -372,12 +674,27 @@ fn render_recent_item(
             {
                 action = Some(NewTabAction::RemoveRecent(recent.path.clone()));
             }
+
+            // Session count badge
+            if session_count > 0 {
+                ui.label(
+                    egui::RichText::new(format!("[{}]", session_count))
+                        .size(12.0)
+                        .color(egui::Color32::GRAY),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new("-")
+                        .size(12.0)
+                        .color(egui::Color32::DARK_GRAY),
+                );
+            }
         });
     });
 
     // Make the whole row clickable
     if response.response.clicked() && action.is_none() {
-        action = Some(NewTabAction::OpenDirectory { path: recent.path.clone(), resume });
+        action = handle_directory_click(&recent.path, state);
     }
 
     action
@@ -391,12 +708,24 @@ mod tests {
     fn test_new_tab_action_variants() {
         let path = PathBuf::from("/test");
 
-        let _ = NewTabAction::OpenDirectory { path: path.clone(), resume: true };
-        let _ = NewTabAction::OpenDirectory { path: path.clone(), resume: false };
+        let _ = NewTabAction::OpenDirectory {
+            path: path.clone(),
+            resume_session: None,
+        };
+        let _ = NewTabAction::OpenDirectory {
+            path: path.clone(),
+            resume_session: Some("session-123".to_string()),
+        };
         let _ = NewTabAction::BrowseDirectory;
         let _ = NewTabAction::AddBookmark(path.clone());
         let _ = NewTabAction::RemoveBookmark(path.clone());
         let _ = NewTabAction::RemoveRecent(path);
         let _ = NewTabAction::ClearRecent;
+    }
+
+    #[test]
+    fn test_new_tab_state_default() {
+        let state = NewTabState::default();
+        assert!(matches!(state, NewTabState::SelectDirectory));
     }
 }

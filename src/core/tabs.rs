@@ -16,6 +16,9 @@ pub struct TabEntry {
     pub working_directory: PathBuf,
     /// Tab title
     pub title: String,
+    /// Claude session ID to resume (None = fresh start)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
 }
 
 /// Persisted tab state
