@@ -1,3 +1,9 @@
+// Hide console window on Windows release builds
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 //! Agent Deck Companion App - Entry Point
 //!
 //! This is the main entry point for the Agent Deck companion application.
@@ -500,9 +506,11 @@ impl App {
                 info!("Hotkey pressed: {:?}", key);
                 match key {
                     hotkey::HotkeyType::ClaudeKey => {
-                        // Toggle terminal window visibility or start Claude if not running
-                        if !self.session_ptys.is_empty() {
-                            self.terminal_window.toggle();
+                        // If window visible, create new tab; otherwise show/start window
+                        if self.terminal_window.is_visible() {
+                            self.handle_terminal_action(TerminalAction::NewTab, event_loop);
+                        } else if !self.session_ptys.is_empty() {
+                            self.terminal_window.show();
                         } else if !self.terminal_window.session_manager.is_empty() {
                             // We have saved tabs but no PTY running - show window and start active tab
                             self.terminal_window.create_window(event_loop);

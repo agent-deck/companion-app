@@ -166,7 +166,6 @@ dependencies = [
  "wezterm-font",
  "wezterm-surface",
  "wezterm-term",
- "windows 0.58.0",
  "winit",
 ]
 

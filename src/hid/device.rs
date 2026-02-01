@@ -272,10 +272,18 @@ fn send_packet_to_device(device: &HidDevice, packet: &HidPacket) -> Result<()> {
     let bytes = packet.as_bytes();
 
     // On macOS/Windows, hidapi requires prepending a 0x00 report ID for devices
-    // that don't use numbered reports (like QMK Raw HID)
-    let mut data = Vec::with_capacity(PACKET_SIZE + 1);
-    data.push(0x00); // Report ID
-    data.extend_from_slice(bytes);
+    // that don't use numbered reports (like QMK Raw HID).
+    // Linux hidraw doesn't need the report ID prefix.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let data = {
+        let mut data = Vec::with_capacity(PACKET_SIZE + 1);
+        data.push(0x00); // Report ID
+        data.extend_from_slice(bytes);
+        data
+    };
+
+    #[cfg(target_os = "linux")]
+    let data = bytes.to_vec();
 
     let written = device
         .write(&data)

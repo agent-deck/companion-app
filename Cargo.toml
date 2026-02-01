@@ -90,8 +90,7 @@ cocoa = "0.26"
 objc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# Windows specific
-windows = { version = "0.58", features = ["Win32_UI_Shell", "Win32_System_Console"] }
+# Windows specific (currently unused, retained for potential future Win32 API needs)
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux specific (for D-Bus, X11/Wayland)
