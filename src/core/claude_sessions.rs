@@ -82,6 +82,21 @@ fn get_project_storage_path(dir: &Path) -> Option<PathBuf> {
     Some(home.join(".claude").join("projects").join(encoded))
 }
 
+/// Find the most recently created session in a directory
+///
+/// Returns the session ID if found. Sessions are sorted by modified date,
+/// so the first one is the most recent.
+pub fn find_most_recent_session(dir: &Path) -> Option<String> {
+    let sessions = get_sessions_for_directory(dir);
+    sessions.first().map(|s| s.session_id.clone())
+}
+
+/// Check if a session with the given ID exists in a directory
+pub fn session_exists(dir: &Path, session_id: &str) -> bool {
+    let sessions = get_sessions_for_directory(dir);
+    sessions.iter().any(|s| s.session_id == session_id)
+}
+
 /// Get sessions for a directory from Claude Code's storage
 ///
 /// Returns sessions sorted by modified date (most recent first).

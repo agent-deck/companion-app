@@ -38,6 +38,12 @@ pub struct SessionInfo {
     pub is_loading: bool,
     /// Claude session ID to resume (None = fresh start, Some(id) = --resume {id})
     pub claude_session_id: Option<String>,
+    /// Whether a bell occurred in this session (for visual bell indicator)
+    pub bell_active: bool,
+    /// Timestamp when fresh session was started (for session ID resolution)
+    pub session_start_time: Option<std::time::Instant>,
+    /// Whether we're waiting to resolve the session ID
+    pub needs_session_resolution: bool,
 }
 
 impl SessionInfo {
@@ -60,6 +66,9 @@ impl SessionInfo {
             is_running: false,
             is_loading: false,
             claude_session_id: None,
+            bell_active: false,
+            session_start_time: None,
+            needs_session_resolution: false,
         }
     }
 
@@ -76,6 +85,9 @@ impl SessionInfo {
             is_running: false,
             is_loading: false,
             claude_session_id: None,
+            bell_active: false,
+            session_start_time: None,
+            needs_session_resolution: false,
         }
     }
 
@@ -142,12 +154,14 @@ impl SessionManager {
         working_directory: PathBuf,
         title: String,
         claude_session_id: Option<String>,
+        terminal_title: Option<String>,
     ) -> SessionId {
         let id = self.next_id;
         self.next_id += 1;
         let mut session = SessionInfo::new(id, working_directory);
         session.title = title;
         session.claude_session_id = claude_session_id;
+        session.terminal_title = terminal_title;
         // is_running remains false - PTY will be started on demand
         self.sessions.push(session);
         id
@@ -677,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_compute_display_titles_unique() {
-        // When all directories have different names, use simple names
+        // When all directories have different names, show parent/dir format for context
         let mut manager = SessionManager::new();
         manager.create_session(PathBuf::from("/home/user/project1"));
         manager.create_session(PathBuf::from("/home/user/project2"));
@@ -686,11 +700,11 @@ mod tests {
         let titles = manager.compute_display_titles(50);
         assert_eq!(titles.len(), 3);
 
-        // All should have simple names since they're unique
+        // All should have parent/dir format for context
         let values: Vec<_> = titles.values().collect();
-        assert!(values.iter().any(|v| *v == "project1"));
-        assert!(values.iter().any(|v| *v == "project2"));
-        assert!(values.iter().any(|v| *v == "different"));
+        assert!(values.iter().any(|v| *v == "user/project1"));
+        assert!(values.iter().any(|v| *v == "user/project2"));
+        assert!(values.iter().any(|v| *v == "work/different"));
     }
 
     #[test]

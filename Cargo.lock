@@ -161,6 +161,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "uuid",
  "vte",
  "wezterm-cell",
  "wezterm-escape-parser",

@@ -16,9 +16,15 @@ pub struct TabEntry {
     pub working_directory: PathBuf,
     /// Tab title
     pub title: String,
-    /// Claude session ID to resume (None = fresh start)
+    /// Claude session ID:
+    /// - None = auto-continue most recent session (--continue)
+    /// - Some("") = explicit fresh start (no flags)
+    /// - Some(id) = resume specific session (--resume {id})
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session_id: Option<String>,
+    /// Terminal title from OSC escape sequences (Claude's status)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_title: Option<String>,
 }
 
 /// Persisted tab state
