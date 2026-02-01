@@ -225,6 +225,7 @@ fn render_directory_selection(
                     );
                 } else {
                     egui::ScrollArea::vertical()
+                        .id_salt("bookmarks_scroll")
                         .max_height(300.0)
                         .show(ui, |ui| {
                             for bookmark in bookmark_manager.get_bookmarks() {
@@ -285,6 +286,7 @@ fn render_directory_selection(
                     );
                 } else {
                     egui::ScrollArea::vertical()
+                        .id_salt("recent_scroll")
                         .max_height(300.0)
                         .show(ui, |ui| {
                             for recent in bookmark_manager.get_recent() {
