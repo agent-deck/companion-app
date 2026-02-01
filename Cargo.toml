@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.75"
 authors = ["vden"]
 description = "Companion app for the Agent Deck macropad - connects Claude Code CLI to the hardware display"
-license = "MIT"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/vden/agentdeck"
 
 [dependencies]
