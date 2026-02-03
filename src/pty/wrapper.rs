@@ -36,8 +36,10 @@ pub struct PtyWrapper {
     /// Session to resume:
     /// - None = --continue (auto-continue most recent session)
     /// - Some("") = fresh start (no flags, explicit "New Session")
-    /// - Some(id) = --resume {id} (specific session)
+    /// - Some(id) = --resume {id} or --session-id {id} depending on is_new_session
     resume_session: Option<String>,
+    /// Whether this is a brand new session (use --session-id) vs resuming (use --resume)
+    is_new_session: bool,
 }
 
 impl PtyWrapper {
@@ -53,19 +55,22 @@ impl PtyWrapper {
             working_directory: None,
             session_id: None,
             resume_session: None, // Default to fresh start for legacy usage
+            is_new_session: false,
         }
     }
 
     /// Create a new PTY wrapper with a specific working directory and session ID
     ///
     /// # Arguments
-    /// * `resume_session` - None = --continue, Some("") = fresh, Some(id) = --resume {id}
+    /// * `resume_session` - None = --continue, Some("") = fresh, Some(id) = session ID
+    /// * `is_new_session` - true = use --session-id (creating new), false = use --resume (resuming existing)
     pub fn new_with_cwd(
         config: ClaudeConfig,
         event_tx: mpsc::UnboundedSender<AppEvent>,
         working_directory: PathBuf,
         session_id: SessionId,
         resume_session: Option<String>,
+        is_new_session: bool,
     ) -> Self {
         Self {
             master: Arc::new(Mutex::new(None)),
@@ -77,6 +82,7 @@ impl PtyWrapper {
             working_directory: Some(working_directory),
             session_id: Some(session_id),
             resume_session,
+            is_new_session,
         }
     }
 
@@ -108,7 +114,7 @@ impl PtyWrapper {
 
         // Handle session:
         // - None = --continue (auto-continue most recent, if sessions exist)
-        // - Some(id) with non-empty id = --resume {id} (always resume, trust stored ID)
+        // - Some(id) with non-empty id = --resume {id} or --session-id {id} based on is_new_session
         // - Some("") = fresh start, no flags
         match &self.resume_session {
             None => {
@@ -123,13 +129,17 @@ impl PtyWrapper {
                 }
             }
             Some(id) if !id.is_empty() => {
-                // Always use --resume for stored session IDs.
-                // We only store IDs from sessions that were actually created/used,
-                // so they should exist. Using --session-id would incorrectly start
-                // a NEW session instead of resuming.
-                cmd.arg("--resume");
-                cmd.arg(id);
-                info!("Resuming Claude session: {}", id);
+                if self.is_new_session {
+                    // Brand new session - use --session-id to create with specific ID
+                    cmd.arg("--session-id");
+                    cmd.arg(id);
+                    info!("Creating new Claude session with ID: {}", id);
+                } else {
+                    // Resuming existing session
+                    cmd.arg("--resume");
+                    cmd.arg(id);
+                    info!("Resuming Claude session: {}", id);
+                }
             }
             Some(_) => {
                 // Empty string = fresh start, no flags
@@ -182,6 +192,9 @@ impl PtyWrapper {
 
         std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
+            // Keep recent output for error logging (last 4KB)
+            let mut recent_output: Vec<u8> = Vec::with_capacity(4096);
+            const MAX_RECENT_OUTPUT: usize = 4096;
 
             // Get reader from master
             let reader_result = {
@@ -210,6 +223,13 @@ impl PtyWrapper {
                     }
                     Ok(n) => {
                         let data = &buffer[..n];
+
+                        // Keep recent output for error logging
+                        recent_output.extend_from_slice(data);
+                        if recent_output.len() > MAX_RECENT_OUTPUT {
+                            let excess = recent_output.len() - MAX_RECENT_OUTPUT;
+                            recent_output.drain(..excess);
+                        }
 
                         // Send raw output (use session-specific event if we have a session ID)
                         if let Some(sid) = session_id {
@@ -240,6 +260,17 @@ impl PtyWrapper {
             let exit_code: Option<i32> = match child.wait() {
                 Ok(status) => {
                     info!("Claude CLI exited with status: {:?}", status);
+                    // Log recent output if exit code indicates an error
+                    if status.exit_code() != 0 && !recent_output.is_empty() {
+                        // Strip ANSI escape codes for cleaner logging
+                        let output_str = String::from_utf8_lossy(&recent_output);
+                        let clean_output = strip_ansi_codes(&output_str);
+                        error!(
+                            "Claude CLI failed (exit code {}). Last output:\n{}",
+                            status.exit_code(),
+                            clean_output.trim()
+                        );
+                    }
                     Some(status.exit_code() as i32)
                 }
                 Err(e) => {
@@ -346,6 +377,49 @@ impl Drop for PtyWrapper {
             let _ = self.stop();
         }
     }
+}
+
+/// Strip ANSI escape codes from a string for cleaner logging
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip escape sequence
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                // Skip until we hit a letter (end of CSI sequence)
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else if chars.peek() == Some(&']') {
+                // OSC sequence - skip until BEL or ST
+                chars.next(); // consume ']'
+                while let Some(&next) = chars.peek() {
+                    if next == '\x07' {
+                        chars.next();
+                        break;
+                    }
+                    if next == '\x1b' {
+                        chars.next();
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                    chars.next();
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
