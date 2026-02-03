@@ -1,0 +1,203 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.1.0)'
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build for each architecture on native runners
+  build-macos-arm64:
+    runs-on: macos-14  # ARM64 runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Build for ARM64
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Upload ARM64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-arm64
+          path: target/aarch64-apple-darwin/release/agent-deck
+
+  build-macos-x86_64:
+    runs-on: macos-13  # Intel runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Build for x86_64
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Upload x86_64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-x86_64
+          path: target/x86_64-apple-darwin/release/agent-deck
+
+  # Combine binaries and create signed app bundle
+  package-macos:
+    needs: [build-macos-arm64, build-macos-x86_64]
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install librsvg
+
+      - name: Download ARM64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-arm64
+          path: target/aarch64-apple-darwin/release/
+
+      - name: Download x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64
+          path: target/x86_64-apple-darwin/release/
+
+      - name: Make binaries executable
+        run: |
+          chmod +x target/aarch64-apple-darwin/release/agent-deck
+          chmod +x target/x86_64-apple-darwin/release/agent-deck
+
+      - name: Verify binaries
+        run: |
+          echo "ARM64 binary:"
+          file target/aarch64-apple-darwin/release/agent-deck
+          echo "x86_64 binary:"
+          file target/x86_64-apple-darwin/release/agent-deck
+
+      - name: Generate app icon
+        run: ./macos/scripts/generate-icon.sh
+
+      - name: Create universal binary and bundle
+        run: ./macos/scripts/bundle.sh --lipo-only
+
+      - name: Verify universal binary
+        run: |
+          echo "Universal binary:"
+          file "dist/Agent Deck.app/Contents/MacOS/agent-deck"
+          lipo -info "dist/Agent Deck.app/Contents/MacOS/agent-deck"
+
+      - name: Import signing certificate
+        if: ${{ env.MACOS_CERTIFICATE != '' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # Import certificate
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security import certificate.p12 -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          # Allow codesign to access the key
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          rm certificate.p12
+
+      - name: Sign and notarize app
+        if: ${{ env.MACOS_CERTIFICATE != '' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+        run: |
+          ./macos/scripts/sign.sh \
+            --identity "$SIGNING_IDENTITY" \
+            --team-id "$TEAM_ID" \
+            --apple-id "$APPLE_ID" \
+            --password "$APP_PASSWORD"
+
+      - name: Ad-hoc sign (unsigned build)
+        if: ${{ env.MACOS_CERTIFICATE == '' }}
+        run: |
+          echo "No signing certificate provided, creating ad-hoc signed build"
+          codesign --force --deep --sign - "dist/Agent Deck.app"
+
+      - name: Create DMG
+        env:
+          SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+        run: |
+          if [ -n "$SIGNING_IDENTITY" ]; then
+            ./macos/scripts/create-dmg.sh \
+              --identity "$SIGNING_IDENTITY" \
+              --team-id "$TEAM_ID" \
+              --apple-id "$APPLE_ID"
+          else
+            ./macos/scripts/create-dmg.sh --skip-notarize
+          fi
+
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          else
+            echo "version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*\"\(.*\)\"/\1/')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentDeck-${{ steps.version.outputs.version }}-macos-universal
+          path: dist/*.dmg
+
+  create-release:
+    needs: package-macos
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: AgentDeck-${{ steps.version.outputs.version }}-macos-universal
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Agent Deck v${{ steps.version.outputs.version }}
+          draft: true
+          generate_release_notes: true
+          files: artifacts/*.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
