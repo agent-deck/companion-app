@@ -13,13 +13,11 @@ use tracing::{debug, error, info};
 /// Tray menu actions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
-    /// Start Claude CLI
-    StartClaude,
-    /// Stop Claude CLI
-    StopClaude,
+    /// Toggle window visibility (show/hide)
+    ToggleWindow,
     /// Open settings
     OpenSettings,
-    /// Quit application
+    /// Quit application (really quit)
     Quit,
 }
 
@@ -31,10 +29,13 @@ pub struct TrayManager {
     icons: TrayIcon,
     /// Event sender
     event_tx: mpsc::UnboundedSender<AppEvent>,
-    /// Menu item IDs
-    start_id: MenuId,
-    stop_id: MenuId,
+    /// Toggle window menu item (for dynamic text updates)
+    toggle_item: MenuItem,
+    /// Toggle menu item ID
+    toggle_id: MenuId,
+    /// Settings menu item ID
     settings_id: MenuId,
+    /// Quit menu item ID
     quit_id: MenuId,
 }
 
@@ -47,11 +48,8 @@ impl TrayManager {
         // Create menu
         let menu = Menu::new();
 
-        let start_item = MenuItem::new("Start Claude", true, None);
-        let start_id = start_item.id().clone();
-
-        let stop_item = MenuItem::new("Stop Claude", true, None);
-        let stop_id = stop_item.id().clone();
+        let toggle_item = MenuItem::new("Show Agent Deck", true, None);
+        let toggle_id = toggle_item.id().clone();
 
         let settings_item = MenuItem::new("Settings...", true, None);
         let settings_id = settings_item.id().clone();
@@ -59,8 +57,7 @@ impl TrayManager {
         let quit_item = MenuItem::new("Quit", true, None);
         let quit_id = quit_item.id().clone();
 
-        menu.append(&start_item)?;
-        menu.append(&stop_item)?;
+        menu.append(&toggle_item)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&settings_item)?;
         menu.append(&PredefinedMenuItem::separator())?;
@@ -70,7 +67,7 @@ impl TrayManager {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("Agent Deck - Disconnected")
-            .with_icon(icons.disconnected.clone())
+            .with_icon(icons.disconnected().clone())
             .build()
             .context("Failed to create tray icon")?;
 
@@ -80,8 +77,8 @@ impl TrayManager {
             tray,
             icons,
             event_tx,
-            start_id,
-            stop_id,
+            toggle_item,
+            toggle_id,
             settings_id,
             quit_id,
         };
@@ -95,8 +92,7 @@ impl TrayManager {
     /// Start menu event handler
     fn start_menu_handler(&self) {
         let event_tx = self.event_tx.clone();
-        let start_id = self.start_id.clone();
-        let stop_id = self.stop_id.clone();
+        let toggle_id = self.toggle_id.clone();
         let settings_id = self.settings_id.clone();
         let quit_id = self.quit_id.clone();
 
@@ -107,10 +103,8 @@ impl TrayManager {
                 if let Ok(event) = receiver.recv() {
                     debug!("Menu event: {:?}", event);
 
-                    let action = if event.id == start_id {
-                        Some(TrayAction::StartClaude)
-                    } else if event.id == stop_id {
-                        Some(TrayAction::StopClaude)
+                    let action = if event.id == toggle_id {
+                        Some(TrayAction::ToggleWindow)
                     } else if event.id == settings_id {
                         Some(TrayAction::OpenSettings)
                     } else if event.id == quit_id {
@@ -129,12 +123,18 @@ impl TrayManager {
         });
     }
 
+    /// Update the toggle menu item text based on window visibility
+    pub fn set_window_visible(&mut self, visible: bool) {
+        let text = if visible { "Hide Agent Deck" } else { "Show Agent Deck" };
+        self.toggle_item.set_text(text);
+    }
+
     /// Set connected/disconnected state
     pub fn set_connected(&mut self, connected: bool) {
         let icon = if connected {
-            &self.icons.connected
+            self.icons.connected()
         } else {
-            &self.icons.disconnected
+            self.icons.disconnected()
         };
 
         let tooltip = if connected {
