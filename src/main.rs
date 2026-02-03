@@ -23,6 +23,8 @@ use agent_deck::{
     tray::TrayManager,
     window::{TerminalAction, TerminalWindowState},
 };
+#[cfg(target_os = "macos")]
+use agent_deck::macos::{create_menu_bar, init_menu_sender, update_recent_sessions_menu, MenuAction};
 use anyhow::Result;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -67,6 +69,9 @@ struct App {
     terminal_window: TerminalWindowState,
     /// Configuration
     config: Config,
+    /// Whether the macOS menu bar has been created
+    #[cfg(target_os = "macos")]
+    menu_created: bool,
 }
 
 impl App {
@@ -87,6 +92,8 @@ impl App {
             session_ptys: HashMap::new(),
             terminal_window: TerminalWindowState::new(font_size),
             config,
+            #[cfg(target_os = "macos")]
+            menu_created: false,
         }
     }
 
@@ -127,7 +134,7 @@ impl App {
         // For fresh sessions (Some("")), generate a UUID upfront.
         // This ensures we know the session ID immediately and can persist it.
         // The PTY wrapper will use --session-id <uuid> for new sessions.
-        let (actual_resume_session, needs_session_id_resolution) = match &resume_session {
+        let (actual_resume_session, is_new_session, needs_session_id_resolution) = match &resume_session {
             Some(id) if id.is_empty() => {
                 // Fresh session: generate UUID and use it
                 let uuid = uuid::Uuid::new_v4().to_string();
@@ -138,15 +145,36 @@ impl App {
                     session.claude_session_id = Some(uuid.clone());
                 }
 
-                (Some(uuid), false)
+                (Some(uuid), true, false) // is_new_session = true
             }
             Some(id) => {
-                // Explicit session ID (resuming) - no resolution needed
-                (Some(id.clone()), false)
+                // Trying to resume a specific session - check if it exists
+                use agent_deck::core::claude_sessions::session_exists;
+                let exists = session_exists(&working_directory, id);
+
+                if exists {
+                    // Session exists - resume it
+                    (Some(id.clone()), false, false) // is_new_session = false
+                } else {
+                    // Session was saved but never actually used (no conversation happened)
+                    // Generate a new UUID so we can track this session
+                    let uuid = uuid::Uuid::new_v4().to_string();
+                    info!(
+                        "Session {} not found on disk (never used?), generating new UUID: {}",
+                        id, uuid
+                    );
+
+                    // Update SessionInfo with the new UUID
+                    if let Some(session) = self.terminal_window.session_manager.get_session_mut(session_id) {
+                        session.claude_session_id = Some(uuid.clone());
+                    }
+
+                    (Some(uuid), true, false) // is_new_session = true (creating new)
+                }
             }
             None => {
                 // Auto-continue - still need resolution to find which session was continued
-                (None, true)
+                (None, false, true)
             }
         };
 
@@ -158,6 +186,7 @@ impl App {
             working_directory.clone(),
             session_id,
             actual_resume_session,
+            is_new_session,
         ));
 
         match pty.start() {
@@ -330,6 +359,16 @@ impl App {
         }
     }
 
+    /// Save window geometry to settings
+    fn save_window_geometry(&mut self) {
+        if let Some(geometry) = self.terminal_window.get_window_geometry() {
+            self.terminal_window.settings.window_geometry = geometry;
+            if let Err(e) = self.terminal_window.settings.save() {
+                error!("Failed to save window geometry: {}", e);
+            }
+        }
+    }
+
     /// Load saved tabs from persistent storage
     fn load_saved_tabs(&mut self) {
         match TabState::load() {
@@ -417,13 +456,27 @@ impl App {
                     .session_manager
                     .set_active_session(session_id);
 
-                // Clear bell indicator when tab becomes active
+                // Clear bell indicator and finished-in-background indicator when tab becomes active
                 if let Some(session) = self.terminal_window.session_manager.get_session_mut(session_id) {
                     session.bell_active = false;
+                    session.finished_in_background = false;
                 }
 
                 // Update window title to reflect active tab
                 self.terminal_window.update_window_title();
+
+                // Update recent sessions menu for the new active tab's directory
+                #[cfg(target_os = "macos")]
+                if let Some(session) = self.terminal_window.session_manager.get_session(session_id) {
+                    use agent_deck::core::claude_sessions::get_sessions_for_directory;
+                    let mut sessions = get_sessions_for_directory(&session.working_directory);
+                    sessions.truncate(5);
+                    let menu_sessions: Vec<(String, String)> = sessions
+                        .iter()
+                        .map(|s| (s.session_id.clone(), s.display_title()))
+                        .collect();
+                    update_recent_sessions_menu(&menu_sessions);
+                }
 
                 // Save tabs immediately when switching (to persist active tab)
                 self.save_tabs();
@@ -523,12 +576,31 @@ impl App {
                 let _ = self.terminal_window.bookmark_manager.save();
             }
             TerminalAction::OpenSettings => {
-                // Settings modal is handled internally by the terminal window
+                self.terminal_window.open_settings();
+                if let Some(ref window) = self.terminal_window.window {
+                    window.request_redraw();
+                }
             }
             TerminalAction::ApplySettings(settings) => {
+                // Check if font size changed
+                let font_size_changed = self.terminal_window.font_size != settings.font_size;
+
                 self.terminal_window.settings = settings.clone();
                 let _ = settings.save();
-                // TODO: Apply font size changes to glyph cache
+
+                // Also persist font size to config for startup
+                if font_size_changed {
+                    self.config.terminal.font_size = settings.font_size;
+                    let _ = self.config.save();
+                }
+
+                // Apply font size changes if needed
+                if font_size_changed {
+                    self.terminal_window.apply_font_size(settings.font_size);
+                    if let Some(ref window) = self.terminal_window.window {
+                        window.request_redraw();
+                    }
+                }
             }
             TerminalAction::Copy => {
                 // Copy selected text to clipboard
@@ -631,10 +703,18 @@ impl App {
                             self.handle_terminal_action(TerminalAction::NewTab, event_loop);
                         } else if !self.session_ptys.is_empty() {
                             self.terminal_window.show();
+                            // Sync tray menu
+                            if let Some(ref mut tray) = self.tray_manager {
+                                tray.set_window_visible(true);
+                            }
                         } else if !self.terminal_window.session_manager.is_empty() {
                             // We have saved tabs but no PTY running - show window and start active tab
                             self.terminal_window.create_window(event_loop);
                             self.terminal_window.show();
+                            // Sync tray menu
+                            if let Some(ref mut tray) = self.tray_manager {
+                                tray.set_window_visible(true);
+                            }
 
                             // Start PTY for active session if it has a working directory
                             if let Some(session) = self.terminal_window.session_manager.active_session() {
@@ -647,6 +727,10 @@ impl App {
                             }
                         } else {
                             self.start_claude(event_loop);
+                            // Sync tray menu (start_claude shows the window)
+                            if let Some(ref mut tray) = self.tray_manager {
+                                tray.set_window_visible(true);
+                            }
                         }
                     }
                     hotkey::HotkeyType::SoftKey(n) => {
@@ -658,31 +742,29 @@ impl App {
             AppEvent::TrayAction(action) => {
                 info!("Tray action: {:?}", action);
                 match action {
-                    tray::TrayAction::StartClaude => {
-                        info!("Starting Claude...");
-                        // Check if we have saved tabs to restore
-                        if !self.terminal_window.session_manager.is_empty() {
+                    tray::TrayAction::ToggleWindow => {
+                        if self.terminal_window.is_visible() {
+                            // Hide window
+                            self.save_tabs();
+                            self.save_window_geometry();
+                            self.terminal_window.hide();
+                        } else {
+                            // Show window
                             self.terminal_window.create_window(event_loop);
                             self.terminal_window.show();
                             // Start PTY for active session if needed
                             if let Some(session) = self.terminal_window.session_manager.active_session() {
-                                if !session.is_new_tab() && !session.is_running {
+                                if !session.is_new_tab() && !session.is_running && !session.is_loading {
                                     let session_id = session.id;
                                     let working_dir = session.working_directory.clone();
                                     let claude_session_id = session.claude_session_id.clone();
                                     self.start_claude_for_session(session_id, working_dir, claude_session_id, event_loop);
                                 }
                             }
-                        } else {
-                            self.start_claude(event_loop);
                         }
-                    }
-                    tray::TrayAction::StopClaude => {
-                        info!("Stopping Claude...");
-                        // Stop all sessions
-                        let session_ids: Vec<_> = self.session_ptys.keys().cloned().collect();
-                        for session_id in session_ids {
-                            self.stop_claude_for_session(session_id);
+                        // Update tray menu text
+                        if let Some(ref mut tray) = self.tray_manager {
+                            tray.set_window_visible(self.terminal_window.is_visible());
                         }
                     }
                     tray::TrayAction::OpenSettings => {
@@ -694,22 +776,31 @@ impl App {
                         self.handle_terminal_action(TerminalAction::OpenSettings, event_loop);
                     }
                     tray::TrayAction::Quit => {
-                        info!("Quitting application...");
-                        // Save window geometry before quitting
-                        if let Some(geometry) = self.terminal_window.get_window_geometry() {
-                            self.terminal_window.settings.window_geometry = geometry;
-                            if let Err(e) = self.terminal_window.settings.save() {
-                                error!("Failed to save window geometry: {}", e);
-                            }
+                        // Check if any sessions have Claude actively working
+                        let working_count = self.terminal_window.session_manager.working_session_count();
+                        let should_quit = if working_count > 0 {
+                            let message = if working_count == 1 {
+                                "Claude is still working in 1 session. Quit anyway?".to_string()
+                            } else {
+                                format!("Claude is still working in {} sessions. Quit anyway?", working_count)
+                            };
+
+                            rfd::MessageDialog::new()
+                                .set_title("Quit AgentDeck")
+                                .set_description(&message)
+                                .set_buttons(rfd::MessageButtons::YesNo)
+                                .set_level(rfd::MessageLevel::Warning)
+                                .show() == rfd::MessageDialogResult::Yes
+                        } else {
+                            true
+                        };
+
+                        if should_quit {
+                            info!("Quitting application...");
+                            // Use event_loop.exit() to trigger the exiting() callback
+                            // which handles graceful shutdown of all Claude sessions
+                            event_loop.exit();
                         }
-                        // Save tabs before quitting
-                        self.save_tabs();
-                        // Stop all sessions
-                        let session_ids: Vec<_> = self.session_ptys.keys().cloned().collect();
-                        for session_id in session_ids {
-                            self.stop_claude_for_session(session_id);
-                        }
-                        std::process::exit(0);
                     }
                 }
             }
@@ -760,6 +851,165 @@ impl App {
                     }
                 }
             }
+            #[cfg(target_os = "macos")]
+            AppEvent::MenuAction(action) => {
+                self.handle_menu_action(action, event_loop);
+            }
+        }
+    }
+
+    /// Handle a menu action (macOS only)
+    #[cfg(target_os = "macos")]
+    fn handle_menu_action(&mut self, action: MenuAction, event_loop: &ActiveEventLoop) {
+        use MenuAction::*;
+
+        info!("Menu action: {:?}", action);
+
+        match action {
+            // App menu
+            About => {
+                // Show about dialog
+                rfd::MessageDialog::new()
+                    .set_title("About Agent Deck")
+                    .set_description("Agent Deck v0.1.0\n\nA companion app for Claude Code CLI.")
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+            }
+            Settings => {
+                // Create window if needed and show settings
+                self.terminal_window.create_window(event_loop);
+                self.terminal_window.show();
+                self.handle_terminal_action(TerminalAction::OpenSettings, event_loop);
+            }
+            HideApp | HideOthers | ShowAll => {
+                // These are handled by standard NSApp actions
+            }
+            HideWindow => {
+                // Cmd+Q now hides window to tray instead of quitting
+                self.save_tabs();
+                self.save_window_geometry();
+                self.terminal_window.hide();
+                if let Some(ref mut tray) = self.tray_manager {
+                    tray.set_window_visible(false);
+                }
+            }
+            Quit => {
+                // Check if any sessions have Claude actively working
+                let working_count = self.terminal_window.session_manager.working_session_count();
+                let should_quit = if working_count > 0 {
+                    let message = if working_count == 1 {
+                        "Claude is still working in 1 session. Quit anyway?".to_string()
+                    } else {
+                        format!("Claude is still working in {} sessions. Quit anyway?", working_count)
+                    };
+
+                    rfd::MessageDialog::new()
+                        .set_title("Quit Agent Deck")
+                        .set_description(&message)
+                        .set_buttons(rfd::MessageButtons::YesNo)
+                        .set_level(rfd::MessageLevel::Warning)
+                        .show() == rfd::MessageDialogResult::Yes
+                } else {
+                    true
+                };
+
+                if should_quit {
+                    info!("Quitting application via menu...");
+                    // Use event_loop.exit() to trigger the exiting() callback
+                    // which handles graceful shutdown of all Claude sessions
+                    event_loop.exit();
+                }
+            }
+
+            // File menu
+            NewSession => {
+                // Create new tab (show window if needed)
+                self.terminal_window.create_window(event_loop);
+                self.terminal_window.show();
+                self.handle_terminal_action(TerminalAction::NewTab, event_loop);
+            }
+            FreshSession => {
+                // Fresh session in current directory
+                self.terminal_window.create_window(event_loop);
+                self.terminal_window.show();
+                self.handle_terminal_action(TerminalAction::FreshSessionCurrentDir, event_loop);
+            }
+            CloseTab => {
+                // Close current tab
+                if let Some(session) = self.terminal_window.session_manager.active_session() {
+                    let session_id = session.id;
+                    self.handle_terminal_action(TerminalAction::CloseTab(session_id), event_loop);
+                }
+            }
+
+            // Edit menu
+            Copy => {
+                self.handle_terminal_action(TerminalAction::Copy, event_loop);
+            }
+            Paste => {
+                self.handle_terminal_action(TerminalAction::Paste, event_loop);
+            }
+            SelectAll => {
+                // Select all text in terminal
+                self.terminal_window.select_all();
+                if let Some(ref window) = self.terminal_window.window {
+                    window.request_redraw();
+                }
+            }
+            // View menu - temporary font size changes (not persisted)
+            IncreaseFontSize => {
+                let current = self.terminal_window.font_size;
+                let new_size = (current + 1.0).min(72.0);
+                self.terminal_window.apply_font_size_temporary(new_size);
+                if let Some(ref window) = self.terminal_window.window {
+                    window.request_redraw();
+                }
+            }
+            DecreaseFontSize => {
+                let current = self.terminal_window.font_size;
+                let new_size = (current - 1.0).max(8.0);
+                self.terminal_window.apply_font_size_temporary(new_size);
+                if let Some(ref window) = self.terminal_window.window {
+                    window.request_redraw();
+                }
+            }
+            ResetFontSize => {
+                // Reset to the font size at app startup
+                let initial_size = self.terminal_window.initial_font_size();
+                self.terminal_window.apply_font_size_temporary(initial_size);
+                if let Some(ref window) = self.terminal_window.window {
+                    window.request_redraw();
+                }
+            }
+            ToggleFullscreen => {
+                // Handled by standard action
+            }
+
+            // Window menu
+            Minimize | Zoom => {
+                // Handled by standard actions
+            }
+
+            // Help menu
+            Help => {
+                // Open help documentation (could be a web page or local file)
+                if let Err(e) = open::that("https://github.com/anthropics/claude-code") {
+                    error!("Failed to open help URL: {}", e);
+                }
+            }
+            ReportIssue => {
+                // Open GitHub issues page
+                if let Err(e) = open::that("https://github.com/vden/agentdeck/issues/new") {
+                    error!("Failed to open issues URL: {}", e);
+                }
+            }
+
+            // Recent session submenu
+            LoadRecentSession(idx) => {
+                // This would load a specific recent session
+                // For now, we'll just log it - full implementation would need session list
+                info!("Load recent session at index: {}", idx);
+            }
         }
     }
 }
@@ -767,6 +1017,14 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Poll);
+
+        // Create macOS native menu bar (must happen after winit starts the event loop)
+        #[cfg(target_os = "macos")]
+        if !self.menu_created {
+            create_menu_bar();
+            self.menu_created = true;
+            info!("macOS native menu bar created");
+        }
 
         // Load saved tabs (will be started lazily when activated)
         self.load_saved_tabs();
@@ -799,7 +1057,7 @@ impl ApplicationHandler for App {
         match HidManager::new(hid_config, event_tx) {
             Ok(hid) => {
                 self.hid_manager = Some(hid);
-                let _ = self.event_tx.send(AppEvent::HidConnected);
+                // Note: HidConnected event is sent by HidManager::try_connect() if device is found
                 info!("HID manager initialized");
             }
             Err(e) => {
@@ -817,16 +1075,37 @@ impl ApplicationHandler for App {
         if self.terminal_window.is_our_window(window_id) {
             match &event {
                 WindowEvent::CloseRequested => {
-                    // Save window geometry before closing
-                    if let Some(geometry) = self.terminal_window.get_window_geometry() {
-                        self.terminal_window.settings.window_geometry = geometry;
-                        if let Err(e) = self.terminal_window.settings.save() {
-                            error!("Failed to save window geometry: {}", e);
+                    // Check if any sessions have Claude actively working
+                    let working_count = self.terminal_window.session_manager.working_session_count();
+                    if working_count > 0 {
+                        // Show confirmation dialog
+                        let message = if working_count == 1 {
+                            "Claude is still working in 1 session. Close anyway?".to_string()
+                        } else {
+                            format!("Claude is still working in {} sessions. Close anyway?", working_count)
+                        };
+
+                        let confirmed = rfd::MessageDialog::new()
+                            .set_title("Close AgentDeck")
+                            .set_description(&message)
+                            .set_buttons(rfd::MessageButtons::YesNo)
+                            .set_level(rfd::MessageLevel::Warning)
+                            .show() == rfd::MessageDialogResult::Yes;
+
+                        if !confirmed {
+                            return;
                         }
                     }
+
+                    // Save window geometry before closing
+                    self.save_window_geometry();
                     // Save tabs when window is closed
                     self.save_tabs();
                     self.terminal_window.hide();
+                    // Sync tray menu
+                    if let Some(ref mut tray) = self.tray_manager {
+                        tray.set_window_visible(false);
+                    }
                     return;
                 }
                 WindowEvent::Resized(size) => {
@@ -886,6 +1165,9 @@ impl ApplicationHandler for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         info!("Application exiting, saving state...");
 
+        // Destroy OpenGL resources properly to avoid "Resources will leak!" warning
+        self.terminal_window.destroy();
+
         // Save window geometry before exiting
         if let Some(geometry) = self.terminal_window.get_window_geometry() {
             self.terminal_window.settings.window_geometry = geometry;
@@ -915,17 +1197,17 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Give Claude a moment to process and save
+        // Give Claude time to process and save the conversation
         if !self.session_ptys.is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
 }
 
-/// Set the macOS application name in the menu bar
+/// Set up macOS application: process name and full native menu bar
 #[cfg(target_os = "macos")]
-#[allow(deprecated)]
-fn set_macos_app_name() {
+#[allow(deprecated, unused_imports)]
+fn setup_macos_app(event_tx: mpsc::UnboundedSender<AppEvent>) {
     use cocoa::appkit::NSApp;
     use cocoa::base::nil;
     use cocoa::foundation::NSString;
@@ -933,30 +1215,56 @@ fn set_macos_app_name() {
     use objc::{sel, sel_impl};
 
     unsafe {
+        let app = NSApp();
+
+        // Set activation policy to Regular (shows in dock, has menu bar)
+        // NSApplicationActivationPolicyRegular = 0
+        let _: () = objc::msg_send![app, setActivationPolicy: 0_isize];
+
         // Set the process name
         let process_info: *mut Object = cocoa::foundation::NSProcessInfo::processInfo(nil);
         let app_name = NSString::alloc(nil).init_str("Agent Deck");
         let _: () = objc::msg_send![process_info, setProcessName: app_name];
+    }
 
-        // Also set the app's main menu title by getting the app and its main menu
-        let app = NSApp();
-        if app != nil {
-            let main_menu: *mut Object = objc::msg_send![app, mainMenu];
-            if main_menu != nil {
-                let first_item: *mut Object = objc::msg_send![main_menu, itemAtIndex: 0i64];
-                if first_item != nil {
-                    let submenu: *mut Object = objc::msg_send![first_item, submenu];
-                    if submenu != nil {
-                        let _: () = objc::msg_send![submenu, setTitle: app_name];
-                    }
-                }
+    // Create channel for menu actions
+    let (menu_tx, mut menu_rx) = mpsc::unbounded_channel::<MenuAction>();
+
+    // Initialize the menu sender (menu bar will be created in resumed() callback)
+    init_menu_sender(menu_tx);
+
+    // Spawn a thread to forward menu events to the main event channel
+    let event_tx_clone = event_tx.clone();
+    std::thread::spawn(move || {
+        while let Some(action) = menu_rx.blocking_recv() {
+            if let Err(e) = event_tx_clone.send(AppEvent::MenuAction(action)) {
+                error!("Failed to forward menu action: {}", e);
+                break;
             }
         }
-    }
+    });
+
+    info!("macOS app setup complete with native menu bar");
 }
 
 #[cfg(not(target_os = "macos"))]
-fn set_macos_app_name() {
+fn setup_macos_app(_event_tx: mpsc::UnboundedSender<AppEvent>) {
+    // No-op on other platforms
+}
+
+/// Set up macOS quit confirmation handler
+/// This intercepts Cmd-Q to show confirmation when Claude is working
+/// Note: Since we now have a proper menu bar with Quit handled via MenuAction,
+/// this handler is disabled. The menu's Quit action handles confirmation.
+#[cfg(target_os = "macos")]
+fn setup_macos_quit_handler() {
+    // Quit confirmation is now handled by the menu bar's Quit action
+    // in handle_menu_action(). This avoids the complexity of isa-swizzling
+    // the app delegate.
+}
+
+#[cfg(not(target_os = "macos"))]
+fn setup_macos_quit_handler() {
     // No-op on other platforms
 }
 
@@ -982,8 +1290,11 @@ fn main() -> Result<()> {
     // Create event loop
     let event_loop = EventLoop::new()?;
 
-    // Set macOS app name (must be after event loop creation)
-    set_macos_app_name();
+    // Set up macOS app (process name and native menu bar, must be after event loop creation)
+    setup_macos_app(event_tx.clone());
+
+    // Set up macOS quit confirmation handler (must be after event loop creation)
+    setup_macos_quit_handler();
 
     // Create application
     let mut app = App::new(state, event_tx, event_rx, config);

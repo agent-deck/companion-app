@@ -19,6 +19,7 @@ impl NotificationHandler {
 
 impl AlertHandler for NotificationHandler {
     fn alert(&mut self, alert: Alert) {
+        tracing::debug!("NotificationHandler received alert: {:?}", alert);
         let _ = self.sender.send(alert);
     }
 }

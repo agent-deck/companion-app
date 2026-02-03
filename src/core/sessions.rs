@@ -15,6 +15,38 @@ use std::sync::Arc;
 /// Unique identifier for a session
 pub type SessionId = usize;
 
+/// Claude's activity state derived from terminal title prefix
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaudeActivity {
+    /// Not running or unknown state
+    #[default]
+    Unknown,
+    /// Claude is idle (✳ prefix)
+    Idle,
+    /// Claude is working/thinking (spinner prefix like ⠐, ⠂, etc.)
+    Working,
+}
+
+impl ClaudeActivity {
+    /// Parse activity state from terminal title
+    pub fn from_title(title: &str) -> Self {
+        let first_char = title.chars().next();
+        match first_char {
+            Some('✳') => ClaudeActivity::Idle,
+            // Braille spinner characters (U+2800-U+28FF range)
+            Some(c) if ('\u{2800}'..='\u{28FF}').contains(&c) => ClaudeActivity::Working,
+            // Other potential working indicators
+            Some('⠋') | Some('⠙') | Some('⠹') | Some('⠸') | Some('⠼') | Some('⠴') | Some('⠦') | Some('⠧') | Some('⠇') | Some('⠏') => ClaudeActivity::Working,
+            _ => ClaudeActivity::Unknown,
+        }
+    }
+
+    /// Check if Claude is currently working
+    pub fn is_working(&self) -> bool {
+        matches!(self, ClaudeActivity::Working)
+    }
+}
+
 /// Information about a single Claude session
 pub struct SessionInfo {
     /// Unique session ID
@@ -44,6 +76,10 @@ pub struct SessionInfo {
     pub session_start_time: Option<std::time::Instant>,
     /// Whether we're waiting to resolve the session ID
     pub needs_session_resolution: bool,
+    /// Claude's current activity state (derived from terminal title prefix)
+    pub claude_activity: ClaudeActivity,
+    /// Whether Claude finished working while tab was in background (for notification indicator)
+    pub finished_in_background: bool,
 }
 
 impl SessionInfo {
@@ -69,6 +105,8 @@ impl SessionInfo {
             bell_active: false,
             session_start_time: None,
             needs_session_resolution: false,
+            claude_activity: ClaudeActivity::default(),
+            finished_in_background: false,
         }
     }
 
@@ -88,6 +126,8 @@ impl SessionInfo {
             bell_active: false,
             session_start_time: None,
             needs_session_resolution: false,
+            claude_activity: ClaudeActivity::default(),
+            finished_in_background: false,
         }
     }
 
@@ -255,6 +295,16 @@ impl SessionManager {
     /// Check if there are any sessions
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
+    }
+
+    /// Check if any sessions have Claude actively working
+    pub fn has_working_sessions(&self) -> bool {
+        self.sessions.iter().any(|s| s.claude_activity.is_working())
+    }
+
+    /// Count sessions where Claude is actively working
+    pub fn working_session_count(&self) -> usize {
+        self.sessions.iter().filter(|s| s.claude_activity.is_working()).count()
     }
 
     /// Get sessions as a slice for rendering

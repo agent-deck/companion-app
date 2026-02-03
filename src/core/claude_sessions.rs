@@ -72,7 +72,7 @@ impl SessionIndexEntry {
 /// Example: `/Users/vden/work/foo` → `-Users-vden-work-foo`
 fn encode_project_path(path: &Path) -> String {
     let path_str = path.to_string_lossy();
-    path_str.replace('/', "-").replace('\\', "-")
+    path_str.replace('/', "-").replace('\\', "-").replace('_', "-")
 }
 
 /// Get the Claude Code storage directory for a project
@@ -92,7 +92,19 @@ pub fn find_most_recent_session(dir: &Path) -> Option<String> {
 }
 
 /// Check if a session with the given ID exists in a directory
+///
+/// Checks both the sessions-index.json and the actual session file (<id>.jsonl)
+/// since the index might not be updated immediately after session creation.
 pub fn session_exists(dir: &Path, session_id: &str) -> bool {
+    // First check if the actual session file exists (more reliable)
+    if let Some(project_path) = get_project_storage_path(dir) {
+        let session_file = project_path.join(format!("{}.jsonl", session_id));
+        if session_file.exists() {
+            return true;
+        }
+    }
+
+    // Fall back to checking the index
     let sessions = get_sessions_for_directory(dir);
     sessions.iter().any(|s| s.session_id == session_id)
 }

@@ -14,6 +14,19 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+#[cfg(target_os = "macos")]
+use super::hotplug_macos::{HotplugEvent, HotplugWatcher};
+
+/// Number of consecutive ping failures before declaring disconnection
+const DISCONNECT_THRESHOLD: u32 = 3;
+
+/// Polling interval when hotplug is not available (non-macOS platforms)
+#[cfg(not(target_os = "macos"))]
+const RECONNECT_INITIAL_MS: u64 = 500;
+
+#[cfg(not(target_os = "macos"))]
+const RECONNECT_MAX_MS: u64 = 5000;
+
 /// Manager for HID device communication with Agent Deck
 pub struct HidManager {
     /// HID API instance
@@ -26,8 +39,11 @@ pub struct HidManager {
     event_tx: mpsc::UnboundedSender<AppEvent>,
     /// Whether currently connected
     connected: Arc<AtomicBool>,
-    /// Whether the ping thread should stop
-    stop_ping: Arc<AtomicBool>,
+    /// Whether the monitor thread should stop
+    stop_monitor: Arc<AtomicBool>,
+    /// macOS hotplug watcher
+    #[cfg(target_os = "macos")]
+    hotplug_watcher: Option<HotplugWatcher>,
 }
 
 impl HidManager {
@@ -35,68 +51,249 @@ impl HidManager {
     pub fn new(config: HidConfig, event_tx: mpsc::UnboundedSender<AppEvent>) -> Result<Self> {
         let api = HidApi::new().context("Failed to initialize HID API")?;
 
-        let manager = Self {
+        let mut manager = Self {
             api: Arc::new(Mutex::new(api)),
             device: Arc::new(Mutex::new(None)),
-            config,
-            event_tx,
+            config: config.clone(),
+            event_tx: event_tx.clone(),
             connected: Arc::new(AtomicBool::new(false)),
-            stop_ping: Arc::new(AtomicBool::new(false)),
+            stop_monitor: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "macos")]
+            hotplug_watcher: None,
         };
 
-        // Try initial connection
-        manager.try_connect()?;
+        // Try initial connection (don't fail if device not found)
+        if let Err(e) = manager.try_connect() {
+            info!("Initial connection failed (will retry): {}", e);
+        }
 
-        // Start ping thread
+        // Start the appropriate monitor mechanism
+        #[cfg(target_os = "macos")]
+        {
+            manager.start_macos_hotplug(config, event_tx);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            manager.start_polling_monitor();
+        }
+
+        // Start ping thread for connection health monitoring
         manager.start_ping_thread();
 
         Ok(manager)
     }
 
-    /// Start background ping thread
-    fn start_ping_thread(&self) {
-        let device = Arc::clone(&self.device);
-        let connected = Arc::clone(&self.connected);
-        let stop_ping = Arc::clone(&self.stop_ping);
-        let ping_interval = self.config.ping_interval_ms;
+    /// Start macOS IOKit hotplug watcher
+    #[cfg(target_os = "macos")]
+    fn start_macos_hotplug(&mut self, config: HidConfig, _event_tx: mpsc::UnboundedSender<AppEvent>) {
+        // Create channel for hotplug events
+        let (hotplug_tx, mut hotplug_rx) = mpsc::unbounded_channel();
 
-        thread::spawn(move || {
-            info!("Ping thread started");
-            while !stop_ping.load(Ordering::Relaxed) {
-                if connected.load(Ordering::Relaxed) {
-                    let device_guard = device.lock();
-                    if let Some(ref dev) = *device_guard {
-                        // Send ping
-                        let packet = HidPacket::with_command(HidCommand::Ping);
-                        match send_packet_to_device(dev, &packet) {
-                            Ok(()) => {
-                                debug!("Ping sent");
-                                // Try to read pong response
-                                let mut buffer = [0u8; PACKET_SIZE];
-                                match dev.read_timeout(&mut buffer, 100) {
-                                    Ok(n) if n > 0 => {
-                                        if buffer[0] == HidCommand::Ping as u8 {
-                                            debug!("Pong received");
+        // Start the IOKit watcher
+        match HotplugWatcher::new(config.vendor_id, config.product_id, hotplug_tx) {
+            Ok(watcher) => {
+                self.hotplug_watcher = Some(watcher);
+                info!("Started native IOKit hotplug watcher");
+
+                // Spawn task to handle hotplug events
+                let api = Arc::clone(&self.api);
+                let device = Arc::clone(&self.device);
+                let connected = Arc::clone(&self.connected);
+                let stop_monitor = Arc::clone(&self.stop_monitor);
+                let event_tx = self.event_tx.clone();
+                let config = self.config.clone();
+
+                thread::spawn(move || {
+                    // Use a blocking receiver in a thread
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to create tokio runtime");
+
+                    rt.block_on(async {
+                        while !stop_monitor.load(Ordering::Relaxed) {
+                            tokio::select! {
+                                Some(event) = hotplug_rx.recv() => {
+                                    match event {
+                                        HotplugEvent::DeviceArrived => {
+                                            if !connected.load(Ordering::Relaxed) {
+                                                // Small delay to let the device initialize
+                                                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                                                // Refresh device list
+                                                {
+                                                    let mut api_guard = api.lock();
+                                                    let _ = api_guard.refresh_devices();
+                                                }
+
+                                                // Try to connect
+                                                if let Some(dev) = try_open_device(&api, &config) {
+                                                    *device.lock() = Some(dev);
+                                                    connected.store(true, Ordering::Relaxed);
+                                                    let _ = event_tx.send(AppEvent::HidConnected);
+                                                    info!("Device connected via hotplug");
+                                                }
+                                            }
+                                        }
+                                        HotplugEvent::DeviceRemoved => {
+                                            if connected.load(Ordering::Relaxed) {
+                                                *device.lock() = None;
+                                                connected.store(false, Ordering::Relaxed);
+                                                let _ = event_tx.send(AppEvent::HidDisconnected);
+                                                info!("Device disconnected via hotplug");
+                                            }
                                         }
                                     }
-                                    Ok(_) => {
-                                        debug!("No pong response");
-                                    }
-                                    Err(e) => {
-                                        warn!("Error reading pong: {}", e);
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                                    // Check stop flag periodically
+                                    if stop_monitor.load(Ordering::Relaxed) {
+                                        break;
                                     }
                                 }
                             }
-                            Err(e) => {
-                                warn!("Failed to send ping: {}", e);
-                            }
+                        }
+                    });
+                });
+            }
+            Err(e) => {
+                warn!("Failed to start IOKit hotplug watcher: {}, falling back to polling", e);
+                self.start_polling_monitor_internal();
+            }
+        }
+    }
+
+    /// Start polling-based monitor (for non-macOS or fallback)
+    #[cfg(not(target_os = "macos"))]
+    fn start_polling_monitor(&self) {
+        self.start_polling_monitor_internal();
+    }
+
+    /// Internal polling monitor implementation
+    fn start_polling_monitor_internal(&self) {
+        let api = Arc::clone(&self.api);
+        let device = Arc::clone(&self.device);
+        let connected = Arc::clone(&self.connected);
+        let stop_monitor = Arc::clone(&self.stop_monitor);
+        let event_tx = self.event_tx.clone();
+        let config = self.config.clone();
+
+        thread::spawn(move || {
+            info!("HID polling monitor thread started");
+
+            #[cfg(not(target_os = "macos"))]
+            let mut reconnect_interval_ms = RECONNECT_INITIAL_MS;
+            #[cfg(target_os = "macos")]
+            let mut reconnect_interval_ms = 500u64;
+
+            #[cfg(not(target_os = "macos"))]
+            let max_interval = RECONNECT_MAX_MS;
+            #[cfg(target_os = "macos")]
+            let max_interval = 5000u64;
+
+            while !stop_monitor.load(Ordering::Relaxed) {
+                if !connected.load(Ordering::Relaxed) {
+                    // Refresh device list to see newly connected devices
+                    {
+                        let mut api_guard = api.lock();
+                        if let Err(e) = api_guard.refresh_devices() {
+                            debug!("Failed to refresh device list: {}", e);
                         }
                     }
-                    drop(device_guard);
+
+                    // Try to find and connect to device
+                    if let Some(dev) = try_open_device(&api, &config) {
+                        *device.lock() = Some(dev);
+                        connected.store(true, Ordering::Relaxed);
+                        let _ = event_tx.send(AppEvent::HidConnected);
+                        reconnect_interval_ms = 500; // Reset on success
+                    } else {
+                        // Exponential backoff
+                        reconnect_interval_ms = (reconnect_interval_ms * 3 / 2).min(max_interval);
+                        debug!("Device not found, next attempt in {}ms", reconnect_interval_ms);
+                    }
+
+                    thread::sleep(Duration::from_millis(reconnect_interval_ms));
+                } else {
+                    // When connected, just sleep (ping thread handles disconnection)
+                    thread::sleep(Duration::from_millis(1000));
+                }
+            }
+            info!("HID polling monitor thread stopped");
+        });
+    }
+
+    /// Start ping thread for connection health monitoring
+    fn start_ping_thread(&self) {
+        let device = Arc::clone(&self.device);
+        let connected = Arc::clone(&self.connected);
+        let stop_monitor = Arc::clone(&self.stop_monitor);
+        let event_tx = self.event_tx.clone();
+        let ping_interval = self.config.ping_interval_ms;
+
+        thread::spawn(move || {
+            info!("HID ping thread started");
+            let mut consecutive_failures: u32 = 0;
+
+            while !stop_monitor.load(Ordering::Relaxed) {
+                if connected.load(Ordering::Relaxed) {
+                    let ping_ok = {
+                        let device_guard = device.lock();
+                        if let Some(ref dev) = *device_guard {
+                            let packet = HidPacket::with_command(HidCommand::Ping);
+                            match send_packet_to_device(dev, &packet) {
+                                Ok(()) => {
+                                    debug!("Ping sent");
+                                    let mut buffer = [0u8; PACKET_SIZE];
+                                    match dev.read_timeout(&mut buffer, 100) {
+                                        Ok(n) if n > 0 => {
+                                            if buffer[0] == HidCommand::Ping as u8 {
+                                                debug!("Pong received");
+                                            }
+                                            true
+                                        }
+                                        Ok(_) => {
+                                            debug!("No pong response");
+                                            true // Write succeeded, device might be busy
+                                        }
+                                        Err(e) => {
+                                            warn!("Error reading pong: {}", e);
+                                            false
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to send ping: {}", e);
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        }
+                    };
+
+                    if ping_ok {
+                        consecutive_failures = 0;
+                    } else {
+                        consecutive_failures += 1;
+                        warn!(
+                            "Ping failure {} of {}",
+                            consecutive_failures, DISCONNECT_THRESHOLD
+                        );
+
+                        if consecutive_failures >= DISCONNECT_THRESHOLD {
+                            info!("Device disconnected (consecutive ping failures)");
+                            *device.lock() = None;
+                            connected.store(false, Ordering::Relaxed);
+                            let _ = event_tx.send(AppEvent::HidDisconnected);
+                            consecutive_failures = 0;
+                        }
+                    }
                 }
                 thread::sleep(Duration::from_millis(ping_interval));
             }
-            info!("Ping thread stopped");
+            info!("HID ping thread stopped");
         });
     }
 
@@ -125,9 +322,7 @@ impl HidManager {
 
         info!(
             "Found Agent Deck: {} {}",
-            device_info
-                .manufacturer_string()
-                .unwrap_or("Unknown"),
+            device_info.manufacturer_string().unwrap_or("Unknown"),
             device_info.product_string().unwrap_or("Unknown")
         );
 
@@ -170,12 +365,8 @@ impl HidManager {
 
         debug!("Sending display update: {}", json);
 
-        // Check if JSON fits in payload
         if json.len() > super::protocol::MAX_PAYLOAD_SIZE {
-            warn!(
-                "JSON too long ({} bytes), truncating",
-                json.len()
-            );
+            warn!("JSON too long ({} bytes), truncating", json.len());
         }
 
         let mut packet = HidPacket::with_command(HidCommand::UpdateDisplay);
@@ -183,7 +374,6 @@ impl HidManager {
 
         send_packet_to_device(device, &packet)?;
 
-        // Try to read ACK but don't fail if not received
         let mut buffer = [0u8; PACKET_SIZE];
         let _ = device.read_timeout(&mut buffer, 50);
 
@@ -197,22 +387,16 @@ impl HidManager {
             .as_ref()
             .ok_or_else(|| anyhow!("Device not connected"))?;
 
-        // Clean up the task string - remove leading symbols/emojis that Claude uses for status
         let clean_task = task
             .trim_start_matches(|c: char| !c.is_alphanumeric())
             .trim();
 
-        // Create JSON payload with just the task
         let json = format!(r#"{{"task":"{}"}}"#, clean_task.replace('"', "\\\""));
 
         debug!("Sending task update: {}", json);
 
-        // Check if JSON fits in payload
         if json.len() > super::protocol::MAX_PAYLOAD_SIZE {
-            warn!(
-                "Task JSON too long ({} bytes), truncating",
-                json.len()
-            );
+            warn!("Task JSON too long ({} bytes), truncating", json.len());
         }
 
         let mut packet = HidPacket::with_command(HidCommand::UpdateDisplay);
@@ -220,7 +404,6 @@ impl HidManager {
 
         send_packet_to_device(device, &packet)?;
 
-        // Try to read ACK but don't fail if not received
         let mut buffer = [0u8; PACKET_SIZE];
         let _ = device.read_timeout(&mut buffer, 50);
 
@@ -241,7 +424,6 @@ impl HidManager {
 
         send_packet_to_device(device, &packet)?;
 
-        // Try to read ACK
         let mut buffer = [0u8; PACKET_SIZE];
         let _ = device.read_timeout(&mut buffer, 50);
 
@@ -262,8 +444,44 @@ impl HidManager {
 
 impl Drop for HidManager {
     fn drop(&mut self) {
-        self.stop_ping.store(true, Ordering::Relaxed);
+        self.stop_monitor.store(true, Ordering::Relaxed);
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(ref mut watcher) = self.hotplug_watcher {
+                watcher.stop();
+            }
+        }
         self.disconnect();
+    }
+}
+
+/// Try to open the HID device
+fn try_open_device(api: &Arc<Mutex<HidApi>>, config: &HidConfig) -> Option<HidDevice> {
+    let api_guard = api.lock();
+    let device_info = api_guard.device_list().find(|d| {
+        d.vendor_id() == config.vendor_id
+            && d.product_id() == config.product_id
+            && d.usage_page() == config.usage_page
+            && d.usage() == config.usage_id
+    })?;
+
+    match device_info.open_device(&api_guard) {
+        Ok(dev) => {
+            if let Err(e) = dev.set_blocking_mode(false) {
+                warn!("Failed to set non-blocking mode: {}", e);
+                return None;
+            }
+            info!(
+                "Opened device: {} {}",
+                device_info.manufacturer_string().unwrap_or("Unknown"),
+                device_info.product_string().unwrap_or("Unknown")
+            );
+            Some(dev)
+        }
+        Err(e) => {
+            debug!("Failed to open device: {}", e);
+            None
+        }
     }
 }
 
@@ -271,9 +489,6 @@ impl Drop for HidManager {
 fn send_packet_to_device(device: &HidDevice, packet: &HidPacket) -> Result<()> {
     let bytes = packet.as_bytes();
 
-    // On macOS/Windows, hidapi requires prepending a 0x00 report ID for devices
-    // that don't use numbered reports (like QMK Raw HID).
-    // Linux hidraw doesn't need the report ID prefix.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let data = {
         let mut data = Vec::with_capacity(PACKET_SIZE + 1);

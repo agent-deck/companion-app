@@ -15,6 +15,8 @@
 pub mod core;
 pub mod hid;
 pub mod hotkey;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod pty;
 pub mod terminal;
 pub mod tray;
@@ -23,6 +25,32 @@ pub mod window;
 pub use core::bookmarks::BookmarkManager;
 pub use core::config::Config;
 pub use core::events::AppEvent;
-pub use core::sessions::{SessionId, SessionInfo, SessionManager};
+pub use core::sessions::{ClaudeActivity, SessionId, SessionInfo, SessionManager};
 pub use core::settings::{ColorScheme, Settings};
 pub use core::state::{AppState, ClaudeState};
+
+// Global counter for working Claude sessions (used by macOS quit handler)
+#[cfg(target_os = "macos")]
+static WORKING_SESSION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Update the global working session count (called when claude_activity changes)
+#[cfg(target_os = "macos")]
+pub fn update_working_session_count(count: usize) {
+    WORKING_SESSION_COUNT.store(count, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Get the current working session count
+#[cfg(target_os = "macos")]
+pub fn get_working_session_count() -> usize {
+    WORKING_SESSION_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn update_working_session_count(_count: usize) {
+    // No-op on other platforms
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn get_working_session_count() -> usize {
+    0
+}

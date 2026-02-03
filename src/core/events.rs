@@ -3,6 +3,8 @@
 use super::sessions::SessionId;
 use super::state::ClaudeState;
 use crate::hotkey::HotkeyType;
+#[cfg(target_os = "macos")]
+use crate::macos::MenuAction;
 use crate::tray::TrayAction;
 
 /// Application-wide events for inter-module communication
@@ -37,4 +39,8 @@ pub enum AppEvent {
 
     /// Terminal title changed (from OSC escape sequence)
     TerminalTitleChanged(String),
+
+    /// Menu bar action triggered (macOS only)
+    #[cfg(target_os = "macos")]
+    MenuAction(MenuAction),
 }

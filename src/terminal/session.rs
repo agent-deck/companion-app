@@ -184,4 +184,23 @@ mod tests {
             assert!(line_idx < screen.scrollback_rows());
         });
     }
+
+    #[test]
+    fn test_bell_notification() {
+        let session = Session::new(1, 80, 24);
+
+        // Send a standalone bell character
+        session.advance_bytes(b"\x07");
+
+        // Poll for notifications
+        let alerts = session.poll_notifications();
+
+        // Should have received a Bell alert
+        assert!(!alerts.is_empty(), "Expected bell notification but got none");
+        assert!(
+            alerts.iter().any(|a| matches!(a, Alert::Bell)),
+            "Expected Alert::Bell but got: {:?}",
+            alerts
+        );
+    }
 }
