@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- App Sandbox (REQUIRED for App Store) -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- Team ID will be added during signing -->
+    <key>com.apple.application-identifier</key>
+    <string>$(AppIdentifierPrefix)com.agentdeck.AgentDeck</string>
+
+    <key>com.apple.developer.team-identifier</key>
+    <string>$(TeamIdentifierPrefix)</string>
+
+    <!-- USB/HID Device Access -->
+    <key>com.apple.security.device.usb</key>
+    <true/>
+
+    <!-- Network access -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- File access - User selected files -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+
+    <!-- Temporary exception for hardened runtime requirements -->
+    <!-- Note: App Store review may require justification for these -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>

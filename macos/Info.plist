@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Basic App Identity -->
+    <key>CFBundleName</key>
+    <string>Agent Deck</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>Agent Deck</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>com.agentdeck.AgentDeck</string>
+
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+
+    <key>CFBundleExecutable</key>
+    <string>agent-deck</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleSignature</key>
+    <string>????</string>
+
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+
+    <!-- macOS Specific -->
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+
+    <!-- App is an agent (menu bar app without dock icon) -->
+    <!-- Uncomment if you want it to be a pure menu bar app -->
+    <!-- <key>LSUIElement</key>
+    <true/> -->
+
+    <!-- Required for background execution -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <false/>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+
+    <!-- Privacy Permission Descriptions (required for App Store) -->
+
+    <!-- Accessibility - Required for global hotkeys -->
+    <key>NSAccessibilityUsageDescription</key>
+    <string>Agent Deck needs accessibility access to respond to global keyboard shortcuts (F15-F20) for quick actions.</string>
+
+    <!-- Input Monitoring - Alternative for hotkeys on some systems -->
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>Agent Deck monitors keyboard input to detect global hotkey presses for quick actions.</string>
+
+    <!-- USB Device Access - Required for HID communication -->
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Agent Deck communicates with the Agent Deck hardware macropad via USB HID.</string>
+
+    <!-- Apple Events - May be needed for automation -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Agent Deck may need to send commands to other applications.</string>
+
+    <!-- Copyright -->
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 Agent Deck. Licensed under GPL-3.0-or-later.</string>
+
+    <!-- Application Category -->
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+
+    <!-- Supported Architectures -->
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+        <string>x86_64</string>
+    </array>
+</dict>
+</plist>
