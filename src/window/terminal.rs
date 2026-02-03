@@ -4,16 +4,15 @@
 //! cursor handling, scrollback, and all terminal features.
 //! Supports multiple tabs with browser-style tab bar.
 
-use super::glyph_cache::{GlyphCache, StyleKey};
-use super::new_tab::{render_new_tab_page, NewTabAction};
-use super::settings_modal::{render_settings_modal, SettingsModal, SettingsModalResult};
+use super::context_menu::{render_context_menu, ContextMenuState};
+use super::glyph_cache::GlyphCache;
+use super::input::{build_arrow_seq, build_f1_f4_seq, build_home_end_seq, build_tilde_seq, encode_modifiers, open_url};
+use super::render::{
+    handle_settings_modal_result, render_hyperlink_tooltip, render_tab_bar,
+    render_terminal_content, RenderParams, MAX_TAB_TITLE_LEN, TAB_BAR_HEIGHT,
+};
+use super::settings_modal::{render_settings_modal, SettingsModal};
 use arboard::Clipboard;
-
-/// Claude icon SVG (white, for tinting)
-const CLAUDE_ICON_SVG: &[u8] = include_bytes!("../../assets/icons/claude.svg");
-
-/// Claude orange color
-const CLAUDE_ORANGE: egui::Color32 = egui::Color32::from_rgb(0xD9, 0x77, 0x57);
 use crate::core::bookmarks::BookmarkManager;
 use crate::core::sessions::{SessionId, SessionManager};
 use crate::core::settings::Settings;
@@ -35,58 +34,22 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
-use wezterm_cell::color::ColorAttribute;
 use wezterm_cell::Hyperlink;
-use wezterm_surface::CursorShape;
-use wezterm_term::color::ColorPalette;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, MouseButton, Modifiers, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-/// Tab bar height in logical pixels
-const TAB_BAR_HEIGHT: f32 = 32.0;
-
-/// Maximum tab title length
-const MAX_TAB_TITLE_LEN: usize = 50; // Generous limit; UI handles actual truncation
-
-/// Convert ColorAttribute to egui Color32 using the provided palette
-fn color_attr_to_egui(
-    attr: ColorAttribute,
-    palette: &ColorPalette,
-    is_foreground: bool,
-) -> egui::Color32 {
-    let srgba = if is_foreground {
-        palette.resolve_fg(attr)
-    } else {
-        palette.resolve_bg(attr)
-    };
-    egui::Color32::from_rgb(
-        (srgba.0 * 255.0) as u8,
-        (srgba.1 * 255.0) as u8,
-        (srgba.2 * 255.0) as u8,
-    )
-}
+use crate::core::claude_sessions::{find_most_recent_session, get_sessions_for_directory};
+#[cfg(target_os = "macos")]
+use crate::macos::{update_edit_menu_state, update_recent_sessions_menu, ContextMenuAction, ContextMenuSession, show_context_menu};
 
 /// Channel for sending input to PTY
 pub type InputSender = mpsc::UnboundedSender<Vec<u8>>;
 
 /// Callback type for PTY resize notifications
 pub type ResizeCallback = Box<dyn Fn(u16, u16) + Send + Sync>;
-
-use crate::core::claude_sessions::{find_most_recent_session, get_sessions_for_directory, ClaudeSession};
-
-/// Context menu state for right-click popup
-#[derive(Default)]
-pub struct ContextMenuState {
-    pub is_open: bool,
-    pub position: egui::Pos2,
-    pub submenu_open: bool,
-    pub available_sessions: Vec<ClaudeSession>,
-    /// Time when menu was opened (to prevent immediate close)
-    pub opened_time: f64,
-}
 
 /// Actions that can be triggered from the terminal UI
 #[derive(Debug, Clone)]
@@ -163,7 +126,9 @@ pub struct TerminalWindowState {
     /// Cached line height for resize calculations (Cell for interior mutability)
     cached_line_height: Cell<f32>,
     /// Font size in points
-    font_size: f32,
+    pub font_size: f32,
+    /// Initial font size at app start (for reset)
+    initial_font_size: f32,
     /// Selection start position (row, col) in terminal coordinates
     selection_start: Option<(i64, usize)>,
     /// Selection end position (row, col) in terminal coordinates
@@ -190,7 +155,9 @@ impl TerminalWindowState {
         let estimated_char_width = font_size * 0.6;
         let estimated_line_height = font_size * 1.3;
 
-        let settings = Settings::load().unwrap_or_default();
+        let mut settings = Settings::load().unwrap_or_default();
+        // Sync settings font_size with the actual startup value from config
+        settings.font_size = font_size;
         let bookmark_manager = BookmarkManager::load().unwrap_or_default();
 
         Self {
@@ -212,6 +179,7 @@ impl TerminalWindowState {
             cached_char_width: Cell::new(estimated_char_width),
             cached_line_height: Cell::new(estimated_line_height),
             font_size,
+            initial_font_size: font_size,
             selection_start: None,
             selection_end: None,
             is_selecting: false,
@@ -227,6 +195,13 @@ impl TerminalWindowState {
     /// Get pending actions and clear the queue
     pub fn take_pending_actions(&mut self) -> Vec<TerminalAction> {
         std::mem::take(&mut self.pending_actions)
+    }
+
+    /// Destroy OpenGL resources (must be called before dropping)
+    pub fn destroy(&mut self) {
+        if let Some(ref mut egui_glow) = self.egui_glow {
+            egui_glow.destroy();
+        }
     }
 
     /// Get the active session's terminal session (for legacy compatibility)
@@ -279,12 +254,12 @@ impl TerminalWindowState {
         if let Some(ref window) = self.window {
             let title = if let Some(session) = self.session_manager.active_session() {
                 if session.is_new_tab() {
-                    "🤖".to_string()
+                    "\u{1F916}".to_string()
                 } else {
                     session.working_directory.display().to_string()
                 }
             } else {
-                "🤖".to_string()
+                "\u{1F916}".to_string()
             };
             window.set_title(&title);
         }
@@ -306,9 +281,6 @@ impl TerminalWindowState {
     }
 
     /// Try to resolve the actual Claude session ID for a fresh session
-    ///
-    /// When a fresh session is started (claude_session_id == Some("")), we need to
-    /// discover the actual session ID from Claude's session index after it starts.
     fn try_resolve_session_id(&mut self, session_id: SessionId) {
         let working_dir = {
             let session = match self.session_manager.get_session(session_id) {
@@ -316,20 +288,18 @@ impl TerminalWindowState {
                 None => return,
             };
 
-            // Only resolve if we have a start time and it's been at least 1 second
             let start = match session.session_start_time {
                 Some(t) => t,
                 None => return,
             };
 
             if start.elapsed().as_secs() < 1 {
-                return; // Wait a bit for session to be indexed
+                return;
             }
 
             session.working_directory.clone()
         };
 
-        // Try to find the most recent session
         if let Some(found_id) = find_most_recent_session(&working_dir) {
             if let Some(session) = self.session_manager.get_session_mut(session_id) {
                 info!(
@@ -340,7 +310,6 @@ impl TerminalWindowState {
                 session.needs_session_resolution = false;
             }
 
-            // Trigger save to persist the resolved ID
             self.pending_actions.push(TerminalAction::SaveTabs);
         }
     }
@@ -432,15 +401,80 @@ impl TerminalWindowState {
 
     /// Open context menu at the specified position
     fn open_context_menu(&mut self, x: f32, y: f32) {
-        // Cache available sessions for the current directory (limit to 5 most recent)
-        if let Some(session) = self.session_manager.active_session() {
+        let sessions = if let Some(session) = self.session_manager.active_session() {
             let mut sessions = get_sessions_for_directory(&session.working_directory);
             sessions.truncate(5);
-            self.context_menu.available_sessions = sessions;
+            sessions
         } else {
-            self.context_menu.available_sessions = Vec::new();
+            Vec::new()
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            let menu_sessions: Vec<(String, String)> = sessions
+                .iter()
+                .map(|s| (s.session_id.clone(), s.display_title()))
+                .collect();
+            update_recent_sessions_menu(&menu_sessions);
+
+            if let Some(ref window) = self.window {
+                if let Ok(handle) = window.window_handle() {
+                    use raw_window_handle::RawWindowHandle;
+                    if let RawWindowHandle::AppKit(appkit_handle) = handle.as_raw() {
+                        let view = appkit_handle.ns_view.as_ptr();
+
+                        let has_selection = self.has_selection();
+                        let has_clipboard = Clipboard::new()
+                            .ok()
+                            .and_then(|mut c| c.get_text().ok())
+                            .map(|t| !t.is_empty())
+                            .unwrap_or(false);
+
+                        let menu_sessions: Vec<ContextMenuSession> = sessions
+                            .iter()
+                            .map(|s| ContextMenuSession {
+                                session_id: s.session_id.clone(),
+                                title: s.display_title(),
+                                time_ago: s.relative_modified_time(),
+                            })
+                            .collect();
+
+                        let action = show_context_menu(
+                            view,
+                            x as f64,
+                            y as f64,
+                            has_selection,
+                            has_clipboard,
+                            &menu_sessions,
+                        );
+
+                        if let Some(action) = action {
+                            match action {
+                                ContextMenuAction::NewSession => {
+                                    self.pending_actions.push(TerminalAction::NewTab);
+                                }
+                                ContextMenuAction::FreshSessionHere => {
+                                    self.pending_actions.push(TerminalAction::FreshSessionCurrentDir);
+                                }
+                                ContextMenuAction::LoadSession { session_id } => {
+                                    self.pending_actions.push(TerminalAction::LoadSession { session_id });
+                                }
+                                ContextMenuAction::Copy => {
+                                    self.pending_actions.push(TerminalAction::Copy);
+                                }
+                                ContextMenuAction::Paste => {
+                                    self.pending_actions.push(TerminalAction::Paste);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
         }
 
+        // Fallback to egui context menu
+        self.context_menu.available_sessions = sessions;
         self.context_menu.position = egui::Pos2::new(x, y);
         self.context_menu.is_open = true;
         self.context_menu.submenu_open = false;
@@ -473,6 +507,85 @@ impl TerminalWindowState {
         }
     }
 
+    /// Invalidate the glyph cache (e.g., after font size change)
+    pub fn invalidate_glyph_cache(&mut self) {
+        *self.glyph_cache.borrow_mut() = None;
+    }
+
+    /// Open the settings modal
+    pub fn open_settings(&mut self) {
+        self.settings_modal.open(&self.settings);
+    }
+
+    /// Apply a new font size temporarily (for View menu), without updating settings
+    pub fn apply_font_size_temporary(&mut self, new_size: f32) {
+        self.font_size = new_size;
+        self.apply_font_size_internal(new_size);
+    }
+
+    /// Apply a new font size permanently, updating settings
+    pub fn apply_font_size(&mut self, new_size: f32) {
+        self.font_size = new_size;
+        self.settings.font_size = new_size;
+        self.apply_font_size_internal(new_size);
+    }
+
+    /// Get the initial font size the app started with
+    pub fn initial_font_size(&self) -> f32 {
+        self.initial_font_size
+    }
+
+    /// Internal font size application (shared logic)
+    fn apply_font_size_internal(&mut self, new_size: f32) {
+        if let Some(ref window) = self.window {
+            let scale_factor = window.scale_factor();
+
+            match GlyphCache::new(scale_factor, new_size) {
+                Ok(cache) => {
+                    let cell_width = cache.cell_width() as f32;
+                    let cell_height = cache.cell_height() as f32;
+                    self.cached_char_width.set(cell_width);
+                    self.cached_line_height.set(cell_height);
+                    info!(
+                        "Glyph cache recreated for font_size={}: cell_width={:.2}, cell_height={:.2}",
+                        new_size, cell_width, cell_height
+                    );
+                    *self.glyph_cache.borrow_mut() = Some(cache);
+
+                    let size = window.inner_size();
+                    let width = (size.width as f64 / scale_factor) as f32;
+                    let height = (size.height as f64 / scale_factor) as f32;
+                    let inner_margin = 8.0_f32 * 2.0;
+
+                    let cols = ((width - inner_margin) / cell_width).max(10.0) as u16;
+                    let rows = ((height - inner_margin - TAB_BAR_HEIGHT) / cell_height).max(5.0) as u16;
+
+                    debug!(
+                        "Font size change resize: {:.0}x{:.0} logical -> {}cols x {}rows",
+                        width, height, cols, rows
+                    );
+
+                    for session_info in self.session_manager.iter() {
+                        let sess = session_info.session.lock();
+                        sess.resize(cols as usize, rows as usize);
+                    }
+
+                    if let Some(callback) = &self.resize_callback {
+                        callback(rows, cols);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to recreate glyph cache: {}. Using estimated metrics.", e);
+                    let estimated_char_width = new_size * 0.6;
+                    let estimated_line_height = new_size * 1.3;
+                    self.cached_char_width.set(estimated_char_width);
+                    self.cached_line_height.set(estimated_line_height);
+                    self.invalidate_glyph_cache();
+                }
+            }
+        }
+    }
+
     /// Get selected text from terminal
     pub fn get_selection_text(&self) -> Option<String> {
         let (start, end) = match (self.selection_start, self.selection_end) {
@@ -480,7 +593,6 @@ impl TerminalWindowState {
             _ => return None,
         };
 
-        // Normalize selection (start should be before end)
         let (start, end) = if start.0 < end.0 || (start.0 == end.0 && start.1 <= end.1) {
             (start, end)
         } else {
@@ -533,7 +645,6 @@ impl TerminalWindowState {
         let char_width = self.cached_char_width.get();
         let line_height = self.cached_line_height.get();
 
-        // Account for tab bar and padding
         let tab_bar_height = TAB_BAR_HEIGHT as f64;
         let padding = 8.0;
         let x = (x - padding).max(0.0);
@@ -564,7 +675,6 @@ impl TerminalWindowState {
     fn handle_mouse_press(&mut self, x: f64, y: f64) -> bool {
         let (row, col) = self.screen_to_terminal_coords(x, y);
 
-        // Check for hyperlink
         if let Some(hyperlink) = self.get_hyperlink_at(row as usize, col) {
             let state = self.modifiers.state();
             #[cfg(target_os = "macos")]
@@ -573,7 +683,7 @@ impl TerminalWindowState {
             let should_open = state.control_key();
 
             if should_open {
-                self.open_url(hyperlink.uri());
+                open_url(hyperlink.uri());
                 return true;
             }
         }
@@ -586,6 +696,17 @@ impl TerminalWindowState {
 
     fn handle_mouse_release(&mut self) {
         self.is_selecting = false;
+
+        #[cfg(target_os = "macos")]
+        {
+            let has_selection = self.has_selection();
+            let has_clipboard = arboard::Clipboard::new()
+                .ok()
+                .and_then(|mut c| c.get_text().ok())
+                .map(|t| !t.is_empty())
+                .unwrap_or(false);
+            update_edit_menu_state(has_selection, has_clipboard);
+        }
     }
 
     fn handle_mouse_move(&mut self, x: f64, y: f64) {
@@ -617,24 +738,6 @@ impl TerminalWindowState {
         })
     }
 
-    fn open_url(&self, url: &str) {
-        info!("Opening URL: {}", url);
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("open").arg(url).spawn();
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", "", url])
-                .spawn();
-        }
-    }
-
     /// Create the window (call from resumed handler)
     pub fn create_window(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -649,7 +752,6 @@ impl TerminalWindowState {
             .with_inner_size(LogicalSize::new(geometry.width, geometry.height))
             .with_visible(false);
 
-        // Set position if we have saved coordinates
         if let (Some(x), Some(y)) = (geometry.x, geometry.y) {
             window_attrs = window_attrs.with_position(LogicalPosition::new(x, y));
         }
@@ -723,8 +825,7 @@ impl TerminalWindowState {
         let scale_factor = window.scale_factor();
         debug!("Initializing glyph cache with scale_factor {}", scale_factor);
 
-        // Configure egui fonts - keep defaults for proportional (has Unicode support),
-        // add JetBrainsMono for monospace
+        // Configure egui fonts
         {
             let mut fonts = egui::FontDefinitions::default();
             let jetbrains_mono = include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
@@ -740,7 +841,7 @@ impl TerminalWindowState {
             egui_glow.egui_ctx.set_fonts(fonts);
         }
 
-        match GlyphCache::new(scale_factor) {
+        match GlyphCache::new(scale_factor, self.font_size) {
             Ok(cache) => {
                 let cell_width = cache.cell_width() as f32;
                 let cell_height = cache.cell_height() as f32;
@@ -768,7 +869,6 @@ impl TerminalWindowState {
             self.handle_resize(initial_size.width, initial_size.height);
         }
 
-        // Update title based on active session
         self.update_window_title();
 
         info!("Terminal window created");
@@ -780,13 +880,10 @@ impl TerminalWindowState {
         let size = window.inner_size();
         let scale_factor = window.scale_factor();
 
-        // Convert physical size to logical
         let logical_width = size.width as f64 / scale_factor;
         let logical_height = size.height as f64 / scale_factor;
 
-        // Get position (may fail on some platforms)
         let position = window.outer_position().ok().map(|pos| {
-            // Convert physical position to logical
             let logical_x = (pos.x as f64 / scale_factor) as i32;
             let logical_y = (pos.y as f64 / scale_factor) as i32;
             (logical_x, logical_y)
@@ -802,11 +899,21 @@ impl TerminalWindowState {
 
     /// Handle window event - returns true if event was consumed
     pub fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
-        if let Some(ref mut egui_glow) = self.egui_glow {
-            let response = egui_glow.on_window_event(self.window.as_ref().unwrap(), event);
-            if response.repaint {
-                if let Some(ref window) = self.window {
-                    window.request_redraw();
+        let egui_should_handle_keyboard = self.settings_modal.is_open
+            || self.session_manager.active_session().map_or(true, |s| !s.is_running);
+
+        let should_pass_to_egui = match event {
+            WindowEvent::KeyboardInput { .. } => egui_should_handle_keyboard,
+            _ => true,
+        };
+
+        if should_pass_to_egui {
+            if let Some(ref mut egui_glow) = self.egui_glow {
+                let response = egui_glow.on_window_event(self.window.as_ref().unwrap(), event);
+                if response.repaint {
+                    if let Some(ref window) = self.window {
+                        window.request_redraw();
+                    }
                 }
             }
         }
@@ -816,13 +923,11 @@ impl TerminalWindowState {
                 self.modifiers = new_modifiers.clone();
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // Don't handle key input if settings modal is open
                 if self.settings_modal.is_open {
                     return false;
                 }
 
                 if event.state == ElementState::Pressed {
-                    // Close context menu on Escape
                     if let Key::Named(NamedKey::Escape) = &event.logical_key {
                         if self.context_menu.is_open {
                             self.close_context_menu();
@@ -833,16 +938,13 @@ impl TerminalWindowState {
                         }
                     }
 
-                    // Close context menu on any other key input
                     if self.context_menu.is_open {
                         self.close_context_menu();
                         if let Some(ref window) = self.window {
                             window.request_redraw();
                         }
-                        // Don't consume the event, let it be processed normally
                     }
 
-                    // Handle Cmd+T for new tab, Cmd+W for close tab
                     let state = self.modifiers.state();
                     if state.super_key() && !state.control_key() && !state.alt_key() {
                         if let Key::Character(c) = &event.logical_key {
@@ -858,11 +960,9 @@ impl TerminalWindowState {
                                     return true;
                                 }
                                 "," => {
-                                    // Cmd+, for settings
                                     self.settings_modal.open(&self.settings);
                                     return true;
                                 }
-                                // Cmd+1-9 for tab switching
                                 "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                                     let idx = c.chars().next().unwrap().to_digit(10).unwrap() as usize - 1;
                                     let sessions = self.session_manager.sessions();
@@ -877,13 +977,11 @@ impl TerminalWindowState {
                         }
                     }
 
-                    // F20 (Claude button) opens new tab
                     if let Key::Named(NamedKey::F20) = &event.logical_key {
                         self.pending_actions.push(TerminalAction::NewTab);
                         return true;
                     }
 
-                    // Only forward to PTY if we have an active running session
                     if let Some(session) = self.session_manager.active_session() {
                         if session.is_running {
                             self.handle_key_input(event);
@@ -893,7 +991,6 @@ impl TerminalWindowState {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // Don't scroll terminal when context menu is open (let egui handle it)
                 if self.context_menu.is_open {
                     return true;
                 }
@@ -912,8 +1009,6 @@ impl TerminalWindowState {
             WindowEvent::MouseInput { state, button, .. } => {
                 if *button == MouseButton::Left {
                     if *state == ElementState::Pressed {
-                        // Don't close context menu here - let egui handle it so menu items can be clicked
-                        // The context menu will close itself when clicked outside (handled in render_context_menu)
                         if !self.context_menu.is_open {
                             if let Some((x, y)) = self.cursor_position {
                                 self.handle_mouse_press(x, y);
@@ -929,7 +1024,6 @@ impl TerminalWindowState {
                     }
                     return true;
                 } else if *button == MouseButton::Right && *state == ElementState::Pressed {
-                    // Right-click to open context menu
                     if let Some(session) = self.session_manager.active_session() {
                         if !session.is_new_tab() {
                             if let Some((x, y)) = self.cursor_position {
@@ -954,74 +1048,27 @@ impl TerminalWindowState {
                     }
                 }
             }
+            WindowEvent::Focused(focused) => {
+                if *focused {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let has_selection = self.has_selection();
+                        let has_clipboard = arboard::Clipboard::new()
+                            .ok()
+                            .and_then(|mut c| c.get_text().ok())
+                            .map(|t| !t.is_empty())
+                            .unwrap_or(false);
+                        update_edit_menu_state(has_selection, has_clipboard);
+                    }
+                }
+            }
             _ => {}
         }
 
         false
     }
 
-    fn encode_modifiers(&self) -> Option<u8> {
-        let state = self.modifiers.state();
-        let mut code = 0u8;
-        if state.shift_key() {
-            code |= 1;
-        }
-        if state.alt_key() {
-            code |= 2;
-        }
-        if state.control_key() {
-            code |= 4;
-        }
-        if code == 0 {
-            None
-        } else {
-            Some(code + 1)
-        }
-    }
-
-    fn build_arrow_seq(&self, key_char: u8) -> Vec<u8> {
-        match self.encode_modifiers() {
-            Some(m) => vec![0x1b, b'[', b'1', b';', b'0' + m, key_char],
-            None => vec![0x1b, b'[', key_char],
-        }
-    }
-
-    fn build_home_end_seq(&self, key_char: u8) -> Vec<u8> {
-        match self.encode_modifiers() {
-            Some(m) => vec![0x1b, b'[', b'1', b';', b'0' + m, key_char],
-            None => vec![0x1b, b'[', key_char],
-        }
-    }
-
-    fn build_tilde_seq(&self, code: &[u8]) -> Vec<u8> {
-        match self.encode_modifiers() {
-            Some(m) => {
-                let mut seq = vec![0x1b, b'['];
-                seq.extend_from_slice(code);
-                seq.push(b';');
-                seq.push(b'0' + m);
-                seq.push(b'~');
-                seq
-            }
-            None => {
-                let mut seq = vec![0x1b, b'['];
-                seq.extend_from_slice(code);
-                seq.push(b'~');
-                seq
-            }
-        }
-    }
-
-    fn build_f1_f4_seq(&self, key_char: u8) -> Vec<u8> {
-        match self.encode_modifiers() {
-            Some(m) => vec![0x1b, b'[', b'1', b';', b'0' + m, key_char],
-            None => vec![0x1b, b'O', key_char],
-        }
-    }
-
     fn handle_key_input(&mut self, event: &winit::event::KeyEvent) {
-        self.scroll_to_bottom();
-
         let state = self.modifiers.state();
         let ctrl = state.control_key();
         let alt = state.alt_key();
@@ -1057,6 +1104,8 @@ impl TerminalWindowState {
             }
         }
 
+        let modifiers = encode_modifiers(shift, alt, ctrl);
+
         let bytes: Option<Vec<u8>> = match &event.logical_key {
             Key::Named(named) => match named {
                 NamedKey::Enter => {
@@ -1085,16 +1134,16 @@ impl TerminalWindowState {
                     }
                 }
                 NamedKey::Escape => Some(vec![0x1b]),
-                NamedKey::ArrowUp => Some(self.build_arrow_seq(b'A')),
-                NamedKey::ArrowDown => Some(self.build_arrow_seq(b'B')),
-                NamedKey::ArrowRight => Some(self.build_arrow_seq(b'C')),
-                NamedKey::ArrowLeft => Some(self.build_arrow_seq(b'D')),
-                NamedKey::Home => Some(self.build_home_end_seq(b'H')),
-                NamedKey::End => Some(self.build_home_end_seq(b'F')),
-                NamedKey::PageUp => Some(self.build_tilde_seq(b"5")),
-                NamedKey::PageDown => Some(self.build_tilde_seq(b"6")),
-                NamedKey::Delete => Some(self.build_tilde_seq(b"3")),
-                NamedKey::Insert => Some(self.build_tilde_seq(b"2")),
+                NamedKey::ArrowUp => Some(build_arrow_seq(modifiers, b'A')),
+                NamedKey::ArrowDown => Some(build_arrow_seq(modifiers, b'B')),
+                NamedKey::ArrowRight => Some(build_arrow_seq(modifiers, b'C')),
+                NamedKey::ArrowLeft => Some(build_arrow_seq(modifiers, b'D')),
+                NamedKey::Home => Some(build_home_end_seq(modifiers, b'H')),
+                NamedKey::End => Some(build_home_end_seq(modifiers, b'F')),
+                NamedKey::PageUp => Some(build_tilde_seq(modifiers, b"5")),
+                NamedKey::PageDown => Some(build_tilde_seq(modifiers, b"6")),
+                NamedKey::Delete => Some(build_tilde_seq(modifiers, b"3")),
+                NamedKey::Insert => Some(build_tilde_seq(modifiers, b"2")),
                 NamedKey::Space => {
                     if ctrl {
                         Some(vec![0x00])
@@ -1104,18 +1153,18 @@ impl TerminalWindowState {
                         Some(vec![b' '])
                     }
                 }
-                NamedKey::F1 => Some(self.build_f1_f4_seq(b'P')),
-                NamedKey::F2 => Some(self.build_f1_f4_seq(b'Q')),
-                NamedKey::F3 => Some(self.build_f1_f4_seq(b'R')),
-                NamedKey::F4 => Some(self.build_f1_f4_seq(b'S')),
-                NamedKey::F5 => Some(self.build_tilde_seq(b"15")),
-                NamedKey::F6 => Some(self.build_tilde_seq(b"17")),
-                NamedKey::F7 => Some(self.build_tilde_seq(b"18")),
-                NamedKey::F8 => Some(self.build_tilde_seq(b"19")),
-                NamedKey::F9 => Some(self.build_tilde_seq(b"20")),
-                NamedKey::F10 => Some(self.build_tilde_seq(b"21")),
-                NamedKey::F11 => Some(self.build_tilde_seq(b"23")),
-                NamedKey::F12 => Some(self.build_tilde_seq(b"24")),
+                NamedKey::F1 => Some(build_f1_f4_seq(modifiers, b'P')),
+                NamedKey::F2 => Some(build_f1_f4_seq(modifiers, b'Q')),
+                NamedKey::F3 => Some(build_f1_f4_seq(modifiers, b'R')),
+                NamedKey::F4 => Some(build_f1_f4_seq(modifiers, b'S')),
+                NamedKey::F5 => Some(build_tilde_seq(modifiers, b"15")),
+                NamedKey::F6 => Some(build_tilde_seq(modifiers, b"17")),
+                NamedKey::F7 => Some(build_tilde_seq(modifiers, b"18")),
+                NamedKey::F8 => Some(build_tilde_seq(modifiers, b"19")),
+                NamedKey::F9 => Some(build_tilde_seq(modifiers, b"20")),
+                NamedKey::F10 => Some(build_tilde_seq(modifiers, b"21")),
+                NamedKey::F11 => Some(build_tilde_seq(modifiers, b"23")),
+                NamedKey::F12 => Some(build_tilde_seq(modifiers, b"24")),
                 _ => None,
             },
             Key::Character(c) => {
@@ -1202,6 +1251,7 @@ impl TerminalWindowState {
 
         if let Some(ref data) = bytes {
             debug!("Sending to PTY: {:?}", data);
+            self.scroll_to_bottom();
             self.clear_selection();
             self.send_to_pty(data);
         }
@@ -1230,7 +1280,6 @@ impl TerminalWindowState {
 
         debug!("Window resize: {:.0}x{:.0} logical -> {}cols x {}rows", width, height, cols, rows);
 
-        // Resize all sessions
         for session_info in self.session_manager.iter() {
             let sess = session_info.session.lock();
             sess.resize(cols as usize, rows as usize);
@@ -1248,7 +1297,6 @@ impl TerminalWindowState {
 
     /// Render the window
     pub fn render(&mut self) {
-        // Process notifications for active session
         self.process_notifications();
 
         if !self.is_visible() {
@@ -1268,7 +1316,6 @@ impl TerminalWindowState {
             return;
         };
 
-        // Capture values that need immutable self access before mutable borrow
         let scroll_offset = self.scroll_offset.load(Ordering::Relaxed) as usize;
         let font_size = self.font_size;
         let color_scheme = self.settings.color_scheme;
@@ -1278,12 +1325,6 @@ impl TerminalWindowState {
             return;
         };
 
-        let cached_char_width = &self.cached_char_width;
-        let cached_line_height = &self.cached_line_height;
-        let glyph_cache = &self.glyph_cache;
-        let hovered_hyperlink = &self.hovered_hyperlink;
-
-        // Capture selection state for rendering
         let selection = match (self.selection_start, self.selection_end) {
             (Some(start), Some(end)) => {
                 let (start, end) = if start.0 < end.0 || (start.0 == end.0 && start.1 <= end.1) {
@@ -1296,11 +1337,8 @@ impl TerminalWindowState {
             _ => None,
         };
 
-        // Collect data needed for rendering
-        // Compute disambiguated titles for all sessions
         let display_titles = self.session_manager.compute_display_titles(MAX_TAB_TITLE_LEN);
 
-        // Tuple: (id, title, is_new_tab, is_running, working_dir, is_loading, terminal_title, bell_active)
         let sessions_data: Vec<_> = self
             .session_manager
             .sessions()
@@ -1314,347 +1352,47 @@ impl TerminalWindowState {
                 s.is_loading,
                 s.terminal_title.clone(),
                 s.bell_active,
+                s.claude_activity,
+                s.finished_in_background,
             ))
             .collect();
         let active_session_idx = self.session_manager.active_session_index();
         let hid_connected = self.hid_connected;
 
-        // Get active session data (session, claude_state, is_new_tab, session_id)
         let active_session_data = self.session_manager.active_session().map(|s| {
             (Arc::clone(&s.session), Arc::clone(&s.claude_state), s.is_new_tab(), s.id)
         });
 
-        // Clone bookmark manager for new tab rendering
         let bookmark_manager = self.bookmark_manager.clone();
 
-        // Track pending actions
         let mut new_actions = Vec::new();
 
-        // Track if we need to install image loaders
         let need_install_loaders = !self.image_loaders_installed;
 
-        egui_glow.run(window, |ctx| {
-            // Install image loaders once (for SVG support)
-            if need_install_loaders {
-                egui_extras::install_image_loaders(ctx);
-            }
+        let render_params = RenderParams {
+            scroll_offset,
+            font_size,
+            color_scheme,
+            has_selection_for_menu,
+            sessions_data,
+            active_session_idx,
+            hid_connected,
+            active_session_data,
+            bookmark_manager,
+            selection,
+            cached_char_width: &self.cached_char_width,
+            cached_line_height: &self.cached_line_height,
+            glyph_cache: &self.glyph_cache,
+            hovered_hyperlink: &self.hovered_hyperlink,
+        };
 
+        egui_glow.run(window, |ctx| {
             // Tab bar at top
             egui::TopBottomPanel::top("tab_bar")
                 .frame(egui::Frame::default().fill(color_scheme.tab_bar_background()))
                 .exact_height(TAB_BAR_HEIGHT)
                 .show(ctx, |ui| {
-                    // Override button visual style for tabs
-                    ui.style_mut().visuals.widgets.inactive.bg_fill = color_scheme.inactive_tab_background();
-                    ui.style_mut().visuals.widgets.hovered.bg_fill = color_scheme.inactive_tab_background();
-                    ui.style_mut().visuals.widgets.active.bg_fill = color_scheme.active_tab_background();
-                    ui.style_mut().visuals.widgets.inactive.weak_bg_fill = color_scheme.inactive_tab_background();
-                    ui.style_mut().visuals.widgets.hovered.weak_bg_fill = color_scheme.inactive_tab_background();
-                    ui.style_mut().visuals.widgets.active.weak_bg_fill = color_scheme.active_tab_background();
-                    // Remove yellow/olive stroke
-                    ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                    ui.style_mut().visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80));
-                    ui.style_mut().visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-
-                    // Calculate available width for tabs
-                    let total_width = ui.available_width();
-                    let right_icons_width = 70.0; // Settings + indicator + padding
-                    let new_tab_btn_width = 32.0;
-                    let tab_spacing = 1.0; // Gap between tabs
-                    let tab_padding = 8.0; // Internal padding per tab
-                    let tabs_area_width = total_width - right_icons_width - new_tab_btn_width - 8.0;
-
-                    // Calculate per-tab width (including padding) to fill available space
-                    let num_tabs = sessions_data.len().max(1);
-                    let min_tab_width = 108.0_f32; // Minimum total tab width including padding
-                    // Account for spacing between tabs: (n-1) gaps for n tabs
-                    let total_spacing = if num_tabs > 1 { (num_tabs - 1) as f32 * tab_spacing } else { 0.0 };
-                    let available_for_tabs = tabs_area_width - total_spacing;
-                    // Calculate full tab width (including padding)
-                    let full_tab_width = (available_for_tabs / num_tabs as f32).max(min_tab_width);
-                    // Calculate how many tabs actually fit
-                    let max_visible_tabs = ((tabs_area_width + tab_spacing) / (full_tab_width + tab_spacing)).floor() as usize;
-                    // The base tab_width without padding (for internal use)
-                    let tab_width = full_tab_width - tab_padding;
-
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = tab_spacing;
-
-                        // Constrain tabs + new tab button to their allocated area
-                        let tabs_plus_btn_width = tabs_area_width + new_tab_btn_width + 4.0;
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(tabs_plus_btn_width, TAB_BAR_HEIGHT),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.set_clip_rect(ui.max_rect());
-
-                        // Render only tabs that fit
-                        for (idx, (id, title, _is_new, is_running, working_dir, is_loading, terminal_title, bell_active)) in sessions_data.iter().take(max_visible_tabs).enumerate() {
-                            let is_active = idx == active_session_idx;
-                            let tab_bg = if is_active {
-                                color_scheme.active_tab_background()
-                            } else if *bell_active {
-                                // Visual bell indicator
-                                color_scheme.bell_tab_background()
-                            } else {
-                                color_scheme.inactive_tab_background()
-                            };
-                            // Dim text for placeholder tabs (not yet started)
-                            let text_color = if *is_running || *_is_new || *is_loading {
-                                color_scheme.foreground()
-                            } else {
-                                // Dimmed for placeholder tabs
-                                let fg = color_scheme.foreground();
-                                egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 150)
-                            };
-
-                            // Allocate the entire tab area with click sensing
-                            let tab_size = egui::vec2(full_tab_width, TAB_BAR_HEIGHT - 4.0);
-                            let (tab_rect, tab_response) = ui.allocate_exact_size(
-                                tab_size,
-                                egui::Sense::click(),
-                            );
-
-                            // Draw tab background
-                            ui.painter().rect_filled(
-                                tab_rect,
-                                egui::Rounding {
-                                    nw: 4.0,
-                                    ne: 4.0,
-                                    sw: 0.0,
-                                    se: 0.0,
-                                },
-                                tab_bg,
-                            );
-
-                            // Close button rect (positioned at right side of tab)
-                            let close_size = 18.0;
-                            let close_btn_margin = 4.0;
-                            let close_rect = egui::Rect::from_min_size(
-                                egui::pos2(
-                                    tab_rect.right() - close_size - close_btn_margin,
-                                    tab_rect.center().y - close_size / 2.0,
-                                ),
-                                egui::vec2(close_size, close_size),
-                            );
-
-                            // Check if close button was clicked
-                            let close_clicked = tab_response.clicked()
-                                && tab_response.interact_pointer_pos()
-                                    .map(|pos| close_rect.contains(pos))
-                                    .unwrap_or(false);
-
-                            // Render tab content inside the allocated area
-                            // Account for close button space on the right
-                            let content_padding = 4.0;
-                            let close_btn_total_width = close_size + close_btn_margin + content_padding;
-                            let content_rect = egui::Rect::from_min_max(
-                                tab_rect.min + egui::vec2(content_padding, 0.0),
-                                tab_rect.max - egui::vec2(close_btn_total_width, 0.0),
-                            );
-                            let mut content_ui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
-                            content_ui.set_width(tab_width);
-                            content_ui.set_height(TAB_BAR_HEIGHT - 4.0);
-
-                            {
-                                let ui = &mut content_ui;
-
-                                    // Use a horizontal layout with title taking remaining space
-                                    ui.horizontal_centered(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-
-                                        // Left padding
-                                        ui.add_space(6.0);
-
-                                        // Claude icon or loading spinner
-                                        let icon_size = 14.0;
-                                        if *is_loading {
-                                            // Show spinning loader when loading
-                                            let time = ui.input(|i| i.time);
-                                            let angle = time * 3.0; // Rotate 3 radians per second
-                                            let spinner_color = CLAUDE_ORANGE;
-
-                                            // Draw a simple spinning arc
-                                            let (rect, _) = ui.allocate_exact_size(
-                                                egui::vec2(icon_size, icon_size),
-                                                egui::Sense::hover(),
-                                            );
-                                            let center = rect.center();
-                                            let radius = icon_size / 2.0 - 1.0;
-                                            let painter = ui.painter();
-
-                                            // Draw arc segments to create spinner effect
-                                            let segments = 8;
-                                            for i in 0..segments {
-                                                let start_angle = angle as f32 + (i as f32 * std::f32::consts::TAU / segments as f32);
-                                                let alpha = ((i as f32 / segments as f32) * 200.0) as u8 + 55;
-                                                let color = egui::Color32::from_rgba_unmultiplied(
-                                                    spinner_color.r(),
-                                                    spinner_color.g(),
-                                                    spinner_color.b(),
-                                                    alpha,
-                                                );
-                                                let x = center.x + radius * start_angle.cos();
-                                                let y = center.y + radius * start_angle.sin();
-                                                painter.circle_filled(egui::pos2(x, y), 1.5, color);
-                                            }
-                                        } else {
-                                            // Claude icon (orange when running, gray when not)
-                                            let icon_tint = if *is_running {
-                                                CLAUDE_ORANGE // Orange for running tabs
-                                            } else {
-                                                egui::Color32::from_gray(100) // Gray for inactive/new tabs
-                                            };
-
-                                            ui.add(
-                                                egui::Image::from_bytes(
-                                                    "bytes://claude-icon.svg",
-                                                    CLAUDE_ICON_SVG,
-                                                )
-                                                .fit_to_exact_size(egui::vec2(icon_size, icon_size))
-                                                .tint(icon_tint),
-                                            );
-                                        }
-
-                                        // Tab title (centered, takes remaining space)
-                                        ui.with_layout(
-                                            egui::Layout::left_to_right(egui::Align::Center)
-                                                .with_main_justify(true),
-                                            |ui| {
-                                                // Display loading text when loading
-                                                let display_title = if *is_loading {
-                                                    "Starting..."
-                                                } else {
-                                                    title.as_str()
-                                                };
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(display_title)
-                                                            .size(13.0)
-                                                            .color(text_color),
-                                                    )
-                                                    .selectable(false)
-                                                    .truncate(),
-                                                );
-                                            },
-                                        );
-
-                                        // Space for close button (rendered separately below)
-                                        ui.add_space(close_size + 4.0);
-                                    });
-                            }
-
-                            // Draw close button
-                            let close_hovered = ui.rect_contains_pointer(close_rect);
-                            let close_color = if close_hovered {
-                                egui::Color32::WHITE
-                            } else {
-                                egui::Color32::GRAY
-                            };
-                            ui.painter().text(
-                                close_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "×",
-                                egui::FontId::proportional(14.0),
-                                close_color,
-                            );
-
-                            // Set cursor to pointer for tab
-                            if tab_response.hovered() {
-                                ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-                            }
-
-                            // Add tooltip with conversation title (if available) and full directory path
-                            // Skip tooltip for new tabs (empty working directory)
-                            if !working_dir.is_empty() {
-                                let tooltip_text = if let Some(term_title) = terminal_title {
-                                    if !term_title.is_empty() {
-                                        format!("{}\n{}", term_title, working_dir)
-                                    } else {
-                                        working_dir.clone()
-                                    }
-                                } else {
-                                    working_dir.clone()
-                                };
-                                tab_response.clone().on_hover_text(tooltip_text);
-                            }
-
-                            // Handle clicks
-                            if close_clicked {
-                                new_actions.push(TerminalAction::CloseTab(*id));
-                            } else if tab_response.clicked() {
-                                new_actions.push(TerminalAction::SwitchTab(*id));
-                            }
-
-                            // Middle-click to close
-                            if tab_response.middle_clicked() {
-                                new_actions.push(TerminalAction::CloseTab(*id));
-                            }
-                        }
-
-                        // New tab button
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("+")
-                                        .size(16.0)
-                                        .color(color_scheme.foreground()),
-                                )
-                                .fill(color_scheme.inactive_tab_background())
-                                .stroke(egui::Stroke::NONE)
-                                .rounding(egui::Rounding {
-                                    nw: 4.0,
-                                    ne: 4.0,
-                                    sw: 0.0,
-                                    se: 0.0,
-                                })
-                                .min_size(egui::vec2(new_tab_btn_width, TAB_BAR_HEIGHT - 4.0)),
-                            )
-                            .on_hover_text("New Tab (Cmd+T)")
-                            .clicked()
-                        {
-                            new_actions.push(TerminalAction::NewTab);
-                        }
-                            }); // End of allocate_ui_with_layout for tabs + new tab button
-
-                        // Right side: settings and connection indicator
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(8.0);
-
-                            // HID connection indicator
-                            let (indicator_color, indicator_text) = if hid_connected {
-                                (egui::Color32::from_rgb(50, 205, 50), "Connected")
-                            } else {
-                                (egui::Color32::from_rgb(220, 20, 60), "Disconnected")
-                            };
-
-                            ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new("●").size(12.0).color(indicator_color),
-                                )
-                                .frame(false),
-                            )
-                            .on_hover_text(indicator_text);
-
-                            ui.add_space(8.0);
-
-                            // Settings button
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("⚙")
-                                            .size(16.0)
-                                            .color(color_scheme.foreground()),
-                                    )
-                                    .frame(false),
-                                )
-                                .on_hover_text("Settings (Cmd+,)")
-                                .clicked()
-                            {
-                                new_actions.push(TerminalAction::OpenSettings);
-                            }
-                        });
-                    });
+                    render_tab_bar(ui, ctx, &render_params, &mut new_actions, need_install_loaders);
                 });
 
             // Main content area
@@ -1665,421 +1403,15 @@ impl TerminalWindowState {
                         .inner_margin(8.0),
                 )
                 .show(ctx, |ui| {
-                    if let Some((session, _claude_state, is_new_tab, session_id)) = &active_session_data {
-                        if *is_new_tab {
-                            // Render new tab page with session_id for per-tab state
-                            if let Some(action) =
-                                render_new_tab_page(ui, &bookmark_manager, color_scheme, *session_id)
-                            {
-                                match action {
-                                    NewTabAction::OpenDirectory { path, resume_session } => {
-                                        new_actions.push(TerminalAction::OpenDirectory { path, resume_session });
-                                    }
-                                    NewTabAction::BrowseDirectory => {
-                                        new_actions.push(TerminalAction::BrowseDirectory);
-                                    }
-                                    NewTabAction::AddBookmark(path) => {
-                                        new_actions.push(TerminalAction::AddBookmark(path));
-                                    }
-                                    NewTabAction::RemoveBookmark(path) => {
-                                        new_actions.push(TerminalAction::RemoveBookmark(path));
-                                    }
-                                    NewTabAction::RemoveRecent(path) => {
-                                        new_actions.push(TerminalAction::RemoveRecent(path));
-                                    }
-                                    NewTabAction::ClearRecent => {
-                                        new_actions.push(TerminalAction::ClearRecent);
-                                    }
-                                }
-                            }
-                        } else {
-                            // Render terminal
-                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                            ui.style_mut().spacing.interact_size = egui::vec2(0.0, 0.0);
-
-                            let sess = session.lock();
-                            let palette = sess.palette().clone();
-
-                            sess.with_terminal_mut(|term| {
-                                let cursor = term.cursor_pos();
-                                let screen = term.screen_mut();
-                                let physical_rows = screen.physical_rows;
-
-                                let content_min = ui.cursor().min;
-
-                                let (char_width, line_height) = {
-                                    let cache_ref = glyph_cache.borrow();
-                                    if let Some(ref cache) = *cache_ref {
-                                        (cache.cell_width() as f32, cache.cell_height() as f32)
-                                    } else {
-                                        let font_id = egui::FontId::monospace(font_size);
-                                        (
-                                            ctx.fonts(|f| f.glyph_width(&font_id, 'M')),
-                                            ctx.fonts(|f| f.row_height(&font_id)),
-                                        )
-                                    }
-                                };
-
-                                cached_char_width.set(char_width);
-                                cached_line_height.set(line_height);
-
-                                let total_lines = screen.scrollback_rows();
-                                let visible_start =
-                                    total_lines.saturating_sub(physical_rows + scroll_offset);
-
-                                let painter = ui.painter();
-                                let default_bg = color_scheme.background();
-
-                                let mut cells_to_render: Vec<(
-                                    usize,
-                                    usize,
-                                    usize,
-                                    String,
-                                    egui::Color32,
-                                    Option<egui::Color32>,
-                                    bool,
-                                    bool,
-                                    bool,
-                                    bool,
-                                    bool,
-                                )> = Vec::new();
-
-                                for row_idx in 0..physical_rows {
-                                    let phys_idx = visible_start + row_idx;
-                                    if phys_idx >= total_lines {
-                                        continue;
-                                    }
-
-                                    let line = screen.line_mut(phys_idx);
-                                    let current_row = phys_idx as i64;
-
-                                    for cell in line.visible_cells() {
-                                        let col_idx = cell.cell_index();
-                                        let attrs = cell.attrs();
-                                        let mut fg =
-                                            color_attr_to_egui(attrs.foreground(), &palette, true);
-                                        let bg_attr = attrs.background();
-                                        let mut bg = if bg_attr == ColorAttribute::Default {
-                                            None
-                                        } else {
-                                            Some(color_attr_to_egui(bg_attr, &palette, false))
-                                        };
-
-                                        if let Some((sel_start, sel_end)) = selection {
-                                            let in_selection = if sel_start.0 == sel_end.0 {
-                                                current_row == sel_start.0
-                                                    && col_idx >= sel_start.1
-                                                    && col_idx < sel_end.1
-                                            } else if current_row == sel_start.0 {
-                                                col_idx >= sel_start.1
-                                            } else if current_row == sel_end.0 {
-                                                col_idx < sel_end.1
-                                            } else {
-                                                current_row > sel_start.0
-                                                    && current_row < sel_end.0
-                                            };
-
-                                            if in_selection {
-                                                fg = egui::Color32::WHITE;
-                                                bg = Some(color_scheme.selection_background());
-                                            }
-                                        }
-
-                                        use wezterm_cell::Intensity;
-                                        let is_bold = matches!(attrs.intensity(), Intensity::Bold);
-                                        match attrs.intensity() {
-                                            Intensity::Bold => {
-                                                fg = egui::Color32::from_rgb(
-                                                    (fg.r() as u16 * 5 / 4).min(255) as u8,
-                                                    (fg.g() as u16 * 5 / 4).min(255) as u8,
-                                                    (fg.b() as u16 * 5 / 4).min(255) as u8,
-                                                );
-                                            }
-                                            Intensity::Half => {
-                                                fg = egui::Color32::from_rgb(
-                                                    fg.r() / 2,
-                                                    fg.g() / 2,
-                                                    fg.b() / 2,
-                                                );
-                                            }
-                                            Intensity::Normal => {}
-                                        }
-
-                                        if attrs.reverse() {
-                                            let temp_fg = fg;
-                                            fg = bg.unwrap_or(default_bg);
-                                            bg = Some(temp_fg);
-                                        }
-
-                                        if attrs.invisible() {
-                                            fg = bg.unwrap_or(default_bg);
-                                        }
-
-                                        let is_italic = attrs.italic();
-                                        use wezterm_cell::Underline;
-
-                                        let cell_hyperlink = attrs.hyperlink();
-                                        let has_hyperlink = cell_hyperlink.is_some();
-
-                                        let is_hovered_hyperlink =
-                                            match (cell_hyperlink, hovered_hyperlink) {
-                                                (Some(cell_link), Some(hovered_link)) => {
-                                                    Arc::ptr_eq(cell_link, hovered_link)
-                                                }
-                                                _ => false,
-                                            };
-
-                                        let has_underline =
-                                            attrs.underline() != Underline::None || has_hyperlink;
-                                        if is_hovered_hyperlink {
-                                            fg = egui::Color32::from_rgb(100, 149, 237);
-                                        } else if has_hyperlink {
-                                            fg = egui::Color32::from_rgb(80, 120, 200);
-                                        }
-
-                                        let has_strikethrough = attrs.strikethrough();
-
-                                        let text = cell.str();
-                                        let display_text = if text.is_empty() {
-                                            " ".to_string()
-                                        } else {
-                                            text.to_string()
-                                        };
-
-                                        let cell_width = cell.width();
-
-                                        cells_to_render.push((
-                                            row_idx,
-                                            col_idx,
-                                            cell_width,
-                                            display_text,
-                                            fg,
-                                            bg,
-                                            is_bold,
-                                            is_italic,
-                                            has_underline,
-                                            has_strikethrough,
-                                            is_hovered_hyperlink,
-                                        ));
-                                    }
-                                }
-
-                                let mut cache_ref = glyph_cache.borrow_mut();
-                                let use_glyph_cache = cache_ref.is_some();
-
-                                for (
-                                    row_idx,
-                                    col_idx,
-                                    cell_width,
-                                    text,
-                                    fg,
-                                    bg,
-                                    is_bold,
-                                    is_italic,
-                                    has_underline,
-                                    has_strikethrough,
-                                    _is_hovered_hyperlink,
-                                ) in cells_to_render
-                                {
-                                    let cell_x = content_min.x + col_idx as f32 * char_width;
-                                    let cell_y = content_min.y + row_idx as f32 * line_height;
-                                    let total_cell_width = cell_width as f32 * char_width;
-                                    let cell_rect = egui::Rect::from_min_size(
-                                        egui::pos2(cell_x, cell_y),
-                                        egui::vec2(total_cell_width, line_height),
-                                    );
-
-                                    if let Some(bg_color) = bg {
-                                        painter.rect_filled(cell_rect, 0.0, bg_color);
-                                    }
-
-                                    let style_key = StyleKey::from_attrs(is_bold, is_italic);
-
-                                    if use_glyph_cache {
-                                        if let Some(ref mut cache) = *cache_ref {
-                                            if let Some(glyph) =
-                                                cache.get_glyph(ctx, &text, style_key)
-                                            {
-                                                let (glyph_rect, tint) = if glyph.has_color {
-                                                    let glyph_w = glyph.width as f32;
-                                                    let glyph_h = glyph.height as f32;
-                                                    let scale_x = total_cell_width / glyph_w;
-                                                    let scale_y = line_height / glyph_h;
-                                                    let scale = scale_x.min(scale_y).min(1.0);
-
-                                                    let scaled_w = glyph_w * scale;
-                                                    let scaled_h = glyph_h * scale;
-
-                                                    let offset_x =
-                                                        (total_cell_width - scaled_w) / 2.0;
-                                                    let offset_y =
-                                                        (line_height - scaled_h) / 2.0;
-
-                                                    let rect = egui::Rect::from_min_size(
-                                                        egui::pos2(
-                                                            cell_x + offset_x,
-                                                            cell_y + offset_y,
-                                                        ),
-                                                        egui::vec2(scaled_w, scaled_h),
-                                                    );
-                                                    (rect, egui::Color32::WHITE)
-                                                } else {
-                                                    let glyph_x = cell_x + glyph.bearing_x as f32;
-                                                    let baseline_y = cell_y + line_height * 0.8;
-                                                    let glyph_y =
-                                                        baseline_y - glyph.bearing_y as f32;
-
-                                                    let rect = egui::Rect::from_min_size(
-                                                        egui::pos2(glyph_x, glyph_y),
-                                                        egui::vec2(
-                                                            glyph.width as f32,
-                                                            glyph.height as f32,
-                                                        ),
-                                                    );
-                                                    (rect, fg)
-                                                };
-
-                                                painter.image(
-                                                    glyph.texture.id(),
-                                                    glyph_rect,
-                                                    egui::Rect::from_min_max(
-                                                        egui::pos2(0.0, 0.0),
-                                                        egui::pos2(1.0, 1.0),
-                                                    ),
-                                                    tint,
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        let font_id = egui::FontId::monospace(font_size);
-                                        painter.text(
-                                            egui::pos2(cell_x, cell_y),
-                                            egui::Align2::LEFT_TOP,
-                                            &text,
-                                            font_id,
-                                            fg,
-                                        );
-                                    }
-
-                                    if has_underline {
-                                        let underline_y = cell_y + line_height - 2.0;
-                                        painter.line_segment(
-                                            [
-                                                egui::pos2(cell_x, underline_y),
-                                                egui::pos2(cell_x + total_cell_width, underline_y),
-                                            ],
-                                            egui::Stroke::new(1.0, fg),
-                                        );
-                                    }
-
-                                    if has_strikethrough {
-                                        let strike_y = cell_y + line_height / 2.0;
-                                        painter.line_segment(
-                                            [
-                                                egui::pos2(cell_x, strike_y),
-                                                egui::pos2(cell_x + total_cell_width, strike_y),
-                                            ],
-                                            egui::Stroke::new(1.0, fg),
-                                        );
-                                    }
-                                }
-
-                                drop(cache_ref);
-
-                                use wezterm_surface::CursorVisibility;
-                                let cursor_in_bounds =
-                                    cursor.y >= 0 && (cursor.y as usize) < physical_rows;
-                                let cursor_visible =
-                                    cursor.visibility == CursorVisibility::Visible;
-                                let should_draw_cursor =
-                                    scroll_offset == 0 && cursor_in_bounds && cursor_visible;
-
-                                if should_draw_cursor {
-                                    let cursor_pixel_x =
-                                        content_min.x + cursor.x as f32 * char_width;
-                                    let cursor_pixel_y =
-                                        content_min.y + cursor.y as f32 * line_height;
-
-                                    let cursor_color =
-                                        egui::Color32::from_rgba_unmultiplied(200, 200, 200, 220);
-
-                                    let cursor_rect = match cursor.shape {
-                                        CursorShape::BlinkingBlock | CursorShape::SteadyBlock => {
-                                            egui::Rect::from_min_size(
-                                                egui::pos2(cursor_pixel_x, cursor_pixel_y),
-                                                egui::vec2(char_width, line_height),
-                                            )
-                                        }
-                                        CursorShape::BlinkingUnderline
-                                        | CursorShape::SteadyUnderline => {
-                                            egui::Rect::from_min_size(
-                                                egui::pos2(
-                                                    cursor_pixel_x,
-                                                    cursor_pixel_y + line_height - 2.0,
-                                                ),
-                                                egui::vec2(char_width, 2.0),
-                                            )
-                                        }
-                                        CursorShape::BlinkingBar | CursorShape::SteadyBar => {
-                                            egui::Rect::from_min_size(
-                                                egui::pos2(cursor_pixel_x, cursor_pixel_y),
-                                                egui::vec2(2.0, line_height),
-                                            )
-                                        }
-                                        _ => egui::Rect::from_min_size(
-                                            egui::pos2(cursor_pixel_x, cursor_pixel_y),
-                                            egui::vec2(char_width, line_height),
-                                        ),
-                                    };
-
-                                    painter.rect_filled(cursor_rect, 0.0, cursor_color);
-                                }
-                            });
-                        }
-                    } else {
-                        // No active session - show welcome message
-                        ui.centered_and_justified(|ui| {
-                            ui.label(
-                                egui::RichText::new("No tabs open. Press + to create a new tab.")
-                                    .size(16.0)
-                                    .color(egui::Color32::GRAY),
-                            );
-                        });
-                    }
+                    render_terminal_content(ui, ctx, &render_params, &mut new_actions);
                 });
 
             // Hyperlink tooltip
-            if let Some(ref hyperlink) = hovered_hyperlink {
-                ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+            render_hyperlink_tooltip(ctx, &self.hovered_hyperlink);
 
-                egui::show_tooltip_at_pointer(
-                    ctx,
-                    egui::LayerId::background(),
-                    egui::Id::new("hyperlink_tooltip"),
-                    |ui: &mut egui::Ui| {
-                        ui.set_min_width(400.0);
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                        ui.label(hyperlink.uri());
-                        ui.add_space(4.0);
-                        ui.weak(
-                            #[cfg(target_os = "macos")]
-                            "Cmd+click to open",
-                            #[cfg(not(target_os = "macos"))]
-                            "Ctrl+click to open",
-                        );
-                    },
-                );
-            }
-
-            // Render settings modal (must be inside egui run block to receive input)
+            // Render settings modal
             let settings_result = render_settings_modal(ctx, &mut self.settings_modal);
-            match settings_result {
-                SettingsModalResult::Apply(settings) => {
-                    new_actions.push(TerminalAction::ApplySettings(settings));
-                }
-                SettingsModalResult::Cancel => {}
-                SettingsModalResult::None => {}
-            }
+            handle_settings_modal_result(settings_result, &mut new_actions);
 
             // Render context menu (if open)
             if self.context_menu.is_open {
@@ -2102,10 +1434,8 @@ impl TerminalWindowState {
             }
         }
 
-        // Store pending actions
         self.pending_actions.extend(new_actions);
 
-        // Mark image loaders as installed
         if need_install_loaders {
             self.image_loaders_installed = true;
         }
@@ -2123,16 +1453,18 @@ impl TerminalWindowState {
     }
 
     pub fn process_notifications(&mut self) {
+        use crate::core::sessions::ClaudeActivity;
         use wezterm_term::Alert;
 
-        // Collect title changes and bell events from all sessions
         let mut title_changes: Vec<(SessionId, String)> = Vec::new();
+        let mut activity_changes: Vec<(SessionId, ClaudeActivity)> = Vec::new();
         let mut bell_sessions: Vec<SessionId> = Vec::new();
         let active_session_id = self.session_manager.active_session_id();
 
         for session_info in self.session_manager.iter() {
             let session = session_info.session.lock();
-            for alert in session.poll_notifications() {
+            let alerts: Vec<Alert> = session.poll_notifications();
+            for alert in alerts {
                 match alert {
                     Alert::ToastNotification { title, body, focus } => {
                         info!(
@@ -2141,9 +1473,9 @@ impl TerminalWindowState {
                         );
                     }
                     Alert::Bell => {
-                        debug!("Terminal bell for session {}", session_info.id);
-                        // Only show visual bell for non-active tabs
+                        debug!("Terminal bell for session {} (active={:?})", session_info.id, active_session_id);
                         if Some(session_info.id) != active_session_id {
+                            debug!("Adding bell indicator for background session {}", session_info.id);
                             bell_sessions.push(session_info.id);
                         }
                     }
@@ -2152,7 +1484,8 @@ impl TerminalWindowState {
                     }
                     Alert::WindowTitleChanged(title) => {
                         debug!("Window title changed for session {}: {}", session_info.id, title);
-                        // Clean once and check if it's useful
+                        let activity = crate::core::sessions::ClaudeActivity::from_title(&title);
+                        activity_changes.push((session_info.id, activity));
                         let clean = clean_terminal_title(&title);
                         if !clean.is_empty() && clean != "Claude Code" {
                             title_changes.push((session_info.id, clean));
@@ -2164,7 +1497,6 @@ impl TerminalWindowState {
                     Alert::TabTitleChanged(title) => {
                         debug!("Tab title changed for session {}: {:?}", session_info.id, title);
                         if let Some(t) = title {
-                            // Clean once and check if it's useful
                             let clean = clean_terminal_title(&t);
                             if !clean.is_empty() && clean != "Claude Code" {
                                 title_changes.push((session_info.id, clean));
@@ -2184,28 +1516,39 @@ impl TerminalWindowState {
             }
         }
 
-        // Apply title changes (outside of the immutable iter loop)
-        // Titles are already cleaned during collection
-        // Collect session IDs that need resolution
         let mut sessions_needing_resolution: Vec<SessionId> = Vec::new();
 
         for (session_id, clean_title) in title_changes {
             if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
                 session_info.terminal_title = Some(clean_title);
 
-                // Check if this session needs session ID resolution
                 if session_info.needs_session_resolution {
                     sessions_needing_resolution.push(session_id);
                 }
             }
         }
 
-        // Try to resolve session IDs for fresh sessions
         for session_id in sessions_needing_resolution {
             self.try_resolve_session_id(session_id);
         }
 
-        // Apply bell indicators
+        let active_session_id = self.session_manager.active_session_id();
+        for (session_id, activity) in activity_changes {
+            if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
+                let was_working = session_info.claude_activity.is_working();
+                let is_background = Some(session_id) != active_session_id;
+                let stopped_working = !activity.is_working();
+
+                if was_working && stopped_working && is_background {
+                    session_info.finished_in_background = true;
+                }
+
+                session_info.claude_activity = activity;
+            }
+        }
+
+        crate::update_working_session_count(self.session_manager.working_session_count());
+
         for session_id in bell_sessions {
             if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
                 session_info.bell_active = true;
@@ -2236,290 +1579,6 @@ impl Default for TerminalWindowState {
     fn default() -> Self {
         Self::new(17.0)
     }
-}
-
-use crate::core::settings::ColorScheme;
-
-/// Render context menu and return any triggered actions
-fn render_context_menu(
-    ctx: &egui::Context,
-    context_menu: &mut ContextMenuState,
-    color_scheme: ColorScheme,
-    has_selection: bool,
-) -> Vec<TerminalAction> {
-    let mut actions = Vec::new();
-    let mut close_menu = false;
-
-    // Get current time
-    let current_time = ctx.input(|i| i.time);
-
-    // If menu just opened, record the time and don't process close events yet
-    if context_menu.opened_time == 0.0 {
-        context_menu.opened_time = current_time;
-    }
-
-    // Don't allow closing for 150ms after opening (prevents immediate close from right-click)
-    let can_close = current_time > context_menu.opened_time + 0.15;
-
-    // Get menu position, clamped to window bounds
-    let screen_rect = ctx.screen_rect();
-    let menu_width = 220.0;
-    let menu_item_height = 28.0;
-    let has_sessions = !context_menu.available_sessions.is_empty();
-
-    // Calculate menu height
-    let menu_height = (5.0 * menu_item_height) + 24.0;
-
-    let mut pos = context_menu.position;
-    if pos.x + menu_width > screen_rect.max.x {
-        pos.x = screen_rect.max.x - menu_width - 10.0;
-    }
-    if pos.y + menu_height > screen_rect.max.y {
-        pos.y = screen_rect.max.y - menu_height - 10.0;
-    }
-
-    // Check clipboard
-    let has_clipboard = Clipboard::new()
-        .ok()
-        .and_then(|mut c| c.get_text().ok())
-        .map(|t| !t.is_empty())
-        .unwrap_or(false);
-
-    let mut submenu_rect = egui::Rect::NOTHING;
-    let mut load_session_rect = egui::Rect::NOTHING;
-    let submenu_sessions = context_menu.available_sessions.clone();
-
-    // Main context menu using egui's menu styling
-    let menu_response = egui::Area::new(egui::Id::new("context_menu"))
-        .fixed_pos(pos)
-        .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
-            egui::Frame::popup(ui.style())
-                .fill(color_scheme.popup_background())
-                .stroke(egui::Stroke::new(1.0, color_scheme.popup_border()))
-                .rounding(6.0)
-                .inner_margin(egui::Margin::symmetric(6.0, 6.0))
-                .show(ui, |ui| {
-                    ui.set_width(menu_width - 12.0);
-                    ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 2.0);
-                    ui.style_mut().visuals.widgets.hovered.bg_fill = color_scheme.selection_background();
-
-                    // New Session
-                    let btn = egui::Button::new(
-                        egui::RichText::new("New Session").size(13.0).color(color_scheme.foreground())
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .min_size(egui::vec2(menu_width - 12.0, menu_item_height));
-
-                    if ui.add(btn).clicked() {
-                        actions.push(TerminalAction::NewTab);
-                        close_menu = true;
-                    }
-
-                    ui.add_space(2.0);
-                    ui.separator();
-                    ui.add_space(2.0);
-
-                    // Fresh Session
-                    let btn = egui::Button::new(
-                        egui::RichText::new("Fresh session from here").size(13.0).color(color_scheme.foreground())
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .min_size(egui::vec2(menu_width - 12.0, menu_item_height));
-
-                    if ui.add(btn).clicked() {
-                        actions.push(TerminalAction::FreshSessionCurrentDir);
-                        close_menu = true;
-                    }
-
-                    // Load session submenu trigger
-                    let label_text = if has_sessions { "Load recent session  >" } else { "Load recent session" };
-                    let text_color = if has_sessions { color_scheme.foreground() } else { color_scheme.disabled_foreground() };
-
-                    let btn = egui::Button::new(
-                        egui::RichText::new(label_text).size(13.0).color(text_color)
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .min_size(egui::vec2(menu_width - 12.0, menu_item_height));
-
-                    let load_response = ui.add(btn);
-                    load_session_rect = load_response.rect;
-
-                    ui.add_space(2.0);
-                    ui.separator();
-                    ui.add_space(2.0);
-
-                    // Copy
-                    let text_color = if has_selection { color_scheme.foreground() } else { color_scheme.disabled_foreground() };
-                    let btn = egui::Button::new(
-                        egui::RichText::new("Copy").size(13.0).color(text_color)
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .min_size(egui::vec2(menu_width - 12.0, menu_item_height));
-
-                    if ui.add(btn).clicked() && has_selection {
-                        actions.push(TerminalAction::Copy);
-                        close_menu = true;
-                    }
-
-                    // Paste
-                    let text_color = if has_clipboard { color_scheme.foreground() } else { color_scheme.disabled_foreground() };
-                    let btn = egui::Button::new(
-                        egui::RichText::new("Paste").size(13.0).color(text_color)
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .min_size(egui::vec2(menu_width - 12.0, menu_item_height));
-
-                    if ui.add(btn).clicked() && has_clipboard {
-                        actions.push(TerminalAction::Paste);
-                        close_menu = true;
-                    }
-                });
-        });
-
-    let main_menu_rect = menu_response.response.rect;
-
-    // Determine if submenu should be shown
-    let load_session_hovered = ctx.input(|i| {
-        i.pointer.hover_pos().map(|p| load_session_rect.contains(p)).unwrap_or(false)
-    });
-
-    if has_sessions && load_session_hovered {
-        context_menu.submenu_open = true;
-    }
-
-    // Render submenu if open
-    if context_menu.submenu_open && has_sessions {
-        let submenu_x = load_session_rect.right() + 2.0;
-        let submenu_y = load_session_rect.top() - 6.0;
-
-        let submenu_width = 260.0;
-        let submenu_item_height = 44.0;
-        let max_visible_sessions = 8;
-        let visible_sessions = submenu_sessions.len().min(max_visible_sessions);
-        let submenu_height = visible_sessions as f32 * submenu_item_height + 12.0;
-
-        let mut submenu_pos = egui::pos2(submenu_x, submenu_y);
-        if submenu_pos.x + submenu_width > screen_rect.max.x {
-            submenu_pos.x = load_session_rect.left() - submenu_width - 2.0;
-        }
-        if submenu_pos.y + submenu_height > screen_rect.max.y {
-            submenu_pos.y = screen_rect.max.y - submenu_height - 10.0;
-        }
-
-        let submenu_response = egui::Area::new(egui::Id::new("context_submenu"))
-            .fixed_pos(submenu_pos)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .fill(color_scheme.popup_background())
-                    .stroke(egui::Stroke::new(1.0, color_scheme.popup_border()))
-                    .rounding(6.0)
-                    .inner_margin(egui::Margin::symmetric(6.0, 6.0))
-                    .show(ui, |ui| {
-                        ui.set_width(submenu_width - 12.0);
-                        ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 2.0);
-                        ui.style_mut().visuals.widgets.hovered.bg_fill = color_scheme.selection_background();
-
-                        egui::ScrollArea::vertical()
-                            .id_salt("context_submenu_scroll")
-                            .max_height(max_visible_sessions as f32 * submenu_item_height)
-                            .show(ui, |ui| {
-                                for (idx, session) in submenu_sessions.iter().enumerate() {
-                                    let title = session.display_title();
-                                    let time_str = session.relative_modified_time();
-
-                                    // Truncate title if too long
-                                    let max_title_chars = 35;
-                                    let display_title = if title.chars().count() > max_title_chars {
-                                        format!("{}...", title.chars().take(max_title_chars - 3).collect::<String>())
-                                    } else {
-                                        title
-                                    };
-
-                                    // Use a vertical layout inside a button-like container
-                                    let btn_id = ui.make_persistent_id(format!("session_btn_{}", idx));
-                                    let response = ui.push_id(btn_id, |ui| {
-                                        let (rect, response) = ui.allocate_exact_size(
-                                            egui::vec2(submenu_width - 24.0, submenu_item_height),
-                                            egui::Sense::click(),
-                                        );
-
-                                        // Draw background on hover
-                                        if response.hovered() {
-                                            ui.painter().rect_filled(rect, 4.0, color_scheme.selection_background());
-                                        }
-
-                                        // Draw title and time with clipping
-                                        let clip_rect = rect.shrink(4.0);
-                                        ui.painter().with_clip_rect(clip_rect).text(
-                                            egui::pos2(rect.left() + 8.0, rect.top() + 14.0),
-                                            egui::Align2::LEFT_CENTER,
-                                            &display_title,
-                                            egui::FontId::proportional(12.0),
-                                            if response.hovered() { egui::Color32::WHITE } else { color_scheme.foreground() },
-                                        );
-
-                                        ui.painter().with_clip_rect(clip_rect).text(
-                                            egui::pos2(rect.left() + 8.0, rect.top() + 32.0),
-                                            egui::Align2::LEFT_CENTER,
-                                            &time_str,
-                                            egui::FontId::proportional(10.0),
-                                            if response.hovered() { egui::Color32::from_gray(200) } else { color_scheme.secondary_foreground() },
-                                        );
-
-                                        response
-                                    }).inner;
-
-                                    if response.clicked() {
-                                        actions.push(TerminalAction::LoadSession {
-                                            session_id: session.session_id.clone(),
-                                        });
-                                        close_menu = true;
-                                    }
-                                }
-                            });
-                    });
-            });
-
-        submenu_rect = submenu_response.response.rect;
-    }
-
-    // Check if mouse is outside all menu areas
-    let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
-    if let Some(mouse) = mouse_pos {
-        let expanded_load_rect = load_session_rect.expand(4.0);
-        let in_main_menu = main_menu_rect.contains(mouse);
-        let in_submenu = submenu_rect.contains(mouse);
-        let in_load_item = expanded_load_rect.contains(mouse);
-
-        // Close submenu if mouse is not in relevant areas
-        if context_menu.submenu_open && !in_submenu && !in_load_item {
-            let gap_rect = egui::Rect::from_min_max(
-                egui::pos2(load_session_rect.right(), load_session_rect.top() - 10.0),
-                egui::pos2(submenu_rect.left(), load_session_rect.bottom() + 10.0),
-            );
-            if !gap_rect.contains(mouse) && !in_main_menu {
-                context_menu.submenu_open = false;
-            }
-        }
-
-        // Close menu on left-click outside (after grace period)
-        if can_close {
-            let left_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
-            if left_clicked && !in_main_menu && !in_submenu {
-                close_menu = true;
-            }
-        }
-    }
-
-    if close_menu {
-        context_menu.is_open = false;
-        context_menu.submenu_open = false;
-        context_menu.opened_time = 0.0;
-    }
-
-    actions
 }
 
 /// Clean terminal title by removing leading symbols/emojis

@@ -120,7 +120,8 @@ pub fn render_settings_modal(
                             MIN_FONT_SIZE..=MAX_FONT_SIZE,
                         )
                         .suffix(" pt")
-                        .fixed_decimals(1),
+                        .step_by(1.0)
+                        .fixed_decimals(0),
                     );
                 });
             });

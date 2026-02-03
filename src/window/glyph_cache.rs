@@ -79,19 +79,25 @@ pub struct GlyphCache {
     texture_counter: usize,
 }
 
+/// Default font size used by WezTerm's config
+const WEZTERM_DEFAULT_FONT_SIZE: f64 = 12.0;
+
 impl GlyphCache {
-    /// Create a new glyph cache with the specified scale factor
+    /// Create a new glyph cache with the specified scale factor and font size
     ///
     /// Uses a default font configuration from wezterm-font.
     /// Rasterizes at native DPI for crisp glyphs, then scales metrics for logical coordinates.
-    pub fn new(scale_factor: f64) -> anyhow::Result<Self> {
+    /// The font_size parameter adjusts the effective DPI to achieve the desired size.
+    pub fn new(scale_factor: f64, font_size: f32) -> anyhow::Result<Self> {
         // Rasterize at native DPI for crisp glyphs on HiDPI displays
         // Base DPI is 96 (Windows/Linux standard) or 72 (macOS traditional)
         // We use 96 as base and multiply by scale factor for physical pixel rendering
-        let dpi = (96.0 * scale_factor) as usize;
+        // Scale DPI by (desired_font_size / wezterm_default_font_size) to achieve the right size
+        let font_scale = font_size as f64 / WEZTERM_DEFAULT_FONT_SIZE;
+        let dpi = (96.0 * scale_factor * font_scale) as usize;
         debug!(
-            "Creating GlyphCache with scale_factor={}, DPI={}",
-            scale_factor, dpi
+            "Creating GlyphCache with scale_factor={}, font_size={}, DPI={}",
+            scale_factor, font_size, dpi
         );
 
         // Create default config handle - this uses WezTerm's default font settings
