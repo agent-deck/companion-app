@@ -180,6 +180,7 @@ impl App {
 
         // Create PTY wrapper with custom working directory
         let claude_config = self.config.claude.clone();
+        let colorfgbg = Some(self.terminal_window.current_theme.colorfgbg());
         let pty = Arc::new(PtyWrapper::new_with_cwd(
             claude_config,
             self.event_tx.clone(),
@@ -187,6 +188,7 @@ impl App {
             session_id,
             actual_resume_session,
             is_new_session,
+            colorfgbg,
         ));
 
         match pty.start() {
@@ -302,7 +304,7 @@ impl App {
                 // No sessions, create one
                 self.terminal_window
                     .session_manager
-                    .create_session(working_dir.clone())
+                    .create_session(working_dir.clone(), &self.terminal_window.current_palette)
             }
         };
 
@@ -380,7 +382,7 @@ impl App {
                 for tab in tab_state.tabs {
                     self.terminal_window
                         .session_manager
-                        .create_placeholder(tab.working_directory, tab.title, tab.claude_session_id, tab.terminal_title);
+                        .create_placeholder(tab.working_directory, tab.title, tab.claude_session_id, tab.terminal_title, &self.terminal_window.current_palette);
                 }
                 // Set active tab (clamped to valid range)
                 let active = tab_state.active_tab.min(
@@ -426,7 +428,7 @@ impl App {
         match action {
             TerminalAction::NewTab => {
                 // Create a new tab (will show new tab page)
-                let session_id = self.terminal_window.session_manager.create_new_tab();
+                let session_id = self.terminal_window.session_manager.create_new_tab(&self.terminal_window.current_palette);
                 self.terminal_window
                     .session_manager
                     .set_active_session(session_id);
@@ -526,7 +528,7 @@ impl App {
                     }
                     Some((_, false)) => {
                         // Create a new session for this directory
-                        let id = self.terminal_window.session_manager.create_session(path.clone());
+                        let id = self.terminal_window.session_manager.create_session(path.clone(), &self.terminal_window.current_palette);
                         // Store the claude session ID for persistence
                         if let Some(s) = self.terminal_window.session_manager.get_session_mut(id) {
                             s.claude_session_id = resume_session.clone();
@@ -534,7 +536,7 @@ impl App {
                         id
                     }
                     None => {
-                        let id = self.terminal_window.session_manager.create_session(path.clone());
+                        let id = self.terminal_window.session_manager.create_session(path.clone(), &self.terminal_window.current_palette);
                         // Store the claude session ID for persistence
                         if let Some(s) = self.terminal_window.session_manager.get_session_mut(id) {
                             s.claude_session_id = resume_session.clone();
@@ -592,11 +594,8 @@ impl App {
                 if font_size_changed {
                     self.config.terminal.font_size = settings.font_size;
                     let _ = self.config.save();
-                }
-
-                // Apply font size changes if needed
-                if font_size_changed {
                     self.terminal_window.apply_font_size(settings.font_size);
+
                     if let Some(ref window) = self.terminal_window.window {
                         window.request_redraw();
                     }
@@ -1152,6 +1151,13 @@ impl ApplicationHandler for App {
         let actions = self.terminal_window.take_pending_actions();
         for action in actions {
             self.handle_terminal_action(action, event_loop);
+        }
+
+        // Check for Claude theme changes (polls ~/.claude.json mtime)
+        if self.terminal_window.check_claude_theme() {
+            if let Some(ref window) = self.terminal_window.window {
+                window.request_redraw();
+            }
         }
 
         // Request redraw if terminal window is visible

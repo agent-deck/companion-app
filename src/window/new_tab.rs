@@ -380,14 +380,14 @@ fn render_directory_selection(
                 ui.label(
                     egui::RichText::new("No directories yet")
                         .size(16.0)
-                        .color(egui::Color32::GRAY)
+                        .color(color_scheme.secondary_foreground())
                         .italics(),
                 );
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new("Browse for a directory to get started")
                         .size(14.0)
-                        .color(egui::Color32::DARK_GRAY),
+                        .color(color_scheme.disabled_foreground()),
                 );
             });
         }
@@ -402,14 +402,14 @@ fn render_directory_selection(
             ui.label(
                 egui::RichText::new("SSH Connections")
                     .size(18.0)
-                    .color(egui::Color32::GRAY)
+                    .color(color_scheme.secondary_foreground())
                     .strong(),
             );
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new("Coming soon...")
                     .size(14.0)
-                    .color(egui::Color32::DARK_GRAY)
+                    .color(color_scheme.disabled_foreground())
                     .italics(),
             );
         });
@@ -466,7 +466,7 @@ fn render_directory_card(
         let star_color = if item.is_bookmarked {
             egui::Color32::from_rgb(255, 200, 50) // Gold
         } else {
-            egui::Color32::GRAY
+            color_scheme.disabled_foreground()
         };
 
         let star_rect = egui::Rect::from_min_size(
@@ -478,7 +478,7 @@ fn render_directory_card(
         let star_response = ui.interact(star_rect, ui.id().with(("star", &item.path)), egui::Sense::click());
 
         let star_tint = if star_response.hovered() {
-            egui::Color32::WHITE
+            color_scheme.foreground()
         } else {
             star_color
         };
@@ -523,7 +523,7 @@ fn render_directory_card(
             egui::Align2::RIGHT_CENTER,
             &short_path,
             egui::FontId::proportional(12.0),
-            egui::Color32::GRAY,
+            color_scheme.secondary_foreground(),
         );
 
         // Line 2: Session title + session count
@@ -545,9 +545,9 @@ fn render_directory_card(
             .unwrap_or_else(|| "\u{2014}".to_string()); // em dash
 
         let title_color = if item.info.most_recent_title.is_some() {
-            egui::Color32::from_gray(180)
+            color_scheme.secondary_foreground()
         } else {
-            egui::Color32::DARK_GRAY
+            color_scheme.disabled_foreground()
         };
 
         ui.painter().text(
@@ -597,7 +597,7 @@ fn render_directory_card(
                     egui::Align2::CENTER_CENTER,
                     "\u{00D7}", // ×
                     egui::FontId::proportional(14.0),
-                    egui::Color32::WHITE,
+                    color_scheme.foreground(),
                 );
             }
 
@@ -733,7 +733,7 @@ fn render_session_selection(
                             egui::Image::from_bytes("bytes://refresh-cw.svg", REFRESH_SVG)
                                 .fit_to_exact_size(egui::vec2(16.0, 16.0))
                                 .tint(if ui.ctx().input(|i| i.pointer.any_down()) {
-                                    egui::Color32::GRAY
+                                    color_scheme.secondary_foreground()
                                 } else {
                                     fg_color
                                 })
@@ -811,7 +811,7 @@ fn render_session_selection(
                 ui.label(
                     egui::RichText::new("Recent Sessions")
                         .size(14.0)
-                        .color(egui::Color32::GRAY),
+                        .color(color_scheme.secondary_foreground()),
                 );
                 ui.add_space(10.0);
 
@@ -888,7 +888,7 @@ fn render_session_selection(
                                         session.relative_modified_time()
                                     ),
                                     egui::FontId::proportional(12.0),
-                                    egui::Color32::GRAY,
+                                    color_scheme.secondary_foreground(),
                                 );
                             }
 

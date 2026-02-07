@@ -8,3 +8,4 @@ pub mod sessions;
 pub mod settings;
 pub mod state;
 pub mod tabs;
+pub mod themes;

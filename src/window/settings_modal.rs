@@ -1,8 +1,8 @@
 //! Settings modal dialog
 //!
-//! A modal dialog for editing application settings like font and color scheme.
+//! A modal dialog for editing application settings like font.
 
-use crate::core::settings::{ColorScheme, Settings, MAX_FONT_SIZE, MIN_FONT_SIZE};
+use crate::core::settings::{Settings, MAX_FONT_SIZE, MIN_FONT_SIZE};
 
 /// State for the settings modal
 pub struct SettingsModal {
@@ -41,7 +41,6 @@ impl SettingsModal {
     pub fn is_modified(&self) -> bool {
         self.working_settings.font_family != self.original_settings.font_family
             || self.working_settings.font_size != self.original_settings.font_size
-            || self.working_settings.color_scheme != self.original_settings.color_scheme
     }
 }
 
@@ -85,7 +84,7 @@ pub fn render_settings_modal(
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .fixed_size([400.0, 300.0])
+        .fixed_size([400.0, 230.0])
         .show(ctx, |ui| {
             ui.add_space(10.0);
 
@@ -126,58 +125,30 @@ pub fn render_settings_modal(
                 });
             });
 
-            ui.add_space(15.0);
-
-            // Color Scheme
-            ui.horizontal(|ui| {
-                ui.label("Color Scheme:");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("color_scheme")
-                        .selected_text(modal.working_settings.color_scheme.display_name())
-                        .width(200.0)
-                        .show_ui(ui, |ui| {
-                            for scheme in ColorScheme::all() {
-                                ui.selectable_value(
-                                    &mut modal.working_settings.color_scheme,
-                                    *scheme,
-                                    scheme.display_name(),
-                                );
-                            }
-                        });
-                });
-            });
-
-            ui.add_space(30.0);
-
-            // Preview
-            ui.group(|ui| {
-                ui.label("Preview:");
-                ui.add_space(5.0);
-
-                let bg = modal.working_settings.color_scheme.background();
-                let fg = modal.working_settings.color_scheme.foreground();
-
-                let preview_rect = ui.available_rect_before_wrap();
-                let preview_rect = egui::Rect::from_min_size(
-                    preview_rect.min,
-                    egui::vec2(ui.available_width(), 60.0),
-                );
-
-                ui.painter().rect_filled(preview_rect, 4.0, bg);
-
-                let font_id = egui::FontId::monospace(modal.working_settings.font_size);
-                ui.painter().text(
-                    preview_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Hello, Claude!",
-                    font_id,
-                    fg,
-                );
-
-                ui.allocate_rect(preview_rect, egui::Sense::hover());
-            });
-
             ui.add_space(20.0);
+
+            // Color theme hint
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.label(
+                    egui::RichText::new("Color theme is synced with Claude Code. Use ")
+                        .size(12.0)
+                        .color(egui::Color32::GRAY),
+                );
+                ui.label(
+                    egui::RichText::new("/theme")
+                        .size(12.0)
+                        .color(egui::Color32::GRAY)
+                        .code(),
+                );
+                ui.label(
+                    egui::RichText::new(" command in Claude Code to change it.")
+                        .size(12.0)
+                        .color(egui::Color32::GRAY),
+                );
+            });
+
+            ui.add_space(15.0);
 
             // Buttons
             ui.horizontal(|ui| {

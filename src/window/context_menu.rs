@@ -237,7 +237,7 @@ pub fn render_context_menu(
                                             egui::Align2::LEFT_CENTER,
                                             &display_title,
                                             egui::FontId::proportional(12.0),
-                                            if response.hovered() { egui::Color32::WHITE } else { color_scheme.foreground() },
+                                            if response.hovered() { color_scheme.close_button_hover_color() } else { color_scheme.foreground() },
                                         );
 
                                         ui.painter().with_clip_rect(clip_rect).text(
@@ -245,7 +245,7 @@ pub fn render_context_menu(
                                             egui::Align2::LEFT_CENTER,
                                             &time_str,
                                             egui::FontId::proportional(10.0),
-                                            if response.hovered() { egui::Color32::from_gray(200) } else { color_scheme.secondary_foreground() },
+                                            if response.hovered() { color_scheme.secondary_foreground() } else { color_scheme.disabled_foreground() },
                                         );
 
                                         response

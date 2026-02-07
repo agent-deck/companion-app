@@ -40,6 +40,8 @@ pub struct PtyWrapper {
     resume_session: Option<String>,
     /// Whether this is a brand new session (use --session-id) vs resuming (use --resume)
     is_new_session: bool,
+    /// COLORFGBG value to set in environment (for background color detection)
+    colorfgbg: Option<String>,
 }
 
 impl PtyWrapper {
@@ -54,8 +56,9 @@ impl PtyWrapper {
             running: Arc::new(Mutex::new(false)),
             working_directory: None,
             session_id: None,
-            resume_session: None, // Default to fresh start for legacy usage
+            resume_session: None,
             is_new_session: false,
+            colorfgbg: None,
         }
     }
 
@@ -64,6 +67,7 @@ impl PtyWrapper {
     /// # Arguments
     /// * `resume_session` - None = --continue, Some("") = fresh, Some(id) = session ID
     /// * `is_new_session` - true = use --session-id (creating new), false = use --resume (resuming existing)
+    /// * `colorfgbg` - COLORFGBG env var value for background color detection
     pub fn new_with_cwd(
         config: ClaudeConfig,
         event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -71,6 +75,7 @@ impl PtyWrapper {
         session_id: SessionId,
         resume_session: Option<String>,
         is_new_session: bool,
+        colorfgbg: Option<String>,
     ) -> Self {
         Self {
             master: Arc::new(Mutex::new(None)),
@@ -83,6 +88,7 @@ impl PtyWrapper {
             session_id: Some(session_id),
             resume_session,
             is_new_session,
+            colorfgbg,
         }
     }
 
@@ -156,6 +162,33 @@ impl PtyWrapper {
         // Set TERM for color support
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+
+        // Set COLORFGBG for background color detection (used by programs like Claude Code)
+        if let Some(ref colorfgbg) = self.colorfgbg {
+            cmd.env("COLORFGBG", colorfgbg);
+        }
+
+        // On macOS, apps launched from Finder don't inherit the shell's PATH.
+        // Add common installation directories to ensure we can find claude and other tools.
+        #[cfg(target_os = "macos")]
+        {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            let home = std::env::var("HOME").unwrap_or_default();
+            let mut paths = vec![
+                "/opt/homebrew/bin".to_string(),
+                "/opt/homebrew/sbin".to_string(),
+                "/usr/local/bin".to_string(),
+                "/usr/local/sbin".to_string(),
+                // Common npm global paths
+                format!("{}/.npm-global/bin", home),
+                // Claude Code local install
+                format!("{}/.claude/local", home),
+            ];
+            if !current_path.is_empty() {
+                paths.push(current_path);
+            }
+            cmd.env("PATH", paths.join(":"));
+        }
 
         info!("Starting Claude CLI: {} {:?}", cli_path, self.config.default_args);
 

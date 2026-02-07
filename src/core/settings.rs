@@ -49,18 +49,21 @@ impl Default for WindowGeometry {
     }
 }
 
-/// Color scheme options
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Color scheme (Dark/Light) derived from theme at runtime.
+/// Used for UI chrome colors (tabs, popups, close buttons, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorScheme {
-    /// Dark theme (default)
     #[default]
     Dark,
-    /// Light theme
     Light,
 }
 
 impl ColorScheme {
-    /// Get the display name for this color scheme
+    /// Derive color scheme from a theme's lightness
+    pub fn from_is_light(is_light: bool) -> Self {
+        if is_light { Self::Light } else { Self::Dark }
+    }
+
     pub fn display_name(&self) -> &'static str {
         match self {
             ColorScheme::Dark => "Dark",
@@ -68,12 +71,6 @@ impl ColorScheme {
         }
     }
 
-    /// Get all available color schemes
-    pub fn all() -> &'static [ColorScheme] {
-        &[ColorScheme::Dark, ColorScheme::Light]
-    }
-
-    /// Get the background color for this scheme
     pub fn background(&self) -> egui::Color32 {
         match self {
             ColorScheme::Dark => egui::Color32::from_rgb(30, 30, 30),
@@ -81,7 +78,6 @@ impl ColorScheme {
         }
     }
 
-    /// Get the foreground color for this scheme
     pub fn foreground(&self) -> egui::Color32 {
         match self {
             ColorScheme::Dark => egui::Color32::from_rgb(220, 220, 220),
@@ -89,7 +85,6 @@ impl ColorScheme {
         }
     }
 
-    /// Get the selection background color
     pub fn selection_background(&self) -> egui::Color32 {
         match self {
             ColorScheme::Dark => egui::Color32::from_rgb(70, 130, 180),
@@ -97,7 +92,6 @@ impl ColorScheme {
         }
     }
 
-    /// Get the tab bar background color
     pub fn tab_bar_background(&self) -> egui::Color32 {
         match self {
             ColorScheme::Dark => egui::Color32::from_rgb(40, 40, 40),
@@ -105,7 +99,6 @@ impl ColorScheme {
         }
     }
 
-    /// Get the active tab background color
     pub fn active_tab_background(&self) -> egui::Color32 {
         match self {
             ColorScheme::Dark => egui::Color32::from_rgb(50, 50, 50),
@@ -113,7 +106,6 @@ impl ColorScheme {
         }
     }
 
-    /// Get the inactive tab background color
     pub fn inactive_tab_background(&self) -> egui::Color32 {
         match self {
             ColorScheme::Dark => egui::Color32::from_rgb(35, 35, 35),
@@ -121,23 +113,20 @@ impl ColorScheme {
         }
     }
 
-    /// Get the bell indicator tab background color (visual bell)
     pub fn bell_tab_background(&self) -> egui::Color32 {
         match self {
-            ColorScheme::Dark => egui::Color32::from_rgb(100, 60, 40), // Orange-brown tint
-            ColorScheme::Light => egui::Color32::from_rgb(255, 220, 180), // Light orange tint
+            ColorScheme::Dark => egui::Color32::from_rgb(100, 60, 40),
+            ColorScheme::Light => egui::Color32::from_rgb(255, 220, 180),
         }
     }
 
-    /// Get the accent color (for links, session counts, etc.)
     pub fn accent_color(&self) -> egui::Color32 {
         match self {
-            ColorScheme::Dark => egui::Color32::from_rgb(100, 149, 237), // Cornflower blue
-            ColorScheme::Light => egui::Color32::from_rgb(65, 105, 225), // Royal blue
+            ColorScheme::Dark => egui::Color32::from_rgb(100, 149, 237),
+            ColorScheme::Light => egui::Color32::from_rgb(65, 105, 225),
         }
     }
 
-    /// Get the popup/context menu background color
     pub fn popup_background(&self) -> egui::Color32 {
         match self {
             ColorScheme::Dark => egui::Color32::from_rgb(45, 45, 45),
@@ -145,7 +134,6 @@ impl ColorScheme {
         }
     }
 
-    /// Get the popup/context menu border color
     pub fn popup_border(&self) -> egui::Color32 {
         match self {
             ColorScheme::Dark => egui::Color32::from_rgb(70, 70, 70),
@@ -153,21 +141,69 @@ impl ColorScheme {
         }
     }
 
-    /// Get the disabled/grayed out text color
     pub fn disabled_foreground(&self) -> egui::Color32 {
         match self {
             ColorScheme::Dark => egui::Color32::from_rgb(100, 100, 100),
-            ColorScheme::Light => egui::Color32::from_rgb(160, 160, 160),
+            ColorScheme::Light => egui::Color32::from_rgb(140, 140, 140),
         }
     }
 
-    /// Get the secondary/dimmed text color
     pub fn secondary_foreground(&self) -> egui::Color32 {
         match self {
             ColorScheme::Dark => egui::Color32::from_rgb(150, 150, 150),
-            ColorScheme::Light => egui::Color32::from_rgb(120, 120, 120),
+            ColorScheme::Light => egui::Color32::from_rgb(100, 100, 100),
         }
     }
+
+    pub fn cursor_color(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::from_rgba_unmultiplied(200, 200, 200, 220),
+            ColorScheme::Light => egui::Color32::from_rgba_unmultiplied(40, 40, 40, 220),
+        }
+    }
+
+    pub fn close_button_color(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::GRAY,
+            ColorScheme::Light => egui::Color32::from_rgb(140, 140, 140),
+        }
+    }
+
+    pub fn close_button_hover_color(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::WHITE,
+            ColorScheme::Light => egui::Color32::from_rgb(40, 40, 40),
+        }
+    }
+
+    pub fn tab_hover_stroke(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::from_rgb(80, 80, 80),
+            ColorScheme::Light => egui::Color32::from_rgb(180, 180, 180),
+        }
+    }
+
+    pub fn hyperlink_color(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::from_rgb(80, 120, 200),
+            ColorScheme::Light => egui::Color32::from_rgb(30, 80, 180),
+        }
+    }
+
+    pub fn hyperlink_hover_color(&self) -> egui::Color32 {
+        match self {
+            ColorScheme::Dark => egui::Color32::from_rgb(100, 149, 237),
+            ColorScheme::Light => egui::Color32::from_rgb(50, 100, 220),
+        }
+    }
+}
+
+fn default_font_family() -> String {
+    DEFAULT_FONT_FAMILY.to_string()
+}
+
+fn default_font_size() -> f32 {
+    DEFAULT_FONT_SIZE
 }
 
 /// Application settings
@@ -181,21 +217,9 @@ pub struct Settings {
     #[serde(default = "default_font_size")]
     pub font_size: f32,
 
-    /// Color scheme
-    #[serde(default)]
-    pub color_scheme: ColorScheme,
-
     /// Window geometry (size and position)
     #[serde(default)]
     pub window_geometry: WindowGeometry,
-}
-
-fn default_font_family() -> String {
-    DEFAULT_FONT_FAMILY.to_string()
-}
-
-fn default_font_size() -> f32 {
-    DEFAULT_FONT_SIZE
 }
 
 impl Default for Settings {
@@ -203,7 +227,6 @@ impl Default for Settings {
         Self {
             font_family: default_font_family(),
             font_size: default_font_size(),
-            color_scheme: ColorScheme::default(),
             window_geometry: WindowGeometry::default(),
         }
     }
@@ -281,7 +304,6 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.font_family, DEFAULT_FONT_FAMILY);
         assert_eq!(settings.font_size, DEFAULT_FONT_SIZE);
-        assert_eq!(settings.color_scheme, ColorScheme::Dark);
         assert_eq!(settings.window_geometry.width, DEFAULT_WINDOW_WIDTH);
         assert_eq!(settings.window_geometry.height, DEFAULT_WINDOW_HEIGHT);
     }
@@ -305,10 +327,7 @@ mod tests {
         let dark = ColorScheme::Dark;
         let light = ColorScheme::Light;
 
-        // Dark should have darker background
         assert!(dark.background().r() < light.background().r());
-
-        // Foreground should be opposite
         assert!(dark.foreground().r() > light.foreground().r());
     }
 
@@ -317,7 +336,6 @@ mod tests {
         let settings = Settings {
             font_family: "Menlo".to_string(),
             font_size: 14.0,
-            color_scheme: ColorScheme::Light,
             window_geometry: WindowGeometry {
                 width: 1200.0,
                 height: 800.0,
@@ -331,7 +349,6 @@ mod tests {
 
         assert_eq!(parsed.font_family, "Menlo");
         assert_eq!(parsed.font_size, 14.0);
-        assert_eq!(parsed.color_scheme, ColorScheme::Light);
         assert_eq!(parsed.window_geometry.width, 1200.0);
         assert_eq!(parsed.window_geometry.height, 800.0);
         assert_eq!(parsed.window_geometry.x, Some(100));
@@ -348,15 +365,22 @@ mod tests {
     }
 
     #[test]
-    fn test_settings_backward_compatible() {
-        // Test that settings without window_geometry can still be parsed
+    fn test_settings_ignores_unknown_fields() {
+        // Old settings with color_scheme or theme_name should still parse
+        // (serde ignores unknown fields by default)
         let old_toml = r#"
 font_family = "Monaco"
 font_size = 16.0
-color_scheme = "Dark"
 "#;
         let parsed: Settings = toml::from_str(old_toml).unwrap();
         assert_eq!(parsed.font_family, "Monaco");
+        assert_eq!(parsed.font_size, 16.0);
         assert_eq!(parsed.window_geometry, WindowGeometry::default());
+    }
+
+    #[test]
+    fn test_color_scheme_from_is_light() {
+        assert_eq!(ColorScheme::from_is_light(false), ColorScheme::Dark);
+        assert_eq!(ColorScheme::from_is_light(true), ColorScheme::Light);
     }
 }

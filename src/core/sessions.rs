@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use wezterm_term::color::ColorPalette;
 
 /// Unique identifier for a session
 pub type SessionId = usize;
@@ -83,8 +84,8 @@ pub struct SessionInfo {
 }
 
 impl SessionInfo {
-    /// Create a new session with the given working directory
-    pub fn new(id: SessionId, working_directory: PathBuf) -> Self {
+    /// Create a new session with the given working directory and color palette
+    pub fn new(id: SessionId, working_directory: PathBuf, palette: &ColorPalette) -> Self {
         let title = working_directory
             .file_name()
             .and_then(|n| n.to_str())
@@ -96,7 +97,7 @@ impl SessionInfo {
             working_directory,
             title,
             terminal_title: None,
-            session: Arc::new(Mutex::new(Session::new(0, 120, 50))),
+            session: Arc::new(Mutex::new(Session::new(0, 120, 50, palette.clone()))),
             pty_input_tx: None,
             claude_state: Arc::new(Mutex::new(ClaudeState::default())),
             is_running: false,
@@ -111,13 +112,13 @@ impl SessionInfo {
     }
 
     /// Create a new tab session (not yet started, shows new tab page)
-    pub fn new_tab(id: SessionId) -> Self {
+    pub fn new_tab(id: SessionId, palette: &ColorPalette) -> Self {
         Self {
             id,
             working_directory: PathBuf::new(),
             title: "New Session".to_string(),
             terminal_title: None,
-            session: Arc::new(Mutex::new(Session::new(0, 120, 50))),
+            session: Arc::new(Mutex::new(Session::new(0, 120, 50, palette.clone()))),
             pty_input_tx: None,
             claude_state: Arc::new(Mutex::new(ClaudeState::default())),
             is_running: false,
@@ -172,18 +173,18 @@ impl SessionManager {
     }
 
     /// Create a new session and return its ID
-    pub fn create_session(&mut self, working_directory: PathBuf) -> SessionId {
+    pub fn create_session(&mut self, working_directory: PathBuf, palette: &ColorPalette) -> SessionId {
         let id = self.next_id;
         self.next_id += 1;
-        self.sessions.push(SessionInfo::new(id, working_directory));
+        self.sessions.push(SessionInfo::new(id, working_directory, palette));
         id
     }
 
     /// Create a new tab (empty session for new tab page)
-    pub fn create_new_tab(&mut self) -> SessionId {
+    pub fn create_new_tab(&mut self, palette: &ColorPalette) -> SessionId {
         let id = self.next_id;
         self.next_id += 1;
-        self.sessions.push(SessionInfo::new_tab(id));
+        self.sessions.push(SessionInfo::new_tab(id, palette));
         id
     }
 
@@ -195,10 +196,11 @@ impl SessionManager {
         title: String,
         claude_session_id: Option<String>,
         terminal_title: Option<String>,
+        palette: &ColorPalette,
     ) -> SessionId {
         let id = self.next_id;
         self.next_id += 1;
-        let mut session = SessionInfo::new(id, working_directory);
+        let mut session = SessionInfo::new(id, working_directory, palette);
         session.title = title;
         session.claude_session_id = claude_session_id;
         session.terminal_title = terminal_title;
@@ -670,16 +672,20 @@ fn disambiguate_same_path_sessions(
 mod tests {
     use super::*;
 
+    fn default_palette() -> ColorPalette {
+        ColorPalette::default()
+    }
+
     #[test]
     fn test_session_manager_create() {
         let mut manager = SessionManager::new();
         assert!(manager.is_empty());
 
-        let id1 = manager.create_session(PathBuf::from("/home/user/project1"));
+        let id1 = manager.create_session(PathBuf::from("/home/user/project1"), &default_palette());
         assert_eq!(manager.session_count(), 1);
         assert_eq!(manager.active_session_id(), Some(id1));
 
-        let id2 = manager.create_session(PathBuf::from("/home/user/project2"));
+        let id2 = manager.create_session(PathBuf::from("/home/user/project2"), &default_palette());
         assert_eq!(manager.session_count(), 2);
         // Active session should still be the first one
         assert_eq!(manager.active_session_id(), Some(id1));
@@ -688,8 +694,8 @@ mod tests {
     #[test]
     fn test_session_manager_switch() {
         let mut manager = SessionManager::new();
-        let id1 = manager.create_session(PathBuf::from("/project1"));
-        let id2 = manager.create_session(PathBuf::from("/project2"));
+        let id1 = manager.create_session(PathBuf::from("/project1"), &default_palette());
+        let id2 = manager.create_session(PathBuf::from("/project2"), &default_palette());
 
         assert!(manager.set_active_session(id2));
         assert_eq!(manager.active_session_id(), Some(id2));
@@ -701,9 +707,9 @@ mod tests {
     #[test]
     fn test_session_manager_close() {
         let mut manager = SessionManager::new();
-        let id1 = manager.create_session(PathBuf::from("/project1"));
-        let id2 = manager.create_session(PathBuf::from("/project2"));
-        let id3 = manager.create_session(PathBuf::from("/project3"));
+        let id1 = manager.create_session(PathBuf::from("/project1"), &default_palette());
+        let id2 = manager.create_session(PathBuf::from("/project2"), &default_palette());
+        let id3 = manager.create_session(PathBuf::from("/project3"), &default_palette());
 
         manager.set_active_session(id2);
         assert_eq!(manager.active_session_index(), 1);
@@ -723,7 +729,7 @@ mod tests {
     #[test]
     fn test_new_tab_session() {
         let mut manager = SessionManager::new();
-        let id = manager.create_new_tab();
+        let id = manager.create_new_tab(&default_palette());
 
         let session = manager.get_session(id).unwrap();
         assert!(session.is_new_tab());
@@ -733,7 +739,7 @@ mod tests {
     #[test]
     fn test_display_title_truncation() {
         // Use a path with a long final component to test truncation
-        let session = SessionInfo::new(0, PathBuf::from("/path/to/very_long_directory_name_here"));
+        let session = SessionInfo::new(0, PathBuf::from("/path/to/very_long_directory_name_here"), &default_palette());
         let title = session.display_title(10);
         assert!(title.len() <= 10);
         assert!(title.ends_with("..."));
@@ -743,9 +749,9 @@ mod tests {
     fn test_compute_display_titles_unique() {
         // When all directories have different names, show parent/dir format for context
         let mut manager = SessionManager::new();
-        manager.create_session(PathBuf::from("/home/user/project1"));
-        manager.create_session(PathBuf::from("/home/user/project2"));
-        manager.create_session(PathBuf::from("/work/different"));
+        manager.create_session(PathBuf::from("/home/user/project1"), &default_palette());
+        manager.create_session(PathBuf::from("/home/user/project2"), &default_palette());
+        manager.create_session(PathBuf::from("/work/different"), &default_palette());
 
         let titles = manager.compute_display_titles(50);
         assert_eq!(titles.len(), 3);
@@ -761,8 +767,8 @@ mod tests {
     fn test_compute_display_titles_same_name_different_path() {
         // When directories have the same name but different paths, disambiguate
         let mut manager = SessionManager::new();
-        let id1 = manager.create_session(PathBuf::from("/work/project1/app"));
-        let id2 = manager.create_session(PathBuf::from("/work/project2/app"));
+        let id1 = manager.create_session(PathBuf::from("/work/project1/app"), &default_palette());
+        let id2 = manager.create_session(PathBuf::from("/work/project2/app"), &default_palette());
 
         let titles = manager.compute_display_titles(50);
         assert_eq!(titles.len(), 2);
@@ -780,7 +786,7 @@ mod tests {
     fn test_compute_display_titles_new_tab() {
         // New tabs should just show "New Session"
         let mut manager = SessionManager::new();
-        let id = manager.create_new_tab();
+        let id = manager.create_new_tab(&default_palette());
 
         let titles = manager.compute_display_titles(50);
         assert_eq!(titles.get(&id), Some(&"New Session".to_string()));
@@ -805,7 +811,7 @@ mod tests {
     fn test_compute_display_titles_with_terminal_title() {
         // When a session has a terminal_title set, it should be included in the display
         let mut manager = SessionManager::new();
-        let id = manager.create_session(PathBuf::from("/home/user/project"));
+        let id = manager.create_session(PathBuf::from("/home/user/project"), &default_palette());
 
         // Set the terminal title (simulating OSC title change from Claude)
         if let Some(session) = manager.get_session_mut(id) {

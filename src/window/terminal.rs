@@ -15,9 +15,11 @@ use super::settings_modal::{render_settings_modal, SettingsModal};
 use arboard::Clipboard;
 use crate::core::bookmarks::BookmarkManager;
 use crate::core::sessions::{SessionId, SessionManager};
-use crate::core::settings::Settings;
+use crate::core::settings::{ColorScheme, Settings};
 use crate::core::state::ClaudeState;
+use crate::core::themes::{Theme, ThemeRegistry, claude_json_mtime, read_claude_theme_is_light};
 use crate::terminal::Session;
+use wezterm_term::color::ColorPalette;
 use egui_glow::EguiGlow;
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextAttributesBuilder, PossiblyCurrentContext};
@@ -32,6 +34,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 use wezterm_cell::Hyperlink;
@@ -147,6 +150,16 @@ pub struct TerminalWindowState {
     image_loaders_installed: bool,
     /// Context menu state for right-click popup
     context_menu: ContextMenuState,
+    /// Theme registry with all available themes
+    pub theme_registry: ThemeRegistry,
+    /// Currently active theme
+    pub current_theme: Theme,
+    /// Current color palette (derived from theme)
+    pub current_palette: ColorPalette,
+    /// Current color scheme (derived from theme, for UI chrome)
+    pub color_scheme: ColorScheme,
+    /// Last known mtime of ~/.claude.json (for detecting theme changes)
+    claude_json_mtime: Option<SystemTime>,
 }
 
 impl TerminalWindowState {
@@ -159,6 +172,18 @@ impl TerminalWindowState {
         // Sync settings font_size with the actual startup value from config
         settings.font_size = font_size;
         let bookmark_manager = BookmarkManager::load().unwrap_or_default();
+
+        // Initialize theme system — auto-detect from ~/.claude.json
+        let theme_registry = ThemeRegistry::new();
+        let is_light = read_claude_theme_is_light();
+        let theme_name = if is_light { "Light" } else { "Dark" };
+        let current_theme = theme_registry
+            .find(theme_name)
+            .cloned()
+            .unwrap_or_else(|| theme_registry.find("Dark").unwrap().clone());
+        let current_palette = current_theme.to_color_palette();
+        let color_scheme = ColorScheme::from_is_light(current_theme.is_light);
+        let cj_mtime = claude_json_mtime();
 
         Self {
             window: None,
@@ -189,6 +214,11 @@ impl TerminalWindowState {
             pending_actions: Vec::new(),
             image_loaders_installed: false,
             context_menu: ContextMenuState::default(),
+            theme_registry,
+            current_theme,
+            current_palette,
+            color_scheme,
+            claude_json_mtime: cj_mtime,
         }
     }
 
@@ -515,6 +545,33 @@ impl TerminalWindowState {
     /// Open the settings modal
     pub fn open_settings(&mut self) {
         self.settings_modal.open(&self.settings);
+    }
+
+    /// Check ~/.claude.json for theme changes and update if needed.
+    /// Returns true if the theme changed.
+    pub fn check_claude_theme(&mut self) -> bool {
+        let new_mtime = claude_json_mtime();
+        if new_mtime == self.claude_json_mtime {
+            return false;
+        }
+        self.claude_json_mtime = new_mtime;
+
+        let is_light = read_claude_theme_is_light();
+        let theme_name = if is_light { "Light" } else { "Dark" };
+
+        if self.current_theme.name == theme_name {
+            return false;
+        }
+
+        if let Some(theme) = self.theme_registry.find(theme_name).cloned() {
+            info!("Claude theme changed to '{}', switching terminal theme", theme_name);
+            self.current_palette = theme.to_color_palette();
+            self.color_scheme = ColorScheme::from_is_light(theme.is_light);
+            self.current_theme = theme;
+            true
+        } else {
+            false
+        }
     }
 
     /// Apply a new font size temporarily (for View menu), without updating settings
@@ -1298,6 +1355,7 @@ impl TerminalWindowState {
     /// Render the window
     pub fn render(&mut self) {
         self.process_notifications();
+        self.process_terminal_responses();
 
         if !self.is_visible() {
             return;
@@ -1318,7 +1376,7 @@ impl TerminalWindowState {
 
         let scroll_offset = self.scroll_offset.load(Ordering::Relaxed) as usize;
         let font_size = self.font_size;
-        let color_scheme = self.settings.color_scheme;
+        let color_scheme = self.color_scheme;
         let has_selection_for_menu = self.has_selection();
 
         let Some(ref mut egui_glow) = self.egui_glow else {
@@ -1373,6 +1431,7 @@ impl TerminalWindowState {
             scroll_offset,
             font_size,
             color_scheme,
+            current_theme: &self.current_theme,
             has_selection_for_menu,
             sessions_data,
             active_session_idx,
@@ -1395,11 +1454,12 @@ impl TerminalWindowState {
                     render_tab_bar(ui, ctx, &render_params, &mut new_actions, need_install_loaders);
                 });
 
-            // Main content area
+            // Main content area - use theme background for terminal area
+            let terminal_bg = self.current_theme.background_color32();
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::default()
-                        .fill(color_scheme.background())
+                        .fill(terminal_bg)
                         .inner_margin(8.0),
                 )
                 .show(ctx, |ui| {
@@ -1450,6 +1510,22 @@ impl TerminalWindowState {
 
         egui_glow.paint(window);
         gl_surface.swap_buffers(gl_context).unwrap();
+    }
+
+    /// Forward terminal responses (e.g., OSC 11 bg color replies) to PTY input.
+    /// Call this periodically to ensure programs get responses to their queries.
+    pub fn process_terminal_responses(&self) {
+        for session_info in self.session_manager.iter() {
+            let session = session_info.session.lock();
+            let responses = session.poll_responses();
+            if !responses.is_empty() {
+                if let Some(ref tx) = session_info.pty_input_tx {
+                    for response in responses {
+                        let _ = tx.send(response);
+                    }
+                }
+            }
+        }
     }
 
     pub fn process_notifications(&mut self) {

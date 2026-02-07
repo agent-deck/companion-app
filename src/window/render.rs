@@ -14,6 +14,7 @@ use crate::core::bookmarks::BookmarkManager;
 use crate::core::sessions::SessionId;
 use crate::core::settings::ColorScheme;
 use crate::core::state::ClaudeState;
+use crate::core::themes::Theme;
 use crate::terminal::Session;
 use super::glyph_cache::{GlyphCache, StyleKey};
 use super::new_tab::{render_new_tab_page, NewTabAction};
@@ -76,6 +77,7 @@ pub struct RenderParams<'a> {
     pub scroll_offset: usize,
     pub font_size: f32,
     pub color_scheme: ColorScheme,
+    pub current_theme: &'a Theme,
     pub has_selection_for_menu: bool,
     pub sessions_data: Vec<SessionRenderData>,
     pub active_session_idx: usize,
@@ -116,7 +118,7 @@ pub fn render_tab_bar(
     ui.style_mut().visuals.widgets.active.weak_bg_fill = color_scheme.active_tab_background();
     // Remove yellow/olive stroke
     ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-    ui.style_mut().visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80));
+    ui.style_mut().visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, color_scheme.tab_hover_stroke());
     ui.style_mut().visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
 
     // Calculate available width for tabs
@@ -477,9 +479,9 @@ fn render_single_tab(
     // Draw close button
     let close_hovered = ui.rect_contains_pointer(close_rect);
     let close_color = if close_hovered {
-        egui::Color32::WHITE
+        color_scheme.close_button_hover_color()
     } else {
-        egui::Color32::GRAY
+        color_scheme.close_button_color()
     };
     ui.painter().text(
         close_rect.center(),
@@ -572,7 +574,7 @@ pub fn render_terminal_content(
             ui.style_mut().spacing.interact_size = egui::vec2(0.0, 0.0);
 
             let sess = session.lock();
-            let palette = sess.palette().clone();
+            let palette = params.current_theme.to_color_palette();
 
             sess.with_terminal_mut(|term| {
                 render_terminal_cells(
@@ -584,6 +586,7 @@ pub fn render_terminal_content(
                     selection,
                     font_size,
                     color_scheme,
+                    params.current_theme,
                     cached_char_width,
                     cached_line_height,
                     glyph_cache,
@@ -597,7 +600,7 @@ pub fn render_terminal_content(
             ui.label(
                 egui::RichText::new("No tabs open. Press + to create a new tab.")
                     .size(16.0)
-                    .color(egui::Color32::GRAY),
+                    .color(color_scheme.secondary_foreground()),
             );
         });
     }
@@ -614,6 +617,7 @@ fn render_terminal_cells(
     selection: Option<((i64, usize), (i64, usize))>,
     font_size: f32,
     color_scheme: ColorScheme,
+    current_theme: &Theme,
     cached_char_width: &Cell<f32>,
     cached_line_height: &Cell<f32>,
     glyph_cache: &RefCell<Option<GlyphCache>>,
@@ -649,7 +653,7 @@ fn render_terminal_cells(
     let visible_start = total_lines.saturating_sub(physical_rows + scroll_offset);
 
     let painter = ui.painter();
-    let default_bg = color_scheme.background();
+    let default_bg = current_theme.background_color32();
 
     // Collect cells to render
     let mut cells_to_render: Vec<(
@@ -700,29 +704,12 @@ fn render_terminal_cells(
                 };
 
                 if in_selection {
-                    fg = egui::Color32::WHITE;
-                    bg = Some(color_scheme.selection_background());
+                    fg = current_theme.foreground_color32();
+                    bg = Some(current_theme.selection_bg_color32());
                 }
             }
 
             let is_bold = matches!(attrs.intensity(), Intensity::Bold);
-            match attrs.intensity() {
-                Intensity::Bold => {
-                    fg = egui::Color32::from_rgb(
-                        (fg.r() as u16 * 5 / 4).min(255) as u8,
-                        (fg.g() as u16 * 5 / 4).min(255) as u8,
-                        (fg.b() as u16 * 5 / 4).min(255) as u8,
-                    );
-                }
-                Intensity::Half => {
-                    fg = egui::Color32::from_rgb(
-                        fg.r() / 2,
-                        fg.g() / 2,
-                        fg.b() / 2,
-                    );
-                }
-                Intensity::Normal => {}
-            }
 
             if attrs.reverse() {
                 let temp_fg = fg;
@@ -748,9 +735,9 @@ fn render_terminal_cells(
 
             let has_underline = attrs.underline() != Underline::None || has_hyperlink;
             if is_hovered_hyperlink {
-                fg = egui::Color32::from_rgb(100, 149, 237);
+                fg = color_scheme.hyperlink_hover_color();
             } else if has_hyperlink {
-                fg = egui::Color32::from_rgb(80, 120, 200);
+                fg = color_scheme.hyperlink_color();
             }
 
             let has_strikethrough = attrs.strikethrough();
@@ -900,7 +887,7 @@ fn render_terminal_cells(
         let cursor_pixel_x = content_min.x + cursor.x as f32 * char_width;
         let cursor_pixel_y = content_min.y + cursor.y as f32 * line_height;
 
-        let cursor_color = egui::Color32::from_rgba_unmultiplied(200, 200, 200, 220);
+        let cursor_color = current_theme.cursor_color32();
 
         let cursor_rect = match cursor.shape {
             CursorShape::BlinkingBlock | CursorShape::SteadyBlock => {
