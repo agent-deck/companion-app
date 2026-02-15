@@ -311,37 +311,24 @@ pub struct SoftKeyConfig {
     pub data: Vec<u8>,
 }
 
+/// Tab state: session exists but Claude isn't loaded/detected yet
+pub const TAB_STATE_INACTIVE: u8 = 0;
+/// Tab state: Claude is loaded and idle (✳ prefix detected)
+pub const TAB_STATE_STARTED: u8 = 1;
+/// Tab state: Claude is actively working (spinner detected)
+pub const TAB_STATE_WORKING: u8 = 2;
+
 /// Display update data structure matching firmware JSON format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisplayUpdate {
-    /// Current task description
+    /// Session name
+    pub session: String,
+    /// Current task description (empty when idle)
     pub task: String,
-    /// Model name
-    pub model: String,
-    /// Progress percentage (0-100)
-    pub progress: u8,
-    /// Token count (formatted)
-    pub tokens: String,
-    /// Cost (formatted)
-    pub cost: String,
-}
-
-impl DisplayUpdate {
-    /// Convert to JSON string for HID transmission
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-
-    /// Create from ClaudeState
-    pub fn from_claude_state(state: &crate::core::state::ClaudeState) -> Self {
-        Self {
-            task: state.task.clone(),
-            model: state.model.clone(),
-            progress: state.progress,
-            tokens: state.tokens.clone(),
-            cost: state.cost.clone(),
-        }
-    }
+    /// Tab states for all non-new-tab sessions
+    pub tabs: Vec<u8>,
+    /// Index into tabs array for the currently active tab
+    pub active: usize,
 }
 
 #[cfg(test)]
@@ -448,15 +435,16 @@ mod tests {
     #[test]
     fn test_display_update_json() {
         let update = DisplayUpdate {
-            task: "Testing".to_string(),
-            model: "Claude".to_string(),
-            progress: 50,
-            tokens: "1000".to_string(),
-            cost: "$0.01".to_string(),
+            session: "my-project".to_string(),
+            task: "Reading files".to_string(),
+            tabs: vec![0, 1, 2],
+            active: 1,
         };
-        let json = update.to_json();
-        assert!(json.contains("\"task\":\"Testing\""));
-        assert!(json.contains("\"progress\":50"));
+        let json = serde_json::to_string(&update).unwrap();
+        assert!(json.contains("\"session\":\"my-project\""));
+        assert!(json.contains("\"task\":\"Reading files\""));
+        assert!(json.contains("\"tabs\":[0,1,2]"));
+        assert!(json.contains("\"active\":1"));
     }
 
     #[test]

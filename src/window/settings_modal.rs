@@ -223,19 +223,16 @@ pub fn render_settings_modal(
             );
         });
 
-    // Modal window
-    let modal_size = if modal.active_tab == SettingsTab::SoftKeys {
-        [520.0, 450.0]
-    } else {
-        [400.0, 230.0]
-    };
-
+    // Modal window — fixed size so it doesn't jump on tab switch
+    let modal_content_size = egui::vec2(520.0, 450.0);
     egui::Window::new("Settings")
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .fixed_size(modal_size)
+        .fixed_size(modal_content_size)
         .show(ctx, |ui| {
+            ui.set_min_size(modal_content_size);
+
             // Tab bar
             ui.horizontal(|ui| {
                 let general_text = egui::RichText::new("General").size(13.0);
@@ -264,14 +261,18 @@ pub fn render_settings_modal(
 
             ui.separator();
 
-            match modal.active_tab {
-                SettingsTab::General => {
-                    result = render_general_tab(ui, modal);
+            // Reserve all remaining space so the window doesn't shrink
+            let available = ui.available_size();
+            ui.allocate_ui(available, |ui| {
+                match modal.active_tab {
+                    SettingsTab::General => {
+                        result = render_general_tab(ui, modal);
+                    }
+                    SettingsTab::SoftKeys => {
+                        result = render_soft_keys_tab(ui, modal, hid_connected);
+                    }
                 }
-                SettingsTab::SoftKeys => {
-                    result = render_soft_keys_tab(ui, modal, hid_connected);
-                }
-            }
+            });
         });
 
     // Close on Escape (skip if capturing or just finished capturing this frame)

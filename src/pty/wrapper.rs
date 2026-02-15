@@ -4,8 +4,6 @@ use crate::core::claude_sessions::get_session_count;
 use crate::core::config::ClaudeConfig;
 use crate::core::events::AppEvent;
 use crate::core::sessions::SessionId;
-use crate::core::state::ClaudeState;
-use super::claude_state::ClaudeStateExtractor;
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
@@ -21,8 +19,6 @@ pub struct PtyWrapper {
     master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     /// Writer to PTY
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
-    /// State extractor
-    extractor: Arc<Mutex<ClaudeStateExtractor>>,
     /// Event sender
     event_tx: mpsc::UnboundedSender<AppEvent>,
     /// Configuration
@@ -50,7 +46,6 @@ impl PtyWrapper {
         Self {
             master: Arc::new(Mutex::new(None)),
             writer: Arc::new(Mutex::new(None)),
-            extractor: Arc::new(Mutex::new(ClaudeStateExtractor::new())),
             event_tx,
             config,
             running: Arc::new(Mutex::new(false)),
@@ -80,7 +75,6 @@ impl PtyWrapper {
         Self {
             master: Arc::new(Mutex::new(None)),
             writer: Arc::new(Mutex::new(None)),
-            extractor: Arc::new(Mutex::new(ClaudeStateExtractor::new())),
             event_tx,
             config,
             running: Arc::new(Mutex::new(false)),
@@ -218,7 +212,6 @@ impl PtyWrapper {
     /// Start background task to read PTY output
     fn start_reader_task(&self, mut child: Box<dyn portable_pty::Child + Send + Sync>) {
         let master = Arc::clone(&self.master);
-        let extractor = Arc::clone(&self.extractor);
         let event_tx = self.event_tx.clone();
         let running = Arc::clone(&self.running);
         let session_id = self.session_id;
@@ -274,11 +267,6 @@ impl PtyWrapper {
                             let _ = event_tx.send(AppEvent::PtyOutput(data.to_vec()));
                         }
 
-                        // Extract state
-                        let mut ext = extractor.lock();
-                        if let Some(state) = ext.process(data) {
-                            let _ = event_tx.send(AppEvent::ClaudeStateChanged(state));
-                        }
                     }
                     Err(e) => {
                         if e.kind() != std::io::ErrorKind::Interrupted {
@@ -356,11 +344,6 @@ impl PtyWrapper {
     /// Check if process is running
     pub fn is_running(&self) -> bool {
         *self.running.lock()
-    }
-
-    /// Get current Claude state
-    pub fn state(&self) -> ClaudeState {
-        self.extractor.lock().state().clone()
     }
 
     /// Stop the PTY process

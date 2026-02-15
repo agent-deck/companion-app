@@ -7,7 +7,6 @@ use super::protocol::{
 };
 use crate::core::config::HidConfig;
 use crate::core::events::AppEvent;
-use crate::core::state::ClaudeState;
 use anyhow::{anyhow, Context, Result};
 use hidapi::{HidApi, HidDevice};
 use parking_lot::Mutex;
@@ -370,49 +369,16 @@ impl HidManager {
         self.connected.load(Ordering::Relaxed)
     }
 
-    /// Send a display update to the device (chunked)
-    pub fn send_display_update(&self, state: &ClaudeState) -> Result<()> {
+    /// Send a display update with session name, current task, tab states, and active tab index
+    pub fn send_display_update(&self, session: &str, task: Option<&str>, tabs: &[u8], active: usize) -> Result<()> {
         let device_guard = self.device.lock();
         let device = device_guard
             .as_ref()
             .ok_or_else(|| anyhow!("Device not connected"))?;
 
-        let truncated = state.truncated();
-        let packets = commands::build_display_update(&truncated);
-
-        debug!("Sending display update ({} packets)", packets.len());
-
+        let packets = commands::build_display_update(session, task, tabs, active);
         send_packets_to_device(device, &packets)?;
 
-        // Read and discard response (or handle state report)
-        self.drain_response(device);
-
-        Ok(())
-    }
-
-    /// Send a task update to the device (chunked)
-    pub fn send_task_update(&self, task: &str) -> Result<()> {
-        let device_guard = self.device.lock();
-        let device = device_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("Device not connected"))?;
-
-        let clean_task = task
-            .trim_start_matches(|c: char| !c.is_alphanumeric())
-            .trim();
-
-        let json = format!(r#"{{"task":"{}"}}"#, clean_task.replace('"', "\\\""));
-
-        debug!("Sending task update: {}", json);
-
-        let packets = super::protocol::build_chunked_packets(
-            HidCommand::UpdateDisplay,
-            json.as_bytes(),
-        );
-
-        send_packets_to_device(device, &packets)?;
-
-        // Read and discard response
         self.drain_response(device);
 
         Ok(())
@@ -535,6 +501,7 @@ impl HidManager {
         info!("Soft keys reset to defaults");
         Ok(configs)
     }
+
 
     /// Set device LED mode
     pub fn set_mode(&self, mode: DeviceMode) -> Result<()> {

@@ -6,17 +6,17 @@
 #![allow(dead_code)]
 
 use super::protocol::{build_chunked_packets, DeviceMode, HidCommand, HidPacket, SoftKeyType};
-use crate::core::state::ClaudeState;
 
-/// Build a display update from Claude state (chunked across packets)
-pub fn build_display_update(state: &ClaudeState) -> Vec<HidPacket> {
+/// Build a display update with session name, current task, tab states, and active tab index
+pub fn build_display_update(session: &str, task: Option<&str>, tabs: &[u8], active: usize) -> Vec<HidPacket> {
     let json = serde_json::json!({
-        "task": truncate(&state.task, 64),
-        "model": truncate(&state.model, 64),
-        "progress": state.progress.min(100),
-        "tokens": truncate(&state.tokens, 16),
-        "cost": truncate(&state.cost, 16),
+        "session": session,
+        "task": task.unwrap_or(""),
+        "tabs": tabs,
+        "active": active,
     });
+
+    tracing::info!("HID display payload: {}", json);
 
     build_chunked_packets(HidCommand::UpdateDisplay, json.to_string().as_bytes())
 }
@@ -54,20 +54,6 @@ pub fn build_set_mode(mode: DeviceMode) -> Vec<HidPacket> {
     build_chunked_packets(HidCommand::SetMode, &[mode as u8])
 }
 
-/// Truncate a string to a maximum length
-fn truncate(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len {
-        return s;
-    }
-
-    // Find a valid UTF-8 boundary
-    let mut end = max_len;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-
-    &s[..end]
-}
 
 #[cfg(test)]
 mod tests {
@@ -76,24 +62,20 @@ mod tests {
 
     #[test]
     fn test_build_display_update() {
-        let state = ClaudeState {
-            task: "Testing".to_string(),
-            model: "Claude".to_string(),
-            progress: 50,
-            tokens: "1000".to_string(),
-            cost: "$0.01".to_string(),
-        };
-
-        let packets = build_display_update(&state);
+        let packets = build_display_update("my-session", Some("Reading files"), &[0, 1, 2], 1);
         assert!(!packets.is_empty());
-        // First packet should be START
         assert!(packets[0].is_start());
-        // Last packet should be END
         assert!(packets.last().unwrap().is_end());
-        // All packets should have UpdateDisplay command
         for p in &packets {
             assert_eq!(p.command(), Some(HidCommand::UpdateDisplay));
         }
+    }
+
+    #[test]
+    fn test_build_display_update_no_task() {
+        let packets = build_display_update("my-session", None, &[1], 0);
+        assert!(!packets.is_empty());
+        assert!(packets[0].is_start());
     }
 
     #[test]
@@ -118,7 +100,6 @@ mod tests {
         let packets = build_set_soft_key(0, SoftKeyType::String, b"hello", true);
         assert!(!packets.is_empty());
         assert_eq!(packets[0].command(), Some(HidCommand::SetSoftKey));
-        // Payload: [index=0, type=2, save=1, 'h', 'e', 'l', 'l', 'o']
         let payload = packets[0].payload();
         assert_eq!(payload[0], 0); // index
         assert_eq!(payload[1], 2); // SoftKeyType::String
@@ -149,9 +130,4 @@ mod tests {
         assert_eq!(packets[0].payload()[0], 2); // Plan = 2
     }
 
-    #[test]
-    fn test_truncate() {
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello world", 5), "hello");
-    }
 }

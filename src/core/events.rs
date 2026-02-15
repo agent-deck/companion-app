@@ -1,7 +1,6 @@
 //! Application event definitions
 
 use super::sessions::SessionId;
-use super::state::ClaudeState;
 use crate::hid::protocol::{DeviceMode};
 use crate::hotkey::HotkeyType;
 #[cfg(target_os = "macos")]
@@ -11,9 +10,6 @@ use crate::tray::TrayAction;
 /// Application-wide events for inter-module communication
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    /// Claude state has changed
-    ClaudeStateChanged(ClaudeState),
-
     /// HID device connected
     HidConnected,
 
@@ -37,9 +33,6 @@ pub enum AppEvent {
 
     /// PTY process exited for a specific session
     PtyExitedForSession { session_id: SessionId, code: Option<i32> },
-
-    /// Terminal title changed (from OSC escape sequence)
-    TerminalTitleChanged(String),
 
     /// HID device state changed (mode button or YOLO switch)
     DeviceStateChanged { mode: DeviceMode, yolo: bool },

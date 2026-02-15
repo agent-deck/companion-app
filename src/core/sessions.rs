@@ -4,7 +4,6 @@
 //! and Claude state.
 
 use crate::core::claude_sessions::get_sessions_for_directory;
-use crate::core::state::ClaudeState;
 use crate::terminal::Session;
 use crate::window::InputSender;
 use parking_lot::Mutex;
@@ -63,8 +62,6 @@ pub struct SessionInfo {
     pub session: Arc<Mutex<Session>>,
     /// Input sender to PTY (None if session not started)
     pub pty_input_tx: Option<InputSender>,
-    /// Claude state for this session
-    pub claude_state: Arc<Mutex<ClaudeState>>,
     /// Whether this session has an active PTY
     pub is_running: bool,
     /// Whether PTY is currently being started (for loading indicator)
@@ -79,6 +76,8 @@ pub struct SessionInfo {
     pub needs_session_resolution: bool,
     /// Claude's current activity state (derived from terminal title prefix)
     pub claude_activity: ClaudeActivity,
+    /// Current task text when Claude is working (from OSC title with spinner prefix)
+    pub current_task: Option<String>,
     /// Whether Claude finished working while tab was in background (for notification indicator)
     pub finished_in_background: bool,
 }
@@ -99,7 +98,6 @@ impl SessionInfo {
             terminal_title: None,
             session: Arc::new(Mutex::new(Session::new(0, 120, 50, palette.clone()))),
             pty_input_tx: None,
-            claude_state: Arc::new(Mutex::new(ClaudeState::default())),
             is_running: false,
             is_loading: false,
             claude_session_id: None,
@@ -107,6 +105,7 @@ impl SessionInfo {
             session_start_time: None,
             needs_session_resolution: false,
             claude_activity: ClaudeActivity::default(),
+            current_task: None,
             finished_in_background: false,
         }
     }
@@ -120,7 +119,6 @@ impl SessionInfo {
             terminal_title: None,
             session: Arc::new(Mutex::new(Session::new(0, 120, 50, palette.clone()))),
             pty_input_tx: None,
-            claude_state: Arc::new(Mutex::new(ClaudeState::default())),
             is_running: false,
             is_loading: false,
             claude_session_id: None,
@@ -128,6 +126,7 @@ impl SessionInfo {
             session_start_time: None,
             needs_session_resolution: false,
             claude_activity: ClaudeActivity::default(),
+            current_task: None,
             finished_in_background: false,
         }
     }
@@ -312,6 +311,44 @@ impl SessionManager {
     /// Get sessions as a slice for rendering
     pub fn sessions(&self) -> &[SessionInfo] {
         &self.sessions
+    }
+
+    /// Collect tab states for HID display update.
+    ///
+    /// Returns `(tab_states, active_index)` where:
+    /// - `tab_states` is a Vec of u8 state constants for all non-new-tab sessions
+    /// - `active_index` is the index into that Vec for the currently active session
+    ///   (defaults to 0 if active session is a new tab or not found)
+    pub fn collect_tab_states(&self) -> (Vec<u8>, usize) {
+        use crate::hid::protocol::{TAB_STATE_INACTIVE, TAB_STATE_STARTED, TAB_STATE_WORKING};
+
+        let active_id = self.active_session_id();
+        let mut tab_states = Vec::new();
+        let mut active_index = 0;
+
+        for session in &self.sessions {
+            if session.is_new_tab() {
+                continue;
+            }
+
+            let state = if !session.is_running {
+                TAB_STATE_INACTIVE
+            } else {
+                match session.claude_activity {
+                    ClaudeActivity::Unknown => TAB_STATE_INACTIVE,
+                    ClaudeActivity::Idle => TAB_STATE_STARTED,
+                    ClaudeActivity::Working => TAB_STATE_WORKING,
+                }
+            };
+
+            if Some(session.id) == active_id {
+                active_index = tab_states.len();
+            }
+
+            tab_states.push(state);
+        }
+
+        (tab_states, active_index)
     }
 
     /// Compute disambiguated display titles for all sessions

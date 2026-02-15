@@ -13,7 +13,6 @@ use wezterm_term::color::ColorPalette;
 use crate::core::bookmarks::BookmarkManager;
 use crate::core::sessions::SessionId;
 use crate::core::settings::ColorScheme;
-use crate::core::state::ClaudeState;
 use crate::core::themes::Theme;
 use crate::terminal::Session;
 use super::glyph_cache::{GlyphCache, StyleKey};
@@ -82,7 +81,7 @@ pub struct RenderParams<'a> {
     pub sessions_data: Vec<SessionRenderData>,
     pub active_session_idx: usize,
     pub hid_connected: bool,
-    pub active_session_data: Option<(Arc<Mutex<Session>>, Arc<Mutex<ClaudeState>>, bool, SessionId)>,
+    pub active_session_data: Option<(Arc<Mutex<Session>>, bool, SessionId)>,
     pub bookmark_manager: BookmarkManager,
     pub selection: Option<((i64, usize), (i64, usize))>,
     pub cached_char_width: &'a Cell<f32>,
@@ -541,7 +540,7 @@ pub fn render_terminal_content(
     let hovered_hyperlink = params.hovered_hyperlink;
     let bookmark_manager = &params.bookmark_manager;
 
-    if let Some((session, _claude_state, is_new_tab, session_id)) = &params.active_session_data {
+    if let Some((session, is_new_tab, session_id)) = &params.active_session_data {
         if *is_new_tab {
             // Render new tab page with session_id for per-tab state
             if let Some(action) =

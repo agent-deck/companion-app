@@ -17,7 +17,6 @@ use arboard::Clipboard;
 use crate::core::bookmarks::BookmarkManager;
 use crate::core::sessions::{SessionId, SessionManager};
 use crate::core::settings::{ColorScheme, Settings};
-use crate::core::state::ClaudeState;
 use crate::core::themes::{Theme, ThemeRegistry, claude_json_mtime, read_claude_theme_is_light};
 use crate::terminal::Session;
 use wezterm_term::color::ColorPalette;
@@ -97,6 +96,8 @@ pub enum TerminalAction {
     ApplySoftKeys([SoftKeyEditState; 3]),
     /// Reset soft keys to firmware defaults
     ResetSoftKeys,
+    /// Send HID display update with session name, current task, tab states, and active index
+    HidDisplayUpdate { session: String, task: Option<String>, tabs: Vec<u8>, active: usize },
 }
 
 /// Terminal window state managed within the main app
@@ -248,12 +249,6 @@ impl TerminalWindowState {
             .map(|s| Arc::clone(&s.session))
     }
 
-    /// Get the active session's claude state (for legacy compatibility)
-    pub fn claude_state(&self) -> Option<Arc<Mutex<ClaudeState>>> {
-        self.session_manager
-            .active_session()
-            .map(|s| Arc::clone(&s.claude_state))
-    }
 
     /// Set callback for PTY resize notifications
     pub fn set_resize_callback<F>(&mut self, callback: F)
@@ -1435,7 +1430,7 @@ impl TerminalWindowState {
         let hid_connected = self.hid_connected;
 
         let active_session_data = self.session_manager.active_session().map(|s| {
-            (Arc::clone(&s.session), Arc::clone(&s.claude_state), s.is_new_tab(), s.id)
+            (Arc::clone(&s.session), s.is_new_tab(), s.id)
         });
 
         let bookmark_manager = self.bookmark_manager.clone();
@@ -1549,8 +1544,9 @@ impl TerminalWindowState {
         use crate::core::sessions::ClaudeActivity;
         use wezterm_term::Alert;
 
-        let mut title_changes: Vec<(SessionId, String)> = Vec::new();
-        let mut activity_changes: Vec<(SessionId, ClaudeActivity)> = Vec::new();
+        // Collect (session_id, activity, cleaned_title) tuples from title changes.
+        // Title is None when the cleaned title is "Claude Code" (activity still tracked).
+        let mut title_activity_changes: Vec<(SessionId, ClaudeActivity, Option<String>)> = Vec::new();
         let mut bell_sessions: Vec<SessionId> = Vec::new();
         let active_session_id = self.session_manager.active_session_id();
 
@@ -1577,11 +1573,12 @@ impl TerminalWindowState {
                     }
                     Alert::WindowTitleChanged(title) => {
                         debug!("Window title changed for session {}: {}", session_info.id, title);
-                        let activity = crate::core::sessions::ClaudeActivity::from_title(&title);
-                        activity_changes.push((session_info.id, activity));
+                        let activity = ClaudeActivity::from_title(&title);
                         let clean = clean_terminal_title(&title);
-                        if !clean.is_empty() && clean != "Claude Code" {
-                            title_changes.push((session_info.id, clean));
+                        if !clean.is_empty() {
+                            // Pass None for title when it's just "Claude Code" (still track activity)
+                            let display_title = if clean == "Claude Code" { None } else { Some(clean) };
+                            title_activity_changes.push((session_info.id, activity, display_title));
                         }
                     }
                     Alert::IconTitleChanged(title) => {
@@ -1590,9 +1587,11 @@ impl TerminalWindowState {
                     Alert::TabTitleChanged(title) => {
                         debug!("Tab title changed for session {}: {:?}", session_info.id, title);
                         if let Some(t) = title {
+                            let activity = ClaudeActivity::from_title(&t);
                             let clean = clean_terminal_title(&t);
-                            if !clean.is_empty() && clean != "Claude Code" {
-                                title_changes.push((session_info.id, clean));
+                            if !clean.is_empty() {
+                                let display_title = if clean == "Claude Code" { None } else { Some(clean) };
+                                title_activity_changes.push((session_info.id, activity, display_title));
                             }
                         }
                     }
@@ -1610,10 +1609,53 @@ impl TerminalWindowState {
         }
 
         let mut sessions_needing_resolution: Vec<SessionId> = Vec::new();
+        let mut hid_needs_update = false;
 
-        for (session_id, clean_title) in title_changes {
+        let active_session_id = self.session_manager.active_session_id();
+        for (session_id, activity, clean_title) in title_activity_changes {
             if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
-                session_info.terminal_title = Some(clean_title);
+                // Track activity transitions for background notification
+                let was_working = session_info.claude_activity.is_working();
+                let is_background = Some(session_id) != active_session_id;
+
+                // Route title based on activity:
+                // - Title text is always the session name (both working and idle)
+                // - Task comes from the terminal screen content (spinner status line)
+                // - None means "Claude Code" default — don't overwrite existing title
+                if let Some(title) = clean_title {
+                    session_info.terminal_title = Some(title);
+                }
+
+                match activity {
+                    ClaudeActivity::Working => {
+                        // Scan terminal content for the spinner task line.
+                        // If not found (mid-redraw), keep previous task.
+                        let task = {
+                            let session = session_info.session.lock();
+                            session.find_spinner_task()
+                        };
+                        debug!("Session {}: working, task = {:?}", session_id, task);
+                        if task.is_some() {
+                            session_info.current_task = task;
+                        }
+                    }
+                    _ => {
+                        if session_info.current_task.is_some() {
+                            debug!("Session {}: idle, clearing task", session_id);
+                        }
+                        session_info.current_task = None;
+                    }
+                }
+
+                // Detect finished-in-background
+                if was_working && !activity.is_working() && is_background {
+                    session_info.finished_in_background = true;
+                }
+
+                session_info.claude_activity = activity;
+
+                // Any tab's activity change triggers a HID update (tab states array)
+                hid_needs_update = true;
 
                 if session_info.needs_session_resolution {
                     sessions_needing_resolution.push(session_id);
@@ -1625,26 +1667,43 @@ impl TerminalWindowState {
             self.try_resolve_session_id(session_id);
         }
 
-        let active_session_id = self.session_manager.active_session_id();
-        for (session_id, activity) in activity_changes {
-            if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
-                let was_working = session_info.claude_activity.is_working();
-                let is_background = Some(session_id) != active_session_id;
-                let stopped_working = !activity.is_working();
-
-                if was_working && stopped_working && is_background {
-                    session_info.finished_in_background = true;
-                }
-
-                session_info.claude_activity = activity;
-            }
-        }
-
         crate::update_working_session_count(self.session_manager.working_session_count());
 
         for session_id in bell_sessions {
             if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
                 session_info.bell_active = true;
+            }
+        }
+
+        // Periodically rescan task for active working session, even without title changes.
+        // The spinner task line on screen can change independently of OSC title updates.
+        if !hid_needs_update {
+            if let Some(session_info) = self.session_manager.active_session_mut() {
+                if session_info.claude_activity.is_working() {
+                    let task = {
+                        let session = session_info.session.lock();
+                        session.find_spinner_task()
+                    };
+                    if task.is_some() && task != session_info.current_task {
+                        session_info.current_task = task;
+                        hid_needs_update = true;
+                    }
+                }
+            }
+        }
+
+        // Push HID display update if any tab's state changed
+        if hid_needs_update {
+            if let Some(session_info) = self.session_manager.active_session() {
+                let session_name = session_info.terminal_title.clone().unwrap_or_default();
+                let current_task = session_info.current_task.clone();
+                let (tabs, active) = self.session_manager.collect_tab_states();
+                self.pending_actions.push(TerminalAction::HidDisplayUpdate {
+                    session: session_name,
+                    task: current_task,
+                    tabs,
+                    active,
+                });
             }
         }
     }

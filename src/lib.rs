@@ -27,7 +27,7 @@ pub use core::config::Config;
 pub use core::events::AppEvent;
 pub use core::sessions::{ClaudeActivity, SessionId, SessionInfo, SessionManager};
 pub use core::settings::{ColorScheme, Settings};
-pub use core::state::{AppState, ClaudeState};
+pub use core::state::AppState;
 
 // Global counter for working Claude sessions (used by macOS quit handler)
 #[cfg(target_os = "macos")]

@@ -423,6 +423,21 @@ impl App {
         info!("Claude stopped for session {}", session_id);
     }
 
+    /// Send HID display update for the currently active session.
+    /// Called whenever the active tab changes (switch, close, new tab, etc.)
+    fn send_hid_for_active_session(&self) {
+        if let Some(ref hid) = self.hid_manager {
+            if let Some(session) = self.terminal_window.session_manager.active_session() {
+                let session_name = session.terminal_title.clone().unwrap_or_default();
+                let current_task = session.current_task.clone();
+                let (tabs, active) = self.terminal_window.session_manager.collect_tab_states();
+                if let Err(e) = hid.send_display_update(&session_name, current_task.as_deref(), &tabs, active) {
+                    error!("Failed to send HID display update: {}", e);
+                }
+            }
+        }
+    }
+
     /// Handle terminal UI actions
     fn handle_terminal_action(&mut self, action: TerminalAction, event_loop: &ActiveEventLoop) {
         match action {
@@ -433,6 +448,7 @@ impl App {
                     .session_manager
                     .set_active_session(session_id);
                 self.terminal_window.update_window_title();
+                self.send_hid_for_active_session();
                 info!("Created new tab with session ID {}", session_id);
             }
             TerminalAction::CloseTab(session_id) => {
@@ -455,6 +471,8 @@ impl App {
                 self.terminal_window.update_window_title();
                 // Save tabs after closing
                 self.save_tabs();
+                // Send HID update for newly active tab
+                self.send_hid_for_active_session();
 
                 // Start PTY for newly active session if needed (lazy loading)
                 if let Some(new_active) = self.terminal_window.session_manager.active_session() {
@@ -480,6 +498,9 @@ impl App {
 
                 // Update window title to reflect active tab
                 self.terminal_window.update_window_title();
+
+                // Send HID display update for the newly active session
+                self.send_hid_for_active_session();
 
                 // Update recent sessions menu for the new active tab's directory
                 #[cfg(target_os = "macos")]
@@ -563,6 +584,7 @@ impl App {
                     .session_manager
                     .set_active_session(session_id);
                 self.terminal_window.update_window_title();
+                self.send_hid_for_active_session();
                 self.start_claude_for_session(session_id, path, resume_session, event_loop);
                 // Save tabs after opening a directory
                 self.save_tabs();
@@ -731,29 +753,19 @@ impl App {
                     }
                 }
             }
+            TerminalAction::HidDisplayUpdate { session, task, tabs, active } => {
+                if let Some(ref hid) = self.hid_manager {
+                    if let Err(e) = hid.send_display_update(&session, task.as_deref(), &tabs, active) {
+                        error!("Failed to send HID display update: {}", e);
+                    }
+                }
+            }
         }
     }
 
     /// Process an application event
     fn handle_event(&mut self, event: AppEvent, event_loop: &ActiveEventLoop) {
         match event {
-            AppEvent::ClaudeStateChanged(ref claude_state) => {
-                info!("Claude state changed: {:?}", claude_state);
-                {
-                    let mut state = self.state.write();
-                    state.claude_state = claude_state.clone();
-                }
-                // Update active session's claude state
-                if let Some(session) = self.terminal_window.session_manager.active_session() {
-                    *session.claude_state.lock() = claude_state.clone();
-                }
-                // Send update to HID device
-                if let Some(ref hid) = self.hid_manager {
-                    if let Err(e) = hid.send_display_update(claude_state) {
-                        error!("Failed to send display update: {}", e);
-                    }
-                }
-            }
             AppEvent::HidConnected => {
                 info!("HID device connected");
                 {
@@ -764,6 +776,8 @@ impl App {
                 if let Some(ref mut tray) = self.tray_manager {
                     tray.set_connected(true);
                 }
+                // Send initial display state to the newly connected device
+                self.send_hid_for_active_session();
             }
             AppEvent::HidDisconnected => {
                 info!("HID device disconnected");
@@ -785,6 +799,7 @@ impl App {
                             self.handle_terminal_action(TerminalAction::NewTab, event_loop);
                         } else if !self.session_ptys.is_empty() {
                             self.terminal_window.show();
+                            self.send_hid_for_active_session();
                             // Sync tray menu
                             if let Some(ref mut tray) = self.tray_manager {
                                 tray.set_window_visible(true);
@@ -793,6 +808,7 @@ impl App {
                             // We have saved tabs but no PTY running - show window and start active tab
                             self.terminal_window.create_window(event_loop);
                             self.terminal_window.show();
+                            self.send_hid_for_active_session();
                             // Sync tray menu
                             if let Some(ref mut tray) = self.tray_manager {
                                 tray.set_window_visible(true);
@@ -809,6 +825,7 @@ impl App {
                             }
                         } else {
                             self.start_claude(event_loop);
+                            self.send_hid_for_active_session();
                             // Sync tray menu (start_claude shows the window)
                             if let Some(ref mut tray) = self.tray_manager {
                                 tray.set_window_visible(true);
@@ -834,6 +851,7 @@ impl App {
                             // Show window
                             self.terminal_window.create_window(event_loop);
                             self.terminal_window.show();
+                            self.send_hid_for_active_session();
                             // Start PTY for active session if needed
                             if let Some(session) = self.terminal_window.session_manager.active_session() {
                                 if !session.is_new_tab() && !session.is_running && !session.is_loading {
@@ -908,14 +926,6 @@ impl App {
                     state.device_yolo = yolo;
                 }
             }
-            AppEvent::TerminalTitleChanged(title) => {
-                info!("Terminal title changed: {}", title);
-                if let Some(ref hid) = self.hid_manager {
-                    if let Err(e) = hid.send_task_update(&title) {
-                        error!("Failed to send task update to HID: {}", e);
-                    }
-                }
-            }
             AppEvent::PtyExited(code) => {
                 info!("PTY exited with code: {:?}", code);
                 // Legacy handling - find which session exited
@@ -939,6 +949,9 @@ impl App {
                         let mut state = self.state.write();
                         state.claude_running = false;
                     }
+                } else {
+                    // Send HID update for the newly active tab
+                    self.send_hid_for_active_session();
                 }
             }
             #[cfg(target_os = "macos")]
