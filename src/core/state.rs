@@ -1,5 +1,6 @@
 //! Application state management
 
+use crate::hid::protocol::DeviceMode;
 use serde::{Deserialize, Serialize};
 
 /// State of the Claude Code CLI session
@@ -56,6 +57,10 @@ pub struct AppState {
     pub claude_running: bool,
     /// Error message if any
     pub error: Option<String>,
+    /// Current device mode (default/plan/accept)
+    pub device_mode: DeviceMode,
+    /// Whether device YOLO mode is active
+    pub device_yolo: bool,
 }
 
 

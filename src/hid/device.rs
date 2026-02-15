@@ -1,6 +1,10 @@
 //! HID device discovery and connection management
 
-use super::protocol::{DisplayUpdate, HidCommand, HidPacket, PACKET_SIZE};
+use super::commands;
+use super::protocol::{
+    DeviceMode, DeviceState, HidCommand, HidPacket, ResponsePacket, SoftKeyConfig, SoftKeyType,
+    PACKET_SIZE,
+};
 use crate::core::config::HidConfig;
 use crate::core::events::AppEvent;
 use crate::core::state::ClaudeState;
@@ -241,19 +245,33 @@ impl HidManager {
                     let ping_ok = {
                         let device_guard = device.lock();
                         if let Some(ref dev) = *device_guard {
-                            let packet = HidPacket::with_command(HidCommand::Ping);
-                            match send_packet_to_device(dev, &packet) {
+                            // Send ping using chunked protocol
+                            let packets = commands::build_ping();
+                            match send_packets_to_device(dev, &packets) {
                                 Ok(()) => {
                                     debug!("Ping sent");
-                                    let mut buffer = [0u8; PACKET_SIZE];
-                                    match dev.read_timeout(&mut buffer, 100) {
-                                        Ok(n) if n > 0 => {
-                                            if buffer[0] == HidCommand::Ping as u8 {
+                                    // Read pong response
+                                    match read_raw_packet(dev, 100) {
+                                        Ok(Some(pkt)) => {
+                                            if pkt.command() == Some(HidCommand::Ping) {
                                                 debug!("Pong received");
+                                            }
+                                            // After pong, firmware may also send a state report
+                                            // Try to read it with a short timeout
+                                            if let Ok(Some(state_pkt)) = read_raw_packet(dev, 50) {
+                                                if state_pkt.command() == Some(HidCommand::StateReport) {
+                                                    let state_byte = state_pkt.payload()[0];
+                                                    let ds = DeviceState::from_byte(state_byte);
+                                                    debug!("State report after ping: mode={}, yolo={}", ds.mode, ds.yolo);
+                                                    let _ = event_tx.send(AppEvent::DeviceStateChanged {
+                                                        mode: ds.mode,
+                                                        yolo: ds.yolo,
+                                                    });
+                                                }
                                             }
                                             true
                                         }
-                                        Ok(_) => {
+                                        Ok(None) => {
                                             debug!("No pong response");
                                             true // Write succeeded, device might be busy
                                         }
@@ -352,7 +370,7 @@ impl HidManager {
         self.connected.load(Ordering::Relaxed)
     }
 
-    /// Send a display update to the device
+    /// Send a display update to the device (chunked)
     pub fn send_display_update(&self, state: &ClaudeState) -> Result<()> {
         let device_guard = self.device.lock();
         let device = device_guard
@@ -360,27 +378,19 @@ impl HidManager {
             .ok_or_else(|| anyhow!("Device not connected"))?;
 
         let truncated = state.truncated();
-        let update = DisplayUpdate::from_claude_state(&truncated);
-        let json = update.to_json();
+        let packets = commands::build_display_update(&truncated);
 
-        debug!("Sending display update: {}", json);
+        debug!("Sending display update ({} packets)", packets.len());
 
-        if json.len() > super::protocol::MAX_PAYLOAD_SIZE {
-            warn!("JSON too long ({} bytes), truncating", json.len());
-        }
+        send_packets_to_device(device, &packets)?;
 
-        let mut packet = HidPacket::with_command(HidCommand::UpdateDisplay);
-        packet.set_payload_str(&json);
-
-        send_packet_to_device(device, &packet)?;
-
-        let mut buffer = [0u8; PACKET_SIZE];
-        let _ = device.read_timeout(&mut buffer, 50);
+        // Read and discard response (or handle state report)
+        self.drain_response(device);
 
         Ok(())
     }
 
-    /// Send a task update to the device (simplified display update with just task)
+    /// Send a task update to the device (chunked)
     pub fn send_task_update(&self, task: &str) -> Result<()> {
         let device_guard = self.device.lock();
         let device = device_guard
@@ -395,40 +405,177 @@ impl HidManager {
 
         debug!("Sending task update: {}", json);
 
-        if json.len() > super::protocol::MAX_PAYLOAD_SIZE {
-            warn!("Task JSON too long ({} bytes), truncating", json.len());
-        }
+        let packets = super::protocol::build_chunked_packets(
+            HidCommand::UpdateDisplay,
+            json.as_bytes(),
+        );
 
-        let mut packet = HidPacket::with_command(HidCommand::UpdateDisplay);
-        packet.set_payload_str(&json);
+        send_packets_to_device(device, &packets)?;
 
-        send_packet_to_device(device, &packet)?;
-
-        let mut buffer = [0u8; PACKET_SIZE];
-        let _ = device.read_timeout(&mut buffer, 50);
+        // Read and discard response
+        self.drain_response(device);
 
         Ok(())
     }
 
-    /// Set display brightness
+    /// Set display brightness (chunked protocol)
     pub fn set_brightness(&self, level: u8, save: bool) -> Result<()> {
         let device_guard = self.device.lock();
         let device = device_guard
             .as_ref()
             .ok_or_else(|| anyhow!("Device not connected"))?;
 
-        let mut packet = HidPacket::with_command(HidCommand::SetBrightness);
-        let payload = packet.payload_mut();
-        payload[0] = level;
-        payload[1] = if save { 0x01 } else { 0x00 };
+        let packets = commands::build_set_brightness(level, save);
+        send_packets_to_device(device, &packets)?;
 
-        send_packet_to_device(device, &packet)?;
-
-        let mut buffer = [0u8; PACKET_SIZE];
-        let _ = device.read_timeout(&mut buffer, 50);
+        // Read response
+        self.drain_response(device);
 
         info!("Brightness set to {}", level);
         Ok(())
+    }
+
+    /// Set a soft key assignment
+    pub fn set_soft_key(&self, index: u8, key_type: SoftKeyType, data: &[u8], save: bool) -> Result<()> {
+        let device_guard = self.device.lock();
+        let device = device_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("Device not connected"))?;
+
+        let packets = commands::build_set_soft_key(index, key_type, data, save);
+        send_packets_to_device(device, &packets)?;
+
+        self.drain_response(device);
+
+        info!("Soft key {} set", index);
+        Ok(())
+    }
+
+    /// Get a soft key configuration
+    pub fn get_soft_key(&self, index: u8) -> Result<SoftKeyConfig> {
+        let device_guard = self.device.lock();
+        let device = device_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("Device not connected"))?;
+
+        let packets = commands::build_get_soft_key(index);
+        send_packets_to_device(device, &packets)?;
+
+        // Read response — expect chunked response with key config data
+        let response = read_response(device, HidCommand::GetSoftKey, &self.event_tx)?;
+
+        // Parse response: [key_index, key_type, ...entry_data]
+        // The firmware sends: send_response(cmd, status=0x00, [key_index, type, data...])
+        // read_response() strips the status byte, so response.data = [key_index, type, entry_data...]
+        if response.data.len() < 2 {
+            return Ok(SoftKeyConfig {
+                index,
+                key_type: SoftKeyType::Default,
+                data: vec![],
+            });
+        }
+
+        let _key_index = response.data[0];
+        let key_type = SoftKeyType::from_byte(response.data[1]).unwrap_or(SoftKeyType::Default);
+        let data = if response.data.len() > 2 {
+            response.data[2..].to_vec()
+        } else {
+            vec![]
+        };
+
+        Ok(SoftKeyConfig {
+            index,
+            key_type,
+            data,
+        })
+    }
+
+    /// Reset all soft keys to defaults
+    ///
+    /// Returns the effective assignment for each key post-reset.
+    /// Format from firmware: [type, kc_hi, kc_lo] x 3
+    pub fn reset_soft_keys(&self) -> Result<[SoftKeyConfig; 3]> {
+        let device_guard = self.device.lock();
+        let device = device_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("Device not connected"))?;
+
+        let packets = commands::build_reset_soft_keys();
+        send_packets_to_device(device, &packets)?;
+
+        // Read the response — firmware now returns effective assignments
+        let response = read_response(device, HidCommand::ResetSoftKeys, &self.event_tx)?;
+
+        // Parse response data: [type, kc_hi, kc_lo] x 3
+        let mut configs = [
+            SoftKeyConfig { index: 0, key_type: SoftKeyType::Default, data: vec![] },
+            SoftKeyConfig { index: 1, key_type: SoftKeyType::Default, data: vec![] },
+            SoftKeyConfig { index: 2, key_type: SoftKeyType::Default, data: vec![] },
+        ];
+
+        for i in 0..3usize {
+            let offset = i * 3;
+            if offset + 2 < response.data.len() {
+                let key_type = SoftKeyType::from_byte(response.data[offset])
+                    .unwrap_or(SoftKeyType::Default);
+                let kc_hi = response.data[offset + 1];
+                let kc_lo = response.data[offset + 2];
+                configs[i] = SoftKeyConfig {
+                    index: i as u8,
+                    key_type,
+                    data: match key_type {
+                        SoftKeyType::Keycode | SoftKeyType::Default => vec![kc_hi, kc_lo],
+                        // String/Sequence only have kc=0 in the 0x06 response
+                        _ => vec![],
+                    },
+                };
+            }
+        }
+
+        info!("Soft keys reset to defaults");
+        Ok(configs)
+    }
+
+    /// Set device LED mode
+    pub fn set_mode(&self, mode: DeviceMode) -> Result<()> {
+        let device_guard = self.device.lock();
+        let device = device_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("Device not connected"))?;
+
+        let packets = commands::build_set_mode(mode);
+        send_packets_to_device(device, &packets)?;
+
+        self.drain_response(device);
+
+        info!("Device mode set to {}", mode);
+        Ok(())
+    }
+
+    /// Read and discard response packets, dispatching any state reports
+    fn drain_response(&self, device: &HidDevice) {
+        // Read up to a few packets, handling state reports
+        for _ in 0..3 {
+            match read_raw_packet(device, 50) {
+                Ok(Some(pkt)) => {
+                    if pkt.command() == Some(HidCommand::StateReport) {
+                        let state_byte = pkt.payload()[0];
+                        let ds = DeviceState::from_byte(state_byte);
+                        debug!("State report: mode={}, yolo={}", ds.mode, ds.yolo);
+                        let _ = self.event_tx.send(AppEvent::DeviceStateChanged {
+                            mode: ds.mode,
+                            yolo: ds.yolo,
+                        });
+                    }
+                    // If this is END packet of a response, we're done
+                    if pkt.is_end() {
+                        break;
+                    }
+                }
+                Ok(None) => break, // Timeout, no more data
+                Err(_) => break,
+            }
+        }
     }
 
     /// Disconnect from the device
@@ -485,8 +632,16 @@ fn try_open_device(api: &Arc<Mutex<HidApi>>, config: &HidConfig) -> Option<HidDe
     }
 }
 
-/// Send a packet to the HID device
-fn send_packet_to_device(device: &HidDevice, packet: &HidPacket) -> Result<()> {
+/// Send multiple packets (chunks) to the HID device sequentially
+fn send_packets_to_device(device: &HidDevice, packets: &[HidPacket]) -> Result<()> {
+    for packet in packets {
+        send_single_packet(device, packet)?;
+    }
+    Ok(())
+}
+
+/// Send a single 32-byte packet to the HID device
+fn send_single_packet(device: &HidDevice, packet: &HidPacket) -> Result<()> {
     let bytes = packet.as_bytes();
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -507,6 +662,98 @@ fn send_packet_to_device(device: &HidDevice, packet: &HidPacket) -> Result<()> {
     debug!("Wrote {} bytes to HID device", written);
 
     Ok(())
+}
+
+/// Read a single raw HID packet with timeout
+fn read_raw_packet(device: &HidDevice, timeout_ms: i32) -> Result<Option<HidPacket>> {
+    let mut buffer = [0u8; PACKET_SIZE];
+    match device.read_timeout(&mut buffer, timeout_ms) {
+        Ok(n) if n > 0 => Ok(Some(HidPacket::from_bytes(&buffer))),
+        Ok(_) => Ok(None), // Timeout
+        Err(e) => Err(anyhow!("HID read error: {}", e)),
+    }
+}
+
+/// Read a complete chunked response for a specific command.
+/// Transparently handles interleaved state reports by dispatching them as events.
+fn read_response(
+    device: &HidDevice,
+    expected_cmd: HidCommand,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> Result<ResponsePacket> {
+    let mut payload = Vec::new();
+    let mut got_start = false;
+    let mut command_byte = 0u8;
+
+    // Read packets until we get a complete response (up to reasonable limit)
+    for _ in 0..20 {
+        let pkt = match read_raw_packet(device, 200)? {
+            Some(pkt) => pkt,
+            None => {
+                if got_start {
+                    // Timeout mid-response
+                    return Err(anyhow!("Timeout waiting for response continuation"));
+                } else {
+                    return Err(anyhow!("Timeout waiting for response"));
+                }
+            }
+        };
+
+        // Handle interleaved state reports
+        if pkt.command() == Some(HidCommand::StateReport) {
+            let state_byte = pkt.payload()[0];
+            let ds = DeviceState::from_byte(state_byte);
+            debug!("State report during response read: mode={}, yolo={}", ds.mode, ds.yolo);
+            let _ = event_tx.send(AppEvent::DeviceStateChanged {
+                mode: ds.mode,
+                yolo: ds.yolo,
+            });
+            continue; // Read next packet
+        }
+
+        // Check command matches
+        if pkt.command() != Some(expected_cmd) && pkt.command() != Some(HidCommand::Error) {
+            debug!(
+                "Unexpected response command: {:?} (expected {:?})",
+                pkt.command(),
+                expected_cmd
+            );
+            continue;
+        }
+
+        if pkt.is_start() {
+            got_start = true;
+            command_byte = pkt.command_byte();
+            payload.clear();
+        }
+
+        if got_start {
+            payload.extend_from_slice(pkt.payload());
+        }
+
+        if pkt.is_end() && got_start {
+            // Complete response assembled
+            // Trim trailing zeros from the last chunk
+            while payload.last() == Some(&0) {
+                payload.pop();
+            }
+
+            let status = if payload.is_empty() { 0 } else { payload[0] };
+            let data = if payload.len() > 1 {
+                payload[1..].to_vec()
+            } else {
+                vec![]
+            };
+
+            return Ok(ResponsePacket {
+                command: command_byte,
+                status,
+                data,
+            });
+        }
+    }
+
+    Err(anyhow!("Response read exceeded maximum packet count"))
 }
 
 #[cfg(test)]

@@ -2,10 +2,13 @@
 
 mod commands;
 mod device;
-mod protocol;
+pub mod keycodes;
+pub mod protocol;
+pub mod soft_keys;
 
 #[cfg(target_os = "macos")]
 mod hotplug_macos;
 
 pub use device::HidManager;
-pub use protocol::{HidCommand, HidPacket};
+pub use protocol::{DeviceMode, DeviceState, HidCommand, HidPacket, SoftKeyConfig, SoftKeyType};
+pub use soft_keys::{PresetManager, SoftKeyEditState, UserPreset};

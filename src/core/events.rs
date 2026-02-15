@@ -2,6 +2,7 @@
 
 use super::sessions::SessionId;
 use super::state::ClaudeState;
+use crate::hid::protocol::{DeviceMode};
 use crate::hotkey::HotkeyType;
 #[cfg(target_os = "macos")]
 use crate::macos::MenuAction;
@@ -39,6 +40,9 @@ pub enum AppEvent {
 
     /// Terminal title changed (from OSC escape sequence)
     TerminalTitleChanged(String),
+
+    /// HID device state changed (mode button or YOLO switch)
+    DeviceStateChanged { mode: DeviceMode, yolo: bool },
 
     /// Menu bar action triggered (macOS only)
     #[cfg(target_os = "macos")]
