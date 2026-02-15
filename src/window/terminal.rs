@@ -12,6 +12,7 @@ use super::render::{
     render_terminal_content, RenderParams, MAX_TAB_TITLE_LEN, TAB_BAR_HEIGHT,
 };
 use super::settings_modal::{render_settings_modal, SettingsModal};
+use crate::hid::SoftKeyEditState;
 use arboard::Clipboard;
 use crate::core::bookmarks::BookmarkManager;
 use crate::core::sessions::{SessionId, SessionManager};
@@ -90,6 +91,12 @@ pub enum TerminalAction {
     LoadSession { session_id: String },
     /// Save tabs to persistent storage
     SaveTabs,
+    /// Read soft key configs from device
+    ReadSoftKeys,
+    /// Apply soft key configs to device
+    ApplySoftKeys([SoftKeyEditState; 3]),
+    /// Reset soft keys to firmware defaults
+    ResetSoftKeys,
 }
 
 /// Terminal window state managed within the main app
@@ -545,6 +552,16 @@ impl TerminalWindowState {
     /// Open the settings modal
     pub fn open_settings(&mut self) {
         self.settings_modal.open(&self.settings);
+    }
+
+    /// Set soft key configs on the settings modal (called after device read)
+    pub fn set_soft_key_configs(&mut self, keys: [SoftKeyEditState; 3]) {
+        self.settings_modal.set_soft_keys(keys);
+    }
+
+    /// Set soft key error on the settings modal
+    pub fn set_soft_key_error(&mut self, err: String) {
+        self.settings_modal.set_soft_keys_error(err);
     }
 
     /// Check ~/.claude.json for theme changes and update if needed.
@@ -1470,7 +1487,7 @@ impl TerminalWindowState {
             render_hyperlink_tooltip(ctx, &self.hovered_hyperlink);
 
             // Render settings modal
-            let settings_result = render_settings_modal(ctx, &mut self.settings_modal);
+            let settings_result = render_settings_modal(ctx, &mut self.settings_modal, hid_connected);
             handle_settings_modal_result(settings_result, &mut new_actions);
 
             // Render context menu (if open)

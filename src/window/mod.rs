@@ -20,5 +20,5 @@ pub use render::{
     CLAUDE_ICON_SVG, CLAUDE_ORANGE, DECK_CONNECTED_SVG, DECK_DISCONNECTED_SVG,
     MAX_TAB_TITLE_LEN, TAB_BAR_HEIGHT,
 };
-pub use settings_modal::{render_settings_modal, SettingsModal, SettingsModalResult};
+pub use settings_modal::{render_settings_modal, SettingsModal, SettingsModalResult, SettingsTab};
 pub use terminal::{InputSender, TerminalAction, TerminalWindowState};

@@ -17,7 +17,7 @@ use agent_deck::{
         state::AppState,
         tabs::{TabEntry, TabState},
     },
-    hid::HidManager,
+    hid::{HidManager, SoftKeyEditState},
     hotkey::HotkeyManager,
     pty::PtyWrapper,
     tray::TrayManager,
@@ -436,6 +436,20 @@ impl App {
                 info!("Created new tab with session ID {}", session_id);
             }
             TerminalAction::CloseTab(session_id) => {
+                // Check if Claude is actively working in this session
+                if let Some(session) = self.terminal_window.session_manager.get_session(session_id) {
+                    if session.claude_activity.is_working() {
+                        let confirmed = rfd::MessageDialog::new()
+                            .set_title("Close Tab")
+                            .set_description("Claude is still working in this session. Close anyway?")
+                            .set_buttons(rfd::MessageButtons::YesNo)
+                            .set_level(rfd::MessageLevel::Warning)
+                            .show() == rfd::MessageDialogResult::Yes;
+                        if !confirmed {
+                            return;
+                        }
+                    }
+                }
                 self.stop_claude_for_session(session_id);
                 // Update window title after closing (active tab may have changed)
                 self.terminal_window.update_window_title();
@@ -648,6 +662,75 @@ impl App {
             TerminalAction::SaveTabs => {
                 self.save_tabs();
             }
+            TerminalAction::ReadSoftKeys => {
+                if let Some(ref hid) = self.hid_manager {
+                    if hid.is_connected() {
+                        let mut keys = [
+                            SoftKeyEditState::Default(None),
+                            SoftKeyEditState::Default(None),
+                            SoftKeyEditState::Default(None),
+                        ];
+                        let mut had_error = false;
+                        for i in 0u8..3 {
+                            match hid.get_soft_key(i) {
+                                Ok(config) => {
+                                    keys[i as usize] = SoftKeyEditState::from_config(&config);
+                                }
+                                Err(e) => {
+                                    error!("Failed to read soft key {}: {}", i, e);
+                                    self.terminal_window
+                                        .set_soft_key_error(format!("Failed to read key {}: {}", i, e));
+                                    had_error = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !had_error {
+                            self.terminal_window.set_soft_key_configs(keys);
+                        }
+                    } else {
+                        self.terminal_window
+                            .set_soft_key_error("Device not connected".to_string());
+                    }
+                } else {
+                    self.terminal_window
+                        .set_soft_key_error("HID manager not initialized".to_string());
+                }
+            }
+            TerminalAction::ApplySoftKeys(keys) => {
+                if let Some(ref hid) = self.hid_manager {
+                    for (i, key) in keys.iter().enumerate() {
+                        let (key_type, data) = key.to_wire_data();
+                        if let Err(e) = hid.set_soft_key(i as u8, key_type, &data, true) {
+                            error!("Failed to set soft key {}: {}", i, e);
+                            self.terminal_window
+                                .set_soft_key_error(format!("Failed to set key {}: {}", i, e));
+                            break;
+                        }
+                    }
+                    info!("Soft keys applied to device");
+                }
+            }
+            TerminalAction::ResetSoftKeys => {
+                if let Some(ref hid) = self.hid_manager {
+                    match hid.reset_soft_keys() {
+                        Ok(configs) => {
+                            info!("Soft keys reset to defaults");
+                            let keys = [
+                                SoftKeyEditState::from_config(&configs[0]),
+                                SoftKeyEditState::from_config(&configs[1]),
+                                SoftKeyEditState::from_config(&configs[2]),
+                            ];
+                            self.terminal_window.set_soft_key_configs(keys);
+                        }
+                        Err(e) => {
+                            error!("Failed to reset soft keys: {}", e);
+                            self.terminal_window
+                                .set_soft_key_error(format!("Failed to reset: {}", e));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -815,6 +898,14 @@ impl App {
                 self.terminal_window.process_output_for_session(session_id, &data);
                 if let Some(ref window) = self.terminal_window.window {
                     window.request_redraw();
+                }
+            }
+            AppEvent::DeviceStateChanged { mode, yolo } => {
+                info!("Device state changed: mode={}, yolo={}", mode, yolo);
+                {
+                    let mut state = self.state.write();
+                    state.device_mode = mode;
+                    state.device_yolo = yolo;
                 }
             }
             AppEvent::TerminalTitleChanged(title) => {

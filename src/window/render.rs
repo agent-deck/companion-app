@@ -955,6 +955,15 @@ pub fn handle_settings_modal_result(
         SettingsModalResult::Apply(settings) => {
             new_actions.push(TerminalAction::ApplySettings(settings));
         }
+        SettingsModalResult::ReadSoftKeys => {
+            new_actions.push(TerminalAction::ReadSoftKeys);
+        }
+        SettingsModalResult::ApplySoftKeys(keys) => {
+            new_actions.push(TerminalAction::ApplySoftKeys(keys));
+        }
+        SettingsModalResult::ResetSoftKeys => {
+            new_actions.push(TerminalAction::ResetSoftKeys);
+        }
         SettingsModalResult::Cancel => {}
         SettingsModalResult::None => {}
     }
