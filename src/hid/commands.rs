@@ -54,6 +54,24 @@ pub fn build_set_mode(mode: DeviceMode) -> Vec<HidPacket> {
     build_chunked_packets(HidCommand::SetMode, &[mode as u8])
 }
 
+/// Build an alert command to show an overlay on the device
+pub fn build_alert(tab: usize, session: &str, text: &str) -> Vec<HidPacket> {
+    let json = serde_json::json!({
+        "tab": tab,
+        "session": session,
+        "text": text,
+    });
+    build_chunked_packets(HidCommand::Alert, json.to_string().as_bytes())
+}
+
+/// Build a clear alert command (no text field = clear)
+pub fn build_clear_alert(tab: usize) -> Vec<HidPacket> {
+    let json = serde_json::json!({
+        "tab": tab,
+    });
+    build_chunked_packets(HidCommand::Alert, json.to_string().as_bytes())
+}
+
 
 #[cfg(test)]
 mod tests {

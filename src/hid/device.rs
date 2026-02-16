@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -227,24 +227,35 @@ impl HidManager {
         });
     }
 
-    /// Start ping thread for connection health monitoring
+    /// Start reader thread for connection health monitoring and incoming key events.
+    ///
+    /// This thread performs two duties:
+    /// 1. Sends ping keepalives on a timer to detect disconnection
+    /// 2. Polls for incoming device-initiated packets (key events, type strings, state reports)
     fn start_ping_thread(&self) {
         let device = Arc::clone(&self.device);
         let connected = Arc::clone(&self.connected);
         let stop_monitor = Arc::clone(&self.stop_monitor);
         let event_tx = self.event_tx.clone();
-        let ping_interval = self.config.ping_interval_ms;
+        let ping_interval = Duration::from_millis(self.config.ping_interval_ms);
 
         thread::spawn(move || {
-            info!("HID ping thread started");
+            info!("HID reader thread started");
             let mut consecutive_failures: u32 = 0;
+            let mut last_ping = Instant::now() - ping_interval; // trigger immediate first ping
+            let mut type_string_buf: Vec<u8> = Vec::new();
 
             while !stop_monitor.load(Ordering::Relaxed) {
-                if connected.load(Ordering::Relaxed) {
+                if !connected.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+
+                // --- Ping on timer ---
+                if last_ping.elapsed() >= ping_interval {
                     let ping_ok = {
                         let device_guard = device.lock();
                         if let Some(ref dev) = *device_guard {
-                            // Send ping using chunked protocol
                             let packets = commands::build_ping();
                             match send_packets_to_device(dev, &packets) {
                                 Ok(()) => {
@@ -252,22 +263,7 @@ impl HidManager {
                                     // Read pong response
                                     match read_raw_packet(dev, 100) {
                                         Ok(Some(pkt)) => {
-                                            if pkt.command() == Some(HidCommand::Ping) {
-                                                debug!("Pong received");
-                                            }
-                                            // After pong, firmware may also send a state report
-                                            // Try to read it with a short timeout
-                                            if let Ok(Some(state_pkt)) = read_raw_packet(dev, 50) {
-                                                if state_pkt.command() == Some(HidCommand::StateReport) {
-                                                    let state_byte = state_pkt.payload()[0];
-                                                    let ds = DeviceState::from_byte(state_byte);
-                                                    debug!("State report after ping: mode={}, yolo={}", ds.mode, ds.yolo);
-                                                    let _ = event_tx.send(AppEvent::DeviceStateChanged {
-                                                        mode: ds.mode,
-                                                        yolo: ds.yolo,
-                                                    });
-                                                }
-                                            }
+                                            dispatch_incoming_packet(&pkt, &event_tx, &mut type_string_buf);
                                             true
                                         }
                                         Ok(None) => {
@@ -290,6 +286,8 @@ impl HidManager {
                         }
                     };
 
+                    last_ping = Instant::now();
+
                     if ping_ok {
                         consecutive_failures = 0;
                     } else {
@@ -305,12 +303,31 @@ impl HidManager {
                             connected.store(false, Ordering::Relaxed);
                             let _ = event_tx.send(AppEvent::HidDisconnected);
                             consecutive_failures = 0;
+                            type_string_buf.clear();
+                            continue;
                         }
                     }
                 }
-                thread::sleep(Duration::from_millis(ping_interval));
+
+                // --- Poll for incoming device-initiated packets ---
+                // Use try_lock to avoid blocking command sends (send_display_update, etc.)
+                if let Some(device_guard) = device.try_lock() {
+                    if let Some(ref dev) = *device_guard {
+                        match read_raw_packet(dev, 20) {
+                            Ok(Some(pkt)) => {
+                                dispatch_incoming_packet(&pkt, &event_tx, &mut type_string_buf);
+                            }
+                            Ok(None) => {} // Timeout, no data
+                            Err(e) => {
+                                debug!("Poll read error: {}", e);
+                            }
+                        }
+                    }
+                }
+                // Brief yield if nothing happened to avoid busy-wait
+                // (the 20ms read timeout above provides the main throttle)
             }
-            info!("HID ping thread stopped");
+            info!("HID reader thread stopped");
         });
     }
 
@@ -503,6 +520,38 @@ impl HidManager {
     }
 
 
+    /// Send an alert overlay to the device
+    pub fn send_alert(&self, tab: usize, session: &str, text: &str) -> Result<()> {
+        let device_guard = self.device.lock();
+        let device = device_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("Device not connected"))?;
+
+        let packets = commands::build_alert(tab, session, text);
+        send_packets_to_device(device, &packets)?;
+
+        self.drain_response(device);
+
+        info!("Alert sent: tab={}, text={}", tab, text);
+        Ok(())
+    }
+
+    /// Clear an alert overlay on the device
+    pub fn clear_alert(&self, tab: usize) -> Result<()> {
+        let device_guard = self.device.lock();
+        let device = device_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("Device not connected"))?;
+
+        let packets = commands::build_clear_alert(tab);
+        send_packets_to_device(device, &packets)?;
+
+        self.drain_response(device);
+
+        debug!("Alert cleared: tab={}", tab);
+        Ok(())
+    }
+
     /// Set device LED mode
     pub fn set_mode(&self, mode: DeviceMode) -> Result<()> {
         let device_guard = self.device.lock();
@@ -521,21 +570,23 @@ impl HidManager {
 
     /// Read and discard response packets, dispatching any state reports
     fn drain_response(&self, device: &HidDevice) {
-        // Read up to a few packets, handling state reports
+        // Read up to a few packets, forwarding any device-initiated packets
+        let mut type_string_buf = Vec::new();
         for _ in 0..3 {
             match read_raw_packet(device, 50) {
                 Ok(Some(pkt)) => {
-                    if pkt.command() == Some(HidCommand::StateReport) {
-                        let state_byte = pkt.payload()[0];
-                        let ds = DeviceState::from_byte(state_byte);
-                        debug!("State report: mode={}, yolo={}", ds.mode, ds.yolo);
-                        let _ = self.event_tx.send(AppEvent::DeviceStateChanged {
-                            mode: ds.mode,
-                            yolo: ds.yolo,
-                        });
+                    let is_device_initiated = matches!(
+                        pkt.command(),
+                        Some(HidCommand::StateReport)
+                            | Some(HidCommand::KeyEvent)
+                            | Some(HidCommand::TypeString)
+                            | Some(HidCommand::Ping)
+                    );
+                    if is_device_initiated {
+                        dispatch_incoming_packet(&pkt, &self.event_tx, &mut type_string_buf);
                     }
                     // If this is END packet of a response, we're done
-                    if pkt.is_end() {
+                    if pkt.is_end() && !is_device_initiated {
                         break;
                     }
                 }
@@ -651,6 +702,7 @@ fn read_response(
     let mut payload = Vec::new();
     let mut got_start = false;
     let mut command_byte = 0u8;
+    let mut type_string_buf = Vec::new();
 
     // Read packets until we get a complete response (up to reasonable limit)
     for _ in 0..20 {
@@ -666,16 +718,17 @@ fn read_response(
             }
         };
 
-        // Handle interleaved state reports
-        if pkt.command() == Some(HidCommand::StateReport) {
-            let state_byte = pkt.payload()[0];
-            let ds = DeviceState::from_byte(state_byte);
-            debug!("State report during response read: mode={}, yolo={}", ds.mode, ds.yolo);
-            let _ = event_tx.send(AppEvent::DeviceStateChanged {
-                mode: ds.mode,
-                yolo: ds.yolo,
-            });
-            continue; // Read next packet
+        // Forward device-initiated packets (state reports, key events, etc.)
+        let is_device_initiated = matches!(
+            pkt.command(),
+            Some(HidCommand::StateReport)
+                | Some(HidCommand::KeyEvent)
+                | Some(HidCommand::TypeString)
+                | Some(HidCommand::Ping)
+        );
+        if is_device_initiated {
+            dispatch_incoming_packet(&pkt, event_tx, &mut type_string_buf);
+            continue;
         }
 
         // Check command matches
@@ -721,6 +774,81 @@ fn read_response(
     }
 
     Err(anyhow!("Response read exceeded maximum packet count"))
+}
+
+/// Dispatch a single incoming packet from the device, emitting appropriate AppEvents.
+///
+/// Handles: StateReport, KeyEvent, TypeString, Ping (pong). All other commands are ignored
+/// (they are responses to host-initiated commands handled elsewhere).
+///
+/// `type_string_buf` accumulates chunked TypeString payloads across calls.
+fn dispatch_incoming_packet(
+    pkt: &HidPacket,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+    type_string_buf: &mut Vec<u8>,
+) {
+    match pkt.command() {
+        Some(HidCommand::StateReport) => {
+            let state_byte = pkt.payload()[0];
+            let ds = DeviceState::from_byte(state_byte);
+            debug!("State report: mode={}, yolo={}", ds.mode, ds.yolo);
+            let _ = event_tx.send(AppEvent::DeviceStateChanged {
+                mode: ds.mode,
+                yolo: ds.yolo,
+            });
+        }
+        Some(HidCommand::KeyEvent) => {
+            // Payload: [keycode_hi, keycode_lo]
+            let payload = pkt.payload();
+            if payload.len() >= 2 {
+                let keycode = ((payload[0] as u16) << 8) | (payload[1] as u16);
+                debug!("Key event: keycode=0x{:04X}", keycode);
+                let _ = event_tx.send(AppEvent::HidKeyEvent { keycode });
+            }
+        }
+        Some(HidCommand::TypeString) => {
+            // Chunked: accumulate payload, dispatch on END packet
+            // Payload format: [flags_byte, ...string_data]
+            // flags_byte bit 0: send_enter
+            let payload = pkt.payload();
+
+            if pkt.is_start() {
+                type_string_buf.clear();
+            }
+
+            // Append raw payload (first byte of first chunk has flags)
+            type_string_buf.extend_from_slice(payload);
+
+            if pkt.is_end() && !type_string_buf.is_empty() {
+                // First byte is flags, rest is UTF-8 string
+                let flags = type_string_buf[0];
+                let send_enter = flags & 0x01 != 0;
+
+                // Trim trailing zeros from the string portion
+                let mut str_bytes = &type_string_buf[1..];
+                while str_bytes.last() == Some(&0) {
+                    str_bytes = &str_bytes[..str_bytes.len() - 1];
+                }
+
+                if let Ok(text) = std::str::from_utf8(str_bytes) {
+                    debug!("Type string: {:?} (send_enter={})", text, send_enter);
+                    let _ = event_tx.send(AppEvent::HidTypeString {
+                        text: text.to_string(),
+                        send_enter,
+                    });
+                } else {
+                    warn!("TypeString payload is not valid UTF-8");
+                }
+                type_string_buf.clear();
+            }
+        }
+        Some(HidCommand::Ping) => {
+            debug!("Pong received");
+        }
+        _ => {
+            // Command response or unknown — ignore in the reader loop
+        }
+    }
 }
 
 #[cfg(test)]

@@ -40,8 +40,14 @@ pub enum HidCommand {
     ResetSoftKeys = 0x06,
     /// Set device LED mode
     SetMode = 0x07,
+    /// Show or clear an alert overlay on the device
+    Alert = 0x08,
     /// Device state report (unsolicited from device)
     StateReport = 0x10,
+    /// Type a string into the active terminal (unsolicited from device)
+    TypeString = 0x11,
+    /// Single key event (unsolicited from device)
+    KeyEvent = 0x12,
     /// Error response from device
     Error = 0xFF,
 }
@@ -62,7 +68,10 @@ impl HidCommand {
             0x05 => Some(HidCommand::GetSoftKey),
             0x06 => Some(HidCommand::ResetSoftKeys),
             0x07 => Some(HidCommand::SetMode),
+            0x08 => Some(HidCommand::Alert),
             0x10 => Some(HidCommand::StateReport),
+            0x11 => Some(HidCommand::TypeString),
+            0x12 => Some(HidCommand::KeyEvent),
             0xFF => Some(HidCommand::Error),
             _ => None,
         }
@@ -457,7 +466,10 @@ mod tests {
             HidCommand::GetSoftKey,
             HidCommand::ResetSoftKeys,
             HidCommand::SetMode,
+            HidCommand::Alert,
             HidCommand::StateReport,
+            HidCommand::TypeString,
+            HidCommand::KeyEvent,
             HidCommand::Error,
         ];
         for cmd in commands {
