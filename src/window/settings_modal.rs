@@ -211,12 +211,15 @@ pub fn render_settings_modal(
         }
     }
 
-    // Modal background overlay
+    // Modal background overlay — close on click outside
+    let mut backdrop_clicked = false;
     egui::Area::new(egui::Id::new("settings_modal_backdrop"))
         .fixed_pos(egui::pos2(0.0, 0.0))
+        .order(egui::Order::Background)
         .show(ctx, |ui| {
             let screen_rect = ctx.screen_rect();
-            ui.allocate_rect(screen_rect, egui::Sense::click());
+            let response = ui.allocate_rect(screen_rect, egui::Sense::click());
+            backdrop_clicked = response.clicked();
             ui.painter().rect_filled(
                 screen_rect,
                 0.0,
@@ -265,41 +268,39 @@ pub fn render_settings_modal(
             // Reserve all remaining space so the window doesn't shrink
             let available = ui.available_size();
             ui.allocate_ui(available, |ui| {
-                // Sticky bottom buttons
+                // Place buttons at the bottom using bottom_up layout
                 let mut btn_result = SettingsModalResult::None;
-                egui::TopBottomPanel::bottom("settings_buttons")
-                    .frame(
-                        egui::Frame::default()
-                            .fill(egui::Color32::TRANSPARENT)
-                            .inner_margin(egui::Margin { left: 0.0, right: 0.0, top: 0.0, bottom: 4.0 }),
-                    )
-                    .show_inside(ui, |ui| {
-                        ui.separator();
-                        ui.add_space(4.0);
-                        btn_result = render_bottom_buttons(ui, modal, hid_connected);
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.add_space(4.0);
+                    btn_result = render_bottom_buttons(ui, modal, hid_connected);
+                    ui.add_space(4.0);
+                    ui.separator();
+
+                    // Tab content fills remaining space (top_down inside bottom_up)
+                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        match modal.active_tab {
+                            SettingsTab::General => {
+                                render_general_content(ui, modal);
+                            }
+                            SettingsTab::SoftKeys => {
+                                let tab_result = render_soft_keys_content(ui, modal, hid_connected);
+                                if tab_result != SettingsModalResult::None {
+                                    result = tab_result;
+                                }
+                            }
+                        }
                     });
+                });
 
                 if btn_result != SettingsModalResult::None {
                     result = btn_result;
-                }
-
-                // Tab content fills remaining space
-                match modal.active_tab {
-                    SettingsTab::General => {
-                        render_general_content(ui, modal);
-                    }
-                    SettingsTab::SoftKeys => {
-                        let tab_result = render_soft_keys_content(ui, modal, hid_connected);
-                        if tab_result != SettingsModalResult::None {
-                            result = tab_result;
-                        }
-                    }
                 }
             });
         });
 
     // Close on Escape (skip if capturing or just finished capturing this frame)
-    if !was_capturing && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    // or on click outside the modal window
+    if (!was_capturing && ctx.input(|i| i.key_pressed(egui::Key::Escape))) || backdrop_clicked {
         modal.close();
         result = SettingsModalResult::Cancel;
     }
@@ -361,6 +362,7 @@ fn render_general_content(ui: &mut egui::Ui, modal: &mut SettingsModal) {
     let preview_font_size = modal.working_settings.font_size * (BASE_DPI as f32 / 72.0);
     egui::Frame::default()
         .fill(egui::Color32::from_gray(30))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
         .rounding(4.0)
         .inner_margin(egui::Margin::same(12.0))
         .show(ui, |ui| {
@@ -505,7 +507,7 @@ fn render_bottom_buttons(
 
         // Right-aligned buttons
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("Cancel").clicked() {
+            if ui.button("Close").clicked() {
                 modal.close();
                 result = SettingsModalResult::Cancel;
             }
@@ -909,7 +911,7 @@ fn render_preset_area(
                     done = true;
                 }
 
-                if ui.button("Cancel").clicked() {
+                if ui.button("Close").clicked() {
                     done = true;
                 }
             });
@@ -955,7 +957,7 @@ fn render_preset_area(
                     done = true;
                 }
 
-                if ui.button("Cancel").clicked() {
+                if ui.button("Close").clicked() {
                     done = true;
                 }
             });
