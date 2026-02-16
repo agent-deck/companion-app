@@ -824,7 +824,6 @@ fn render_session_selection(
                         let item_width = ui.available_width();
 
                         for (idx, session) in sessions.iter().enumerate() {
-                            let is_most_recent = idx == 0;
                             // Session items start at index 1 (after "Start New")
                             let is_selected = nav.selected_index == Some(idx + 1);
 
@@ -862,21 +861,6 @@ fn render_session_selection(
                                     fg_color,
                                 );
 
-                                // "(last session)" label for most recent
-                                if is_most_recent {
-                                    let title_galley = ui.painter().layout_no_wrap(
-                                        session.display_title().to_string(),
-                                        egui::FontId::proportional(14.0),
-                                        fg_color,
-                                    );
-                                    ui.painter().text(
-                                        egui::pos2(title_x + title_galley.size().x + 8.0, title_y),
-                                        egui::Align2::LEFT_CENTER,
-                                        "(last session)",
-                                        egui::FontId::proportional(12.0),
-                                        egui::Color32::from_rgb(100, 149, 237),
-                                    );
-                                }
 
                                 // Metadata line
                                 ui.painter().text(
