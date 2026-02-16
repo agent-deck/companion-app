@@ -2,6 +2,7 @@
 //!
 //! Provides a thin wrapper around wezterm-term's Terminal for use with egui rendering.
 
+use crate::hid::protocol::DeviceMode;
 use crate::terminal::config::AgentDeckTermConfig;
 use crate::terminal::notifications::NotificationHandler;
 use parking_lot::Mutex;
@@ -207,6 +208,47 @@ impl Session {
         }
 
         None
+    }
+
+    /// Detect the current Claude Code mode from the terminal buffer.
+    ///
+    /// Scans the bottom rows of the visible screen for mode indicator strings:
+    /// - "⏵⏵ accept edits on" → Accept mode
+    /// - "⏸ plan mode on" → Plan mode
+    /// - Otherwise → Default mode
+    pub fn detect_claude_mode(&self) -> DeviceMode {
+        let mut term = self.terminal.lock();
+        let cursor_row = term.cursor_pos().y as usize;
+        let screen = term.screen_mut();
+        let total_lines = screen.scrollback_rows();
+        let physical_rows = screen.physical_rows;
+
+        let visible_start = total_lines.saturating_sub(physical_rows);
+        let start_phys = visible_start + cursor_row;
+
+        // Scan a few rows near the bottom where the status line appears
+        for offset in 0..5 {
+            let phys_idx = start_phys.saturating_sub(offset);
+            if phys_idx >= total_lines {
+                continue;
+            }
+
+            let line = screen.line_mut(phys_idx);
+            let mut line_text = String::new();
+            for cell in line.visible_cells() {
+                line_text.push_str(cell.str());
+            }
+            let line_text = line_text.trim();
+
+            if line_text.contains("accept edits on") {
+                return DeviceMode::Accept;
+            }
+            if line_text.contains("plan mode on") {
+                return DeviceMode::Plan;
+            }
+        }
+
+        DeviceMode::Default
     }
 
     /// Extract the prompt context block visible on the terminal screen.

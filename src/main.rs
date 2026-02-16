@@ -859,6 +859,13 @@ impl App {
                     }
                 }
             }
+            TerminalAction::HidSetMode(mode) => {
+                if let Some(ref hid) = self.hid_manager {
+                    if let Err(e) = hid.set_mode(mode) {
+                        debug!("Failed to set HID mode: {}", e);
+                    }
+                }
+            }
         }
     }
 
@@ -1029,12 +1036,14 @@ impl App {
                 }
             }
             AppEvent::DeviceStateChanged { mode, yolo } => {
-                info!("Device state changed: mode={}, yolo={}", mode, yolo);
+                debug!("Device state changed: mode={}, yolo={}", mode, yolo);
                 {
                     let mut state = self.state.write();
                     state.device_mode = mode;
                     state.device_yolo = yolo;
                 }
+                self.terminal_window.device_yolo = yolo;
+                self.terminal_window.update_window_title();
             }
             AppEvent::HidKeyEvent { keycode } => {
                 // Resolve target: oldest alerting session (if any), and fallback to active

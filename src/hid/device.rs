@@ -578,7 +578,7 @@ impl HidManager {
 
         self.drain_response(device);
 
-        info!("Device mode set to {}", mode);
+        debug!("Device mode set to {}", mode);
         Ok(())
     }
 

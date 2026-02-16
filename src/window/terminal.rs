@@ -12,7 +12,7 @@ use super::render::{
     render_terminal_content, RenderParams, MAX_TAB_TITLE_LEN, TAB_BAR_HEIGHT,
 };
 use super::settings_modal::{render_settings_modal, SettingsModal};
-use crate::hid::SoftKeyEditState;
+use crate::hid::{DeviceMode, SoftKeyEditState};
 use arboard::Clipboard;
 use crate::core::bookmarks::BookmarkManager;
 use crate::core::sessions::{SessionId, SessionManager};
@@ -102,6 +102,8 @@ pub enum TerminalAction {
     HidAlert { tab: usize, session: String, text: String, details: Option<String> },
     /// Clear HID alert overlay for a tab
     HidClearAlert(usize),
+    /// Set HID device LED mode
+    HidSetMode(DeviceMode),
 }
 
 /// Terminal window state managed within the main app
@@ -126,6 +128,10 @@ pub struct TerminalWindowState {
     settings_modal: SettingsModal,
     /// HID connection state
     pub hid_connected: bool,
+    /// Device YOLO mode state
+    pub device_yolo: bool,
+    /// Last detected Claude Code mode (to send updates only on change)
+    detected_mode: DeviceMode,
     /// Whether window should be visible
     visible: Arc<AtomicBool>,
     /// Whether the window currently has focus
@@ -212,6 +218,8 @@ impl TerminalWindowState {
             settings: settings.clone(),
             settings_modal: SettingsModal::new(settings),
             hid_connected: false,
+            device_yolo: false,
+            detected_mode: DeviceMode::Default,
             visible: Arc::new(AtomicBool::new(false)),
             window_focused: false,
             window_id: None,
@@ -294,7 +302,7 @@ impl TerminalWindowState {
     /// Update the window title based on active session
     pub fn update_window_title(&self) {
         if let Some(ref window) = self.window {
-            let title = if let Some(session) = self.session_manager.active_session() {
+            let base = if let Some(session) = self.session_manager.active_session() {
                 if session.is_new_tab() {
                     "\u{1F916}".to_string()
                 } else {
@@ -302,6 +310,11 @@ impl TerminalWindowState {
                 }
             } else {
                 "\u{1F916}".to_string()
+            };
+            let title = if self.device_yolo {
+                format!("\u{1F525} {}", base)
+            } else {
+                base
             };
             window.set_title(&title);
         }
@@ -1790,6 +1803,18 @@ impl TerminalWindowState {
                         hid_needs_update = true;
                     }
                 }
+            }
+        }
+
+        // Detect Claude Code mode changes for active session
+        if let Some(session_info) = self.session_manager.active_session() {
+            let mode = {
+                let session = session_info.session.lock();
+                session.detect_claude_mode()
+            };
+            if mode != self.detected_mode {
+                self.detected_mode = mode;
+                self.pending_actions.push(TerminalAction::HidSetMode(mode));
             }
         }
 
