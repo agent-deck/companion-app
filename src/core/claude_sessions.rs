@@ -1,12 +1,30 @@
 //! Claude Code session discovery
 //!
-//! Reads session metadata from Claude Code's local storage to enable
-//! session-aware directory selection in the new tab UI.
+//! Discovers sessions by scanning `.jsonl` conversation history files directly,
+//! enriching with metadata from `sessions-index.json` when available (for summaries).
+//! This approach is resilient to the index file being stale or missing.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tracing::warn;
+
+/// Cache TTL in seconds — disk scans happen at most this often per directory.
+const CACHE_TTL_SECS: u64 = 30;
+
+struct CacheEntry {
+    sessions: Vec<ClaudeSession>,
+    fetched_at: Instant,
+}
+
+thread_local! {
+    static SESSION_CACHE: RefCell<HashMap<PathBuf, CacheEntry>> = RefCell::new(HashMap::new());
+}
 
 /// A Claude Code session with metadata
 #[derive(Debug, Clone)]
@@ -19,7 +37,8 @@ pub struct ClaudeSession {
     pub modified: DateTime<Utc>,
 }
 
-/// The sessions-index.json file structure
+// --- sessions-index.json structures (for enrichment) ---
+
 #[derive(Debug, Deserialize)]
 struct SessionsIndex {
     #[allow(dead_code)]
@@ -27,44 +46,198 @@ struct SessionsIndex {
     entries: Vec<SessionIndexEntry>,
 }
 
-/// Raw session entry as stored in sessions-index.json
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionIndexEntry {
     session_id: String,
     summary: Option<String>,
     first_prompt: Option<String>,
+    #[allow(dead_code)]
     message_count: Option<u32>,
+    #[allow(dead_code)]
     created: Option<String>,
+    #[allow(dead_code)]
     modified: Option<String>,
 }
 
-impl SessionIndexEntry {
-    fn into_claude_session(self) -> Option<ClaudeSession> {
-        // Parse dates, defaulting to epoch if missing/invalid
-        let created = self
-            .created
-            .as_ref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|| DateTime::UNIX_EPOCH.into());
+// --- .jsonl parsing structures ---
 
-        let modified = self
-            .modified
-            .as_ref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|| DateTime::UNIX_EPOCH.into());
+#[derive(Deserialize)]
+struct JsonlLine {
+    #[serde(rename = "type")]
+    msg_type: String,
+    timestamp: Option<String>,
+    message: Option<JsonlMessage>,
+}
 
-        Some(ClaudeSession {
-            session_id: self.session_id,
-            summary: self.summary,
-            first_prompt: self.first_prompt,
-            message_count: self.message_count.unwrap_or(0),
+#[derive(Deserialize)]
+struct JsonlMessage {
+    content: Option<serde_json::Value>,
+}
+
+/// Extract the text content from a user message .jsonl line.
+///
+/// Handles both `content: "string"` and `content: [{type: "text", text: "..."}]` variants.
+/// Returns None for non-user messages or if no text content is found.
+fn extract_first_prompt(line: &str) -> Option<String> {
+    let parsed: JsonlLine = serde_json::from_str(line).ok()?;
+    if parsed.msg_type != "user" {
+        return None;
+    }
+    let content = parsed.message?.content?;
+    match content {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(obj) = item.as_object() {
+                    if obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
+                            return Some(text.to_string());
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Check if a prompt looks like a real user message (not a system/internal one).
+fn is_real_user_prompt(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    // Skip system messages like "[Request interrupted by user for tool use]"
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        return false;
+    }
+    !trimmed.is_empty()
+}
+
+/// Scan .jsonl files in a project directory and build session metadata.
+fn scan_jsonl_files(project_path: &Path) -> Vec<ClaudeSession> {
+    let entries = match std::fs::read_dir(project_path) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut sessions = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        // Only .jsonl files directly in the directory (skip subdirs like <uuid>/subagents/)
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext != Some("jsonl") {
+            continue;
+        }
+
+        let session_id = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+
+        // Read first 2 lines
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let reader = BufReader::new(file);
+        let mut lines_iter = reader.lines();
+
+        // Line 1: always file-history-snapshot, skip
+        let _line1 = match lines_iter.next() {
+            Some(Ok(l)) => l,
+            _ => continue,
+        };
+
+        // Line 2: should be the first user message
+        let line2 = match lines_iter.next() {
+            Some(Ok(l)) => l,
+            _ => continue, // stub session (only 1 line)
+        };
+
+        // Quick check: skip if line 2 is not a user message (stub session)
+        if !line2.contains("\"type\":\"user\"") && !line2.contains("\"type\": \"user\"") {
+            continue;
+        }
+
+        // Extract first prompt — skip system messages like "[Request interrupted...]"
+        let mut first_prompt = extract_first_prompt(&line2)
+            .filter(|p| is_real_user_prompt(p));
+
+        // Extract created timestamp from line 2
+        let created = serde_json::from_str::<JsonlLine>(&line2)
+            .ok()
+            .and_then(|l| l.timestamp)
+            .and_then(|ts| DateTime::parse_from_rfc3339(&ts).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .or_else(|| {
+                // Fallback: file birthtime / mtime
+                std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.created().ok())
+                    .map(|t| DateTime::<Utc>::from(t))
+            })
+            .unwrap_or(DateTime::UNIX_EPOCH);
+
+        // If first prompt was a system message, scan a few more lines for a real one
+        if first_prompt.is_none() {
+            for line_result in lines_iter.by_ref().take(30) {
+                let Ok(line) = line_result else { continue };
+                if line.contains("\"type\":\"user\"") || line.contains("\"type\": \"user\"") {
+                    if let Some(prompt) = extract_first_prompt(&line) {
+                        if is_real_user_prompt(&prompt) {
+                            first_prompt = Some(prompt);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Modified from file metadata (fast — no file content reading)
+        let modified = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| DateTime::<Utc>::from(t))
+            .unwrap_or(DateTime::UNIX_EPOCH);
+
+        // Message count: 0 here, enriched from index in merge step
+        sessions.push(ClaudeSession {
+            session_id,
+            summary: None,
+            first_prompt,
+            message_count: 0,
             created,
             modified,
-        })
+        });
     }
+
+    sessions
+}
+
+/// Read sessions-index.json and return entries keyed by session_id for merge lookups.
+fn read_sessions_index(project_path: &Path) -> HashMap<String, SessionIndexEntry> {
+    let index_path = project_path.join("sessions-index.json");
+    let content = match std::fs::read_to_string(&index_path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    let index: SessionsIndex = match serde_json::from_str(&content) {
+        Ok(i) => i,
+        Err(e) => {
+            warn!("Failed to parse sessions-index.json: {}", e);
+            return HashMap::new();
+        }
+    };
+    index
+        .entries
+        .into_iter()
+        .map(|e| (e.session_id.clone(), e))
+        .collect()
 }
 
 /// Encode a path the way Claude Code does: / → -
@@ -93,51 +266,73 @@ pub fn find_most_recent_session(dir: &Path) -> Option<String> {
 
 /// Check if a session with the given ID exists in a directory
 ///
-/// Checks both the sessions-index.json and the actual session file (<id>.jsonl)
-/// since the index might not be updated immediately after session creation.
+/// Checks if the .jsonl file exists — this is the ground truth for session existence.
 pub fn session_exists(dir: &Path, session_id: &str) -> bool {
-    // First check if the actual session file exists (more reliable)
     if let Some(project_path) = get_project_storage_path(dir) {
         let session_file = project_path.join(format!("{}.jsonl", session_id));
-        if session_file.exists() {
-            return true;
-        }
+        session_file.exists()
+    } else {
+        false
     }
-
-    // Fall back to checking the index
-    let sessions = get_sessions_for_directory(dir);
-    sessions.iter().any(|s| s.session_id == session_id)
 }
 
-/// Get sessions for a directory from Claude Code's storage
+/// Get sessions for a directory from Claude Code's storage.
 ///
+/// Results are cached for 30 seconds to avoid repeated disk scans on every frame.
+/// Discovers sessions by scanning .jsonl files (primary source), then enriches
+/// with summary/first_prompt from sessions-index.json when available.
 /// Returns sessions sorted by modified date (most recent first).
-/// Returns empty Vec if no sessions found or on error.
 pub fn get_sessions_for_directory(dir: &Path) -> Vec<ClaudeSession> {
     let Some(project_path) = get_project_storage_path(dir) else {
         return Vec::new();
     };
 
-    let index_path = project_path.join("sessions-index.json");
+    SESSION_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
 
-    // Read and parse the sessions index
-    let content = match std::fs::read_to_string(&index_path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-
-    let index: SessionsIndex = match serde_json::from_str(&content) {
-        Ok(i) => i,
-        Err(e) => {
-            warn!("Failed to parse sessions-index.json for {:?}: {}", dir, e);
-            return Vec::new();
+        // Return cached result if fresh
+        if let Some(entry) = cache.get(&project_path) {
+            if entry.fetched_at.elapsed().as_secs() < CACHE_TTL_SECS {
+                return entry.sessions.clone();
+            }
         }
-    };
 
-    let mut sessions: Vec<ClaudeSession> = index.entries
-        .into_iter()
-        .filter_map(|e| e.into_claude_session())
-        .collect();
+        // Cache miss or stale — do full scan + merge
+        let sessions = fetch_sessions_uncached(&project_path);
+        cache.insert(
+            project_path,
+            CacheEntry {
+                sessions: sessions.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+        sessions
+    })
+}
+
+/// Perform the actual disk scan and index merge (expensive, called on cache miss).
+fn fetch_sessions_uncached(project_path: &Path) -> Vec<ClaudeSession> {
+    // Primary source: scan .jsonl files
+    let mut sessions = scan_jsonl_files(project_path);
+
+    // Enrichment: merge data from sessions-index.json
+    let index = read_sessions_index(project_path);
+    for session in &mut sessions {
+        if let Some(entry) = index.get(&session.session_id) {
+            // Take summary from index (not available in .jsonl)
+            if entry.summary.is_some() {
+                session.summary = entry.summary.clone();
+            }
+            // Take first_prompt from index if .jsonl extraction failed
+            if session.first_prompt.is_none() {
+                session.first_prompt = entry.first_prompt.clone();
+            }
+            // Take message_count from index (avoids expensive full-file scan)
+            if let Some(count) = entry.message_count {
+                session.message_count = count;
+            }
+        }
+    }
 
     // Sort by modified date, most recent first
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
@@ -145,32 +340,13 @@ pub fn get_sessions_for_directory(dir: &Path) -> Vec<ClaudeSession> {
     sessions
 }
 
-/// Get session count for a directory (fast, for display in lists)
+/// Get session count for a directory (uses cached data from get_sessions_for_directory).
 ///
 /// Returns 0 if no sessions found or on error.
 pub fn get_session_count(dir: &Path) -> usize {
-    let Some(project_path) = get_project_storage_path(dir) else {
-        return 0;
-    };
-
-    let index_path = project_path.join("sessions-index.json");
-
-    // Read and parse the sessions index
-    let content = match std::fs::read_to_string(&index_path) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-
-    // Parse and count entries
-    let index: SessionsIndex = match serde_json::from_str(&content) {
-        Ok(i) => i,
-        Err(_) => return 0,
-    };
-
-    index.entries.len()
+    get_sessions_for_directory(dir).len()
 }
 
-/// Get a display string for a session
 impl ClaudeSession {
     /// Get the display title (summary or truncated first prompt)
     pub fn display_title(&self) -> String {
@@ -283,5 +459,38 @@ mod tests {
         };
         assert!(session_long_prompt.display_title().ends_with("..."));
         assert!(session_long_prompt.display_title().len() <= 63);
+    }
+
+    #[test]
+    fn test_extract_first_prompt_string_content() {
+        let line = r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","message":{"role":"user","content":"Hello world"}}"#;
+        assert_eq!(extract_first_prompt(line), Some("Hello world".to_string()));
+    }
+
+    #[test]
+    fn test_extract_first_prompt_array_content() {
+        let line = r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"Array hello"}]}}"#;
+        assert_eq!(
+            extract_first_prompt(line),
+            Some("Array hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_first_prompt_tool_result_only() {
+        let line = r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"abc","content":"result"}]}}"#;
+        assert_eq!(extract_first_prompt(line), None);
+    }
+
+    #[test]
+    fn test_extract_first_prompt_non_user_type() {
+        let line = r#"{"type":"assistant","timestamp":"2026-01-15T10:00:00.000Z","message":{"role":"assistant","content":"I can help"}}"#;
+        assert_eq!(extract_first_prompt(line), None);
+    }
+
+    #[test]
+    fn test_extract_first_prompt_file_history_snapshot() {
+        let line = r#"{"type":"file-history-snapshot","messageId":"abc"}"#;
+        assert_eq!(extract_first_prompt(line), None);
     }
 }

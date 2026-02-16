@@ -882,11 +882,15 @@ fn render_session_selection(
                                 ui.painter().text(
                                     egui::pos2(title_x, rect.top() + 40.0),
                                     egui::Align2::LEFT_CENTER,
-                                    format!(
-                                        "{} messages  {}",
-                                        session.message_count,
+                                    if session.message_count > 0 {
+                                        format!(
+                                            "{} messages  {}",
+                                            session.message_count,
+                                            session.relative_modified_time()
+                                        )
+                                    } else {
                                         session.relative_modified_time()
-                                    ),
+                                    },
                                     egui::FontId::proportional(12.0),
                                     color_scheme.secondary_foreground(),
                                 );
