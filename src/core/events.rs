@@ -37,6 +37,12 @@ pub enum AppEvent {
     /// HID device state changed (mode button or YOLO switch)
     DeviceStateChanged { mode: DeviceMode, yolo: bool },
 
+    /// HID key event: single key press with QMK 16-bit keycode
+    HidKeyEvent { keycode: u16 },
+
+    /// HID type string: string injection from device
+    HidTypeString { text: String, send_enter: bool },
+
     /// Menu bar action triggered (macOS only)
     #[cfg(target_os = "macos")]
     MenuAction(MenuAction),

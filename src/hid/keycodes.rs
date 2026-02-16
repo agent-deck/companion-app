@@ -2,6 +2,7 @@
 //!
 //! Maps common USB HID usage codes to human-readable names for the UI.
 
+use crate::window::{build_arrow_seq, build_f1_f4_seq, build_home_end_seq, build_tilde_seq, encode_modifiers};
 use serde::{Deserialize, Serialize};
 
 /// A common QMK keycode (USB HID usage code)
@@ -448,6 +449,144 @@ pub fn from_egui_modifiers(mods: &egui::Modifiers) -> KeyModifiers {
     }
 }
 
+/// Convert a 16-bit QMK keycode (USB HID usage + modifier bits) into the byte
+/// sequence that should be written to the PTY.
+///
+/// Returns `None` for keycodes that have no terminal representation (e.g. GUI-only combos).
+pub fn qmk_keycode_to_terminal_bytes(keycode: u16) -> Option<Vec<u8>> {
+    let (base_key, mods) = decompose_keycode(keycode);
+    let base = base_key?;
+    let base_byte = base.to_byte();
+
+    let xterm_mod = encode_modifiers(mods.shift, mods.alt, mods.ctrl);
+
+    // Ctrl + letter → ASCII control code
+    if mods.ctrl && !mods.shift && !mods.alt && (0x04..=0x1D).contains(&base_byte) {
+        let ctrl_code = base_byte - 0x04 + 1; // A=0x01 .. Z=0x1A
+        return Some(vec![ctrl_code]);
+    }
+
+    match base {
+        // Special keys
+        QmkKeycode::Enter => Some(vec![b'\r']),
+        QmkKeycode::Escape => Some(vec![0x1b]),
+        QmkKeycode::Tab => {
+            if mods.shift {
+                Some(vec![0x1b, b'[', b'Z'])
+            } else {
+                Some(vec![b'\t'])
+            }
+        }
+        QmkKeycode::Backspace => Some(vec![0x7f]),
+        QmkKeycode::Space => Some(vec![b' ']),
+
+        // Arrow keys
+        QmkKeycode::Up => Some(build_arrow_seq(xterm_mod, b'A')),
+        QmkKeycode::Down => Some(build_arrow_seq(xterm_mod, b'B')),
+        QmkKeycode::Right => Some(build_arrow_seq(xterm_mod, b'C')),
+        QmkKeycode::Left => Some(build_arrow_seq(xterm_mod, b'D')),
+
+        // Home/End
+        QmkKeycode::Home => Some(build_home_end_seq(xterm_mod, b'H')),
+        QmkKeycode::End => Some(build_home_end_seq(xterm_mod, b'F')),
+
+        // Tilde sequences
+        QmkKeycode::Insert => Some(build_tilde_seq(xterm_mod, b"2")),
+        QmkKeycode::Delete => Some(build_tilde_seq(xterm_mod, b"3")),
+        QmkKeycode::PageUp => Some(build_tilde_seq(xterm_mod, b"5")),
+        QmkKeycode::PageDown => Some(build_tilde_seq(xterm_mod, b"6")),
+
+        // F1-F4 (SS3 sequences)
+        QmkKeycode::F1 => Some(build_f1_f4_seq(xterm_mod, b'P')),
+        QmkKeycode::F2 => Some(build_f1_f4_seq(xterm_mod, b'Q')),
+        QmkKeycode::F3 => Some(build_f1_f4_seq(xterm_mod, b'R')),
+        QmkKeycode::F4 => Some(build_f1_f4_seq(xterm_mod, b'S')),
+
+        // F5-F12 (tilde sequences)
+        QmkKeycode::F5 => Some(build_tilde_seq(xterm_mod, b"15")),
+        QmkKeycode::F6 => Some(build_tilde_seq(xterm_mod, b"17")),
+        QmkKeycode::F7 => Some(build_tilde_seq(xterm_mod, b"18")),
+        QmkKeycode::F8 => Some(build_tilde_seq(xterm_mod, b"19")),
+        QmkKeycode::F9 => Some(build_tilde_seq(xterm_mod, b"20")),
+        QmkKeycode::F10 => Some(build_tilde_seq(xterm_mod, b"21")),
+        QmkKeycode::F11 => Some(build_tilde_seq(xterm_mod, b"23")),
+        QmkKeycode::F12 => Some(build_tilde_seq(xterm_mod, b"24")),
+
+        // F13-F24 (tilde sequences, extended)
+        QmkKeycode::F13 => Some(build_tilde_seq(xterm_mod, b"25")),
+        QmkKeycode::F14 => Some(build_tilde_seq(xterm_mod, b"26")),
+        QmkKeycode::F15 => Some(build_tilde_seq(xterm_mod, b"28")),
+        QmkKeycode::F16 => Some(build_tilde_seq(xterm_mod, b"29")),
+        QmkKeycode::F17 => Some(build_tilde_seq(xterm_mod, b"31")),
+        QmkKeycode::F18 => Some(build_tilde_seq(xterm_mod, b"32")),
+        QmkKeycode::F19 => Some(build_tilde_seq(xterm_mod, b"33")),
+        QmkKeycode::F20 => Some(build_tilde_seq(xterm_mod, b"34")),
+        QmkKeycode::F21 => Some(build_tilde_seq(xterm_mod, b"35")),
+        QmkKeycode::F22 => Some(build_tilde_seq(xterm_mod, b"36")),
+        QmkKeycode::F23 => Some(build_tilde_seq(xterm_mod, b"37")),
+        QmkKeycode::F24 => Some(build_tilde_seq(xterm_mod, b"38")),
+
+        // Letters (a-z)
+        QmkKeycode::A | QmkKeycode::B | QmkKeycode::C | QmkKeycode::D |
+        QmkKeycode::E | QmkKeycode::F | QmkKeycode::G | QmkKeycode::H |
+        QmkKeycode::I | QmkKeycode::J | QmkKeycode::K | QmkKeycode::L |
+        QmkKeycode::M | QmkKeycode::N | QmkKeycode::O | QmkKeycode::P |
+        QmkKeycode::Q | QmkKeycode::R | QmkKeycode::S | QmkKeycode::T |
+        QmkKeycode::U | QmkKeycode::V | QmkKeycode::W | QmkKeycode::X |
+        QmkKeycode::Y | QmkKeycode::Z => {
+            let ch = if mods.shift {
+                b'A' + (base_byte - 0x04) // uppercase
+            } else {
+                b'a' + (base_byte - 0x04) // lowercase
+            };
+            if mods.alt {
+                Some(vec![0x1b, ch])
+            } else {
+                Some(vec![ch])
+            }
+        }
+
+        // Numbers
+        QmkKeycode::Num1 => shifted_or_plain(mods.shift, b'!', b'1', mods.alt),
+        QmkKeycode::Num2 => shifted_or_plain(mods.shift, b'@', b'2', mods.alt),
+        QmkKeycode::Num3 => shifted_or_plain(mods.shift, b'#', b'3', mods.alt),
+        QmkKeycode::Num4 => shifted_or_plain(mods.shift, b'$', b'4', mods.alt),
+        QmkKeycode::Num5 => shifted_or_plain(mods.shift, b'%', b'5', mods.alt),
+        QmkKeycode::Num6 => shifted_or_plain(mods.shift, b'^', b'6', mods.alt),
+        QmkKeycode::Num7 => shifted_or_plain(mods.shift, b'&', b'7', mods.alt),
+        QmkKeycode::Num8 => shifted_or_plain(mods.shift, b'*', b'8', mods.alt),
+        QmkKeycode::Num9 => shifted_or_plain(mods.shift, b'(', b'9', mods.alt),
+        QmkKeycode::Num0 => shifted_or_plain(mods.shift, b')', b'0', mods.alt),
+
+        // Punctuation (US layout)
+        QmkKeycode::Minus => shifted_or_plain(mods.shift, b'_', b'-', mods.alt),
+        QmkKeycode::Equal => shifted_or_plain(mods.shift, b'+', b'=', mods.alt),
+        QmkKeycode::LeftBracket => shifted_or_plain(mods.shift, b'{', b'[', mods.alt),
+        QmkKeycode::RightBracket => shifted_or_plain(mods.shift, b'}', b']', mods.alt),
+        QmkKeycode::Backslash => shifted_or_plain(mods.shift, b'|', b'\\', mods.alt),
+        QmkKeycode::Semicolon => shifted_or_plain(mods.shift, b':', b';', mods.alt),
+        QmkKeycode::Quote => shifted_or_plain(mods.shift, b'"', b'\'', mods.alt),
+        QmkKeycode::Grave => shifted_or_plain(mods.shift, b'~', b'`', mods.alt),
+        QmkKeycode::Comma => shifted_or_plain(mods.shift, b'<', b',', mods.alt),
+        QmkKeycode::Dot => shifted_or_plain(mods.shift, b'>', b'.', mods.alt),
+        QmkKeycode::Slash => shifted_or_plain(mods.shift, b'?', b'/', mods.alt),
+
+        // Keys with no terminal output
+        QmkKeycode::CapsLock | QmkKeycode::PrintScreen |
+        QmkKeycode::ScrollLock | QmkKeycode::Pause => None,
+    }
+}
+
+/// Helper: produce shifted or plain character, optionally with Alt prefix
+fn shifted_or_plain(shift: bool, shifted: u8, plain: u8, alt: bool) -> Option<Vec<u8>> {
+    let ch = if shift { shifted } else { plain };
+    if alt {
+        Some(vec![0x1b, ch])
+    } else {
+        Some(vec![ch])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,5 +674,63 @@ mod tests {
 
         let none = KeyModifiers::default();
         assert_eq!(none.display_prefix(), "");
+    }
+
+    #[test]
+    fn test_qmk_to_terminal_ctrl_c() {
+        // Ctrl+C = 0x0106 → ETX (0x03)
+        let keycode = compose_keycode(QmkKeycode::C, KeyModifiers { ctrl: true, ..Default::default() });
+        assert_eq!(qmk_keycode_to_terminal_bytes(keycode), Some(vec![0x03]));
+    }
+
+    #[test]
+    fn test_qmk_to_terminal_enter() {
+        assert_eq!(qmk_keycode_to_terminal_bytes(QmkKeycode::Enter as u16), Some(vec![b'\r']));
+    }
+
+    #[test]
+    fn test_qmk_to_terminal_escape() {
+        assert_eq!(qmk_keycode_to_terminal_bytes(QmkKeycode::Escape as u16), Some(vec![0x1b]));
+    }
+
+    #[test]
+    fn test_qmk_to_terminal_arrow() {
+        assert_eq!(qmk_keycode_to_terminal_bytes(QmkKeycode::Up as u16), Some(vec![0x1b, b'[', b'A']));
+        assert_eq!(qmk_keycode_to_terminal_bytes(QmkKeycode::Down as u16), Some(vec![0x1b, b'[', b'B']));
+    }
+
+    #[test]
+    fn test_qmk_to_terminal_letter() {
+        assert_eq!(qmk_keycode_to_terminal_bytes(QmkKeycode::A as u16), Some(vec![b'a']));
+        // Shift+A → uppercase
+        let shifted = compose_keycode(QmkKeycode::A, KeyModifiers { shift: true, ..Default::default() });
+        assert_eq!(qmk_keycode_to_terminal_bytes(shifted), Some(vec![b'A']));
+    }
+
+    #[test]
+    fn test_qmk_to_terminal_shift_tab() {
+        let shifted = compose_keycode(QmkKeycode::Tab, KeyModifiers { shift: true, ..Default::default() });
+        assert_eq!(qmk_keycode_to_terminal_bytes(shifted), Some(vec![0x1b, b'[', b'Z']));
+    }
+
+    #[test]
+    fn test_qmk_to_terminal_backspace() {
+        assert_eq!(qmk_keycode_to_terminal_bytes(QmkKeycode::Backspace as u16), Some(vec![0x7f]));
+    }
+
+    #[test]
+    fn test_qmk_to_terminal_f1() {
+        assert_eq!(qmk_keycode_to_terminal_bytes(QmkKeycode::F1 as u16), Some(vec![0x1b, b'O', b'P']));
+    }
+
+    #[test]
+    fn test_qmk_to_terminal_f5() {
+        assert_eq!(qmk_keycode_to_terminal_bytes(QmkKeycode::F5 as u16), Some(vec![0x1b, b'[', b'1', b'5', b'~']));
+    }
+
+    #[test]
+    fn test_qmk_to_terminal_unknown() {
+        // Unknown base key
+        assert_eq!(qmk_keycode_to_terminal_bytes(0x0000), None);
     }
 }

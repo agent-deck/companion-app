@@ -80,6 +80,10 @@ pub struct SessionInfo {
     pub current_task: Option<String>,
     /// Whether Claude finished working while tab was in background (for notification indicator)
     pub finished_in_background: bool,
+    /// Whether an HID alert is currently active for this session
+    pub hid_alert_active: bool,
+    /// Monotonic order value for FIFO alert resolution (0 = no alert)
+    pub alert_order: u64,
 }
 
 impl SessionInfo {
@@ -107,6 +111,8 @@ impl SessionInfo {
             claude_activity: ClaudeActivity::default(),
             current_task: None,
             finished_in_background: false,
+            hid_alert_active: false,
+            alert_order: 0,
         }
     }
 
@@ -128,6 +134,8 @@ impl SessionInfo {
             claude_activity: ClaudeActivity::default(),
             current_task: None,
             finished_in_background: false,
+            hid_alert_active: false,
+            alert_order: 0,
         }
     }
 
@@ -317,9 +325,37 @@ impl SessionManager {
         self.sessions.iter().filter(|s| s.claude_activity.is_working()).count()
     }
 
+    /// Get the session ID of the oldest alerting session (lowest alert_order).
+    /// Returns None if no sessions have an active HID alert.
+    pub fn oldest_alerting_session_id(&self) -> Option<SessionId> {
+        self.sessions
+            .iter()
+            .filter(|s| s.hid_alert_active)
+            .min_by_key(|s| s.alert_order)
+            .map(|s| s.id)
+    }
+
     /// Get sessions as a slice for rendering
     pub fn sessions(&self) -> &[SessionInfo] {
         &self.sessions
+    }
+
+    /// Compute the HID-space tab index for a given session ID.
+    ///
+    /// HID tab indices skip new-tab placeholders, matching `collect_tab_states()` ordering.
+    /// Returns None if the session is a new-tab or not found.
+    pub fn session_hid_tab_index(&self, session_id: SessionId) -> Option<usize> {
+        let mut idx = 0;
+        for session in &self.sessions {
+            if session.is_new_tab() {
+                continue;
+            }
+            if session.id == session_id {
+                return Some(idx);
+            }
+            idx += 1;
+        }
+        None
     }
 
     /// Collect tab states for HID display update.

@@ -150,7 +150,7 @@ pub fn render_tab_bar(
                 ui.set_clip_rect(ui.max_rect());
 
                 // Render only tabs that fit
-                for (idx, (id, title, _is_new, is_running, working_dir, is_loading, terminal_title, bell_active, claude_activity, finished_in_background)) in sessions_data.iter().take(max_visible_tabs).enumerate() {
+                for (idx, (id, title, _is_new, is_running, working_dir, is_loading, terminal_title, _bell_active, claude_activity, finished_in_background)) in sessions_data.iter().take(max_visible_tabs).enumerate() {
                     render_single_tab(
                         ui,
                         ctx,
@@ -162,7 +162,6 @@ pub fn render_tab_bar(
                         working_dir,
                         *is_loading,
                         terminal_title,
-                        *bell_active,
                         claude_activity,
                         *finished_in_background,
                         active_session_idx,
@@ -261,7 +260,6 @@ fn render_single_tab(
     working_dir: &str,
     is_loading: bool,
     terminal_title: &Option<String>,
-    bell_active: bool,
     claude_activity: &crate::core::sessions::ClaudeActivity,
     finished_in_background: bool,
     active_session_idx: usize,
@@ -272,9 +270,6 @@ fn render_single_tab(
     let is_active = idx == active_session_idx;
     let tab_bg = if is_active {
         color_scheme.active_tab_background()
-    } else if bell_active {
-        // Visual bell indicator
-        color_scheme.bell_tab_background()
     } else {
         color_scheme.inactive_tab_background()
     };

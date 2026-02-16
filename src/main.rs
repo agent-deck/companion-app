@@ -17,7 +17,7 @@ use agent_deck::{
         state::AppState,
         tabs::{TabEntry, TabState},
     },
-    hid::{HidManager, SoftKeyEditState},
+    hid::{keycodes::qmk_keycode_to_terminal_bytes, HidManager, SoftKeyEditState},
     hotkey::HotkeyManager,
     pty::PtyWrapper,
     tray::TrayManager,
@@ -438,6 +438,25 @@ impl App {
         }
     }
 
+    /// Clear HID alert for a specific session (called on HID input events)
+    fn clear_hid_alert_for_session(&mut self, session_id: SessionId) {
+        let hid_tab_idx = self.terminal_window.session_manager.session_hid_tab_index(session_id);
+        if let Some(session) = self.terminal_window.session_manager.get_session_mut(session_id) {
+            if session.hid_alert_active {
+                session.hid_alert_active = false;
+                session.bell_active = false;
+                session.finished_in_background = false;
+                if let Some(idx) = hid_tab_idx {
+                    if let Some(ref hid) = self.hid_manager {
+                        if let Err(e) = hid.clear_alert(idx) {
+                            error!("Failed to clear HID alert on input: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Handle terminal UI actions
     fn handle_terminal_action(&mut self, action: TerminalAction, event_loop: &ActiveEventLoop) {
         match action {
@@ -466,6 +485,16 @@ impl App {
                         }
                     }
                 }
+                // Clear HID alert before closing
+                if let Some(session) = self.terminal_window.session_manager.get_session(session_id) {
+                    if session.hid_alert_active {
+                        if let Some(idx) = self.terminal_window.session_manager.session_hid_tab_index(session_id) {
+                            if let Some(ref hid) = self.hid_manager {
+                                let _ = hid.clear_alert(idx);
+                            }
+                        }
+                    }
+                }
                 self.stop_claude_for_session(session_id);
                 // Update window title after closing (active tab may have changed)
                 self.terminal_window.update_window_title();
@@ -486,14 +515,27 @@ impl App {
                 }
             }
             TerminalAction::SwitchTab(session_id) => {
+                // Compute HID tab index before mutable borrow
+                let hid_tab_idx = self.terminal_window.session_manager.session_hid_tab_index(session_id);
+
                 self.terminal_window
                     .session_manager
                     .set_active_session(session_id);
 
-                // Clear bell indicator and finished-in-background indicator when tab becomes active
+                // Clear bell indicator, finished-in-background, and HID alert when tab becomes active
                 if let Some(session) = self.terminal_window.session_manager.get_session_mut(session_id) {
                     session.bell_active = false;
                     session.finished_in_background = false;
+                    if session.hid_alert_active {
+                        session.hid_alert_active = false;
+                        if let Some(idx) = hid_tab_idx {
+                            if let Some(ref hid) = self.hid_manager {
+                                if let Err(e) = hid.clear_alert(idx) {
+                                    error!("Failed to clear HID alert on tab switch: {}", e);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Update window title to reflect active tab
@@ -760,6 +802,20 @@ impl App {
                     }
                 }
             }
+            TerminalAction::HidAlert { tab, session, text } => {
+                if let Some(ref hid) = self.hid_manager {
+                    if let Err(e) = hid.send_alert(tab, &session, &text) {
+                        error!("Failed to send HID alert: {}", e);
+                    }
+                }
+            }
+            TerminalAction::HidClearAlert(tab) => {
+                if let Some(ref hid) = self.hid_manager {
+                    if let Err(e) = hid.clear_alert(tab) {
+                        error!("Failed to clear HID alert: {}", e);
+                    }
+                }
+            }
         }
     }
 
@@ -789,14 +845,21 @@ impl App {
                 if let Some(ref mut tray) = self.tray_manager {
                     tray.set_connected(false);
                 }
+                // Clear all HID alert flags since device is gone
+                for session in self.terminal_window.session_manager.iter_mut() {
+                    session.hid_alert_active = false;
+                }
             }
             AppEvent::HotkeyPressed(key) => {
                 info!("Hotkey pressed: {:?}", key);
                 match key {
                     hotkey::HotkeyType::ClaudeKey => {
-                        // If window visible, create new tab; otherwise show/start window
-                        if self.terminal_window.is_visible() {
+                        // If window visible and focused, create new tab; otherwise show/focus window
+                        if self.terminal_window.is_visible() && self.terminal_window.is_focused() {
                             self.handle_terminal_action(TerminalAction::NewTab, event_loop);
+                        } else if self.terminal_window.is_visible() {
+                            // Visible but not focused → bring to front
+                            self.terminal_window.show();
                         } else if !self.session_ptys.is_empty() {
                             self.terminal_window.show();
                             self.send_hid_for_active_session();
@@ -924,6 +987,89 @@ impl App {
                     let mut state = self.state.write();
                     state.device_mode = mode;
                     state.device_yolo = yolo;
+                }
+            }
+            AppEvent::HidKeyEvent { keycode } => {
+                // Resolve target: oldest alerting session (if any), and fallback to active
+                let alert_id = self.terminal_window.session_manager.oldest_alerting_session_id();
+                let target_id = alert_id
+                    .or_else(|| self.terminal_window.session_manager.active_session_id());
+
+                if let Some(sid) = target_id {
+                    self.clear_hid_alert_for_session(sid);
+                }
+
+                // F20 (0x006F) → Claude button: show/focus window, or new tab if already focused
+                if keycode == agent_deck::hid::keycodes::QmkKeycode::F20 as u16 {
+                    if let Some(alert_sid) = alert_id {
+                        // Active alert → switch to the alerting tab, bring window to front
+                        self.terminal_window.show();
+                        if let Some(ref mut tray) = self.tray_manager {
+                            tray.set_window_visible(true);
+                        }
+                        self.handle_terminal_action(TerminalAction::SwitchTab(alert_sid), event_loop);
+                    } else if self.terminal_window.is_visible() && self.terminal_window.is_focused() {
+                        // Window is visible and focused → new tab
+                        self.handle_terminal_action(TerminalAction::NewTab, event_loop);
+                    } else if self.terminal_window.is_visible() {
+                        // Window is visible but not focused → just bring to front
+                        self.terminal_window.show();
+                    } else if !self.session_ptys.is_empty() {
+                        // Has running sessions → show window
+                        self.terminal_window.show();
+                        self.send_hid_for_active_session();
+                        if let Some(ref mut tray) = self.tray_manager {
+                            tray.set_window_visible(true);
+                        }
+                    } else if !self.terminal_window.session_manager.is_empty() {
+                        // Has saved tabs but no PTY → create window and start active tab
+                        self.terminal_window.create_window(event_loop);
+                        self.terminal_window.show();
+                        self.send_hid_for_active_session();
+                        if let Some(ref mut tray) = self.tray_manager {
+                            tray.set_window_visible(true);
+                        }
+                        if let Some(session) = self.terminal_window.session_manager.active_session() {
+                            if !session.is_new_tab() && !session.is_running {
+                                let session_id = session.id;
+                                let working_dir = session.working_directory.clone();
+                                let claude_session_id = session.claude_session_id.clone();
+                                self.start_claude_for_session(session_id, working_dir, claude_session_id, event_loop);
+                            }
+                        }
+                    } else {
+                        // No sessions at all → start fresh
+                        self.start_claude(event_loop);
+                        self.send_hid_for_active_session();
+                        if let Some(ref mut tray) = self.tray_manager {
+                            tray.set_window_visible(true);
+                        }
+                    }
+                } else if let Some(bytes) = qmk_keycode_to_terminal_bytes(keycode) {
+                    // Route keypress to alerting session (or active if no alerts)
+                    if let Some(sid) = target_id {
+                        self.terminal_window.send_to_session_pty(sid, &bytes);
+                    }
+                    if let Some(ref window) = self.terminal_window.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            AppEvent::HidTypeString { text, send_enter } => {
+                // Resolve target: oldest alerting session, or active session as fallback
+                let target_id = self.terminal_window.session_manager
+                    .oldest_alerting_session_id()
+                    .or_else(|| self.terminal_window.session_manager.active_session_id());
+
+                if let Some(sid) = target_id {
+                    self.clear_hid_alert_for_session(sid);
+                    self.terminal_window.send_to_session_pty(sid, text.as_bytes());
+                    if send_enter {
+                        self.terminal_window.send_to_session_pty(sid, b"\r");
+                    }
+                }
+                if let Some(ref window) = self.terminal_window.window {
+                    window.request_redraw();
                 }
             }
             AppEvent::PtyExited(code) => {

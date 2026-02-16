@@ -98,6 +98,10 @@ pub enum TerminalAction {
     ResetSoftKeys,
     /// Send HID display update with session name, current task, tab states, and active index
     HidDisplayUpdate { session: String, task: Option<String>, tabs: Vec<u8>, active: usize },
+    /// Send HID alert overlay for a background session
+    HidAlert { tab: usize, session: String, text: String },
+    /// Clear HID alert overlay for a tab
+    HidClearAlert(usize),
 }
 
 /// Terminal window state managed within the main app
@@ -124,6 +128,8 @@ pub struct TerminalWindowState {
     pub hid_connected: bool,
     /// Whether window should be visible
     visible: Arc<AtomicBool>,
+    /// Whether the window currently has focus
+    window_focused: bool,
     /// Window ID (when created)
     window_id: Option<WindowId>,
     /// Callback to notify PTY of resize (for active session)
@@ -168,6 +174,8 @@ pub struct TerminalWindowState {
     pub color_scheme: ColorScheme,
     /// Last known mtime of ~/.claude.json (for detecting theme changes)
     claude_json_mtime: Option<SystemTime>,
+    /// Monotonic counter for HID alert insertion order (mirrors firmware FIFO)
+    alert_order_counter: u64,
 }
 
 impl TerminalWindowState {
@@ -205,6 +213,7 @@ impl TerminalWindowState {
             settings_modal: SettingsModal::new(settings),
             hid_connected: false,
             visible: Arc::new(AtomicBool::new(false)),
+            window_focused: false,
             window_id: None,
             resize_callback: None,
             scroll_offset: Arc::new(AtomicI32::new(0)),
@@ -227,6 +236,7 @@ impl TerminalWindowState {
             current_palette,
             color_scheme,
             claude_json_mtime: cj_mtime,
+            alert_order_counter: 0,
         }
     }
 
@@ -350,6 +360,10 @@ impl TerminalWindowState {
         self.visible.load(Ordering::Relaxed)
     }
 
+    pub fn is_focused(&self) -> bool {
+        self.window_focused
+    }
+
     pub fn show(&self) {
         self.visible.store(true, Ordering::Relaxed);
         if let Some(ref window) = self.window {
@@ -393,6 +407,15 @@ impl TerminalWindowState {
     /// Send input bytes to the active session's PTY (public wrapper)
     pub fn send_to_active_pty(&self, data: &[u8]) {
         self.send_to_pty(data);
+    }
+
+    /// Send input bytes to a specific session's PTY
+    pub fn send_to_session_pty(&self, session_id: SessionId, data: &[u8]) {
+        if let Some(session) = self.session_manager.get_session(session_id) {
+            if let Some(ref tx) = session.pty_input_tx {
+                let _ = tx.send(data.to_vec());
+            }
+        }
     }
 
     /// Scroll the view (positive = scroll up into history, negative = scroll down)
@@ -1118,7 +1141,21 @@ impl TerminalWindowState {
                 }
             }
             WindowEvent::Focused(focused) => {
+                self.window_focused = *focused;
                 if *focused {
+                    // Clear HID alert for active session when window gains focus
+                    if let Some(session_id) = self.session_manager.active_session_id() {
+                        let tab_idx = self.session_manager.session_hid_tab_index(session_id);
+                        if let Some(session) = self.session_manager.get_session_mut(session_id) {
+                            if session.hid_alert_active {
+                                session.hid_alert_active = false;
+                                if let Some(idx) = tab_idx {
+                                    self.pending_actions.push(TerminalAction::HidClearAlert(idx));
+                                }
+                            }
+                        }
+                    }
+
                     #[cfg(target_os = "macos")]
                     {
                         let has_selection = self.has_selection();
@@ -1548,6 +1585,7 @@ impl TerminalWindowState {
         // Title is None when the cleaned title is "Claude Code" (activity still tracked).
         let mut title_activity_changes: Vec<(SessionId, ClaudeActivity, Option<String>)> = Vec::new();
         let mut bell_sessions: Vec<SessionId> = Vec::new();
+        let mut attention_sessions: Vec<(SessionId, String)> = Vec::new(); // (id, body) for toast notifications
         let active_session_id = self.session_manager.active_session_id();
 
         for session_info in self.session_manager.iter() {
@@ -1560,6 +1598,11 @@ impl TerminalWindowState {
                             "Terminal notification: title={:?}, body={}, focus={}",
                             title, body, focus
                         );
+                        // Treat toast notifications as attention requests when user can't see them
+                        // (background tab or window not focused)
+                        if Some(session_info.id) != active_session_id || !self.window_focused {
+                            attention_sessions.push((session_info.id, body.clone()));
+                        }
                     }
                     Alert::Bell => {
                         debug!("Terminal bell for session {} (active={:?})", session_info.id, active_session_id);
@@ -1610,7 +1653,6 @@ impl TerminalWindowState {
 
         let mut sessions_needing_resolution: Vec<SessionId> = Vec::new();
         let mut hid_needs_update = false;
-
         let active_session_id = self.session_manager.active_session_id();
         for (session_id, activity, clean_title) in title_activity_changes {
             if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
@@ -1670,8 +1712,42 @@ impl TerminalWindowState {
         crate::update_working_session_count(self.session_manager.working_session_count());
 
         for session_id in bell_sessions {
+            // Compute HID tab index before mutable borrow
+            let tab_idx = self.session_manager.session_hid_tab_index(session_id);
             if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
-                session_info.bell_active = true;
+                if !session_info.hid_alert_active {
+                    if let Some(idx) = tab_idx {
+                        let session_name = session_info.hid_session_name().to_string();
+                        self.alert_order_counter += 1;
+                        session_info.alert_order = self.alert_order_counter;
+                        session_info.hid_alert_active = true;
+                        self.pending_actions.push(TerminalAction::HidAlert {
+                            tab: idx,
+                            session: session_name,
+                            text: "Bell".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Toast notifications (OSC 9) — Claude asking for permission
+        for (session_id, body) in attention_sessions {
+            let tab_idx = self.session_manager.session_hid_tab_index(session_id);
+            if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
+                if !session_info.hid_alert_active {
+                    if let Some(idx) = tab_idx {
+                        let session_name = session_info.hid_session_name().to_string();
+                        self.alert_order_counter += 1;
+                        session_info.alert_order = self.alert_order_counter;
+                        session_info.hid_alert_active = true;
+                        self.pending_actions.push(TerminalAction::HidAlert {
+                            tab: idx,
+                            session: session_name,
+                            text: body,
+                        });
+                    }
+                }
             }
         }
 
