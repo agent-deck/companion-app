@@ -99,7 +99,7 @@ pub enum TerminalAction {
     /// Send HID display update with session name, current task, tab states, and active index
     HidDisplayUpdate { session: String, task: Option<String>, tabs: Vec<u8>, active: usize },
     /// Send HID alert overlay for a background session
-    HidAlert { tab: usize, session: String, text: String },
+    HidAlert { tab: usize, session: String, text: String, details: Option<String> },
     /// Clear HID alert overlay for a tab
     HidClearAlert(usize),
 }
@@ -1149,6 +1149,8 @@ impl TerminalWindowState {
                         if let Some(session) = self.session_manager.get_session_mut(session_id) {
                             if session.hid_alert_active {
                                 session.hid_alert_active = false;
+                                session.hid_alert_text = None;
+                                session.hid_alert_details = None;
                                 if let Some(idx) = tab_idx {
                                     self.pending_actions.push(TerminalAction::HidClearAlert(idx));
                                 }
@@ -1660,6 +1662,13 @@ impl TerminalWindowState {
                 let was_working = session_info.claude_activity.is_working();
                 let is_background = Some(session_id) != active_session_id;
 
+                // Check what actually changed before updating state
+                let activity_changed = session_info.claude_activity != activity;
+                let title_changed = match &clean_title {
+                    Some(t) => session_info.terminal_title.as_ref() != Some(t),
+                    None => false,
+                };
+
                 // Route title based on activity:
                 // - Title text is always the session name (both working and idle)
                 // - Task comes from the terminal screen content (spinner status line)
@@ -1696,8 +1705,10 @@ impl TerminalWindowState {
 
                 session_info.claude_activity = activity;
 
-                // Any tab's activity change triggers a HID update (tab states array)
-                hid_needs_update = true;
+                // Only trigger HID update when something actually changed
+                if activity_changed || title_changed {
+                    hid_needs_update = true;
+                }
 
                 if session_info.needs_session_resolution {
                     sessions_needing_resolution.push(session_id);
@@ -1718,13 +1729,20 @@ impl TerminalWindowState {
                 if !session_info.hid_alert_active {
                     if let Some(idx) = tab_idx {
                         let session_name = session_info.hid_session_name().to_string();
+                        let details = {
+                            let session = session_info.session.lock();
+                            session.extract_prompt_context()
+                        };
                         self.alert_order_counter += 1;
                         session_info.alert_order = self.alert_order_counter;
                         session_info.hid_alert_active = true;
+                        session_info.hid_alert_text = Some("Bell".to_string());
+                        session_info.hid_alert_details = details.clone();
                         self.pending_actions.push(TerminalAction::HidAlert {
                             tab: idx,
                             session: session_name,
                             text: "Bell".to_string(),
+                            details,
                         });
                     }
                 }
@@ -1738,13 +1756,20 @@ impl TerminalWindowState {
                 if !session_info.hid_alert_active {
                     if let Some(idx) = tab_idx {
                         let session_name = session_info.hid_session_name().to_string();
+                        let details = {
+                            let session = session_info.session.lock();
+                            session.extract_prompt_context()
+                        };
                         self.alert_order_counter += 1;
                         session_info.alert_order = self.alert_order_counter;
                         session_info.hid_alert_active = true;
+                        session_info.hid_alert_text = Some(body.clone());
+                        session_info.hid_alert_details = details.clone();
                         self.pending_actions.push(TerminalAction::HidAlert {
                             tab: idx,
                             session: session_name,
                             text: body,
+                            details,
                         });
                     }
                 }

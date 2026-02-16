@@ -84,6 +84,10 @@ pub struct SessionInfo {
     pub hid_alert_active: bool,
     /// Monotonic order value for FIFO alert resolution (0 = no alert)
     pub alert_order: u64,
+    /// Stored alert text (for re-sending after tab index shifts)
+    pub hid_alert_text: Option<String>,
+    /// Stored alert details (for re-sending after tab index shifts)
+    pub hid_alert_details: Option<String>,
 }
 
 impl SessionInfo {
@@ -113,6 +117,8 @@ impl SessionInfo {
             finished_in_background: false,
             hid_alert_active: false,
             alert_order: 0,
+            hid_alert_text: None,
+            hid_alert_details: None,
         }
     }
 
@@ -136,6 +142,8 @@ impl SessionInfo {
             finished_in_background: false,
             hid_alert_active: false,
             alert_order: 0,
+            hid_alert_text: None,
+            hid_alert_details: None,
         }
     }
 

@@ -44,6 +44,8 @@ pub struct HidManager {
     connected: Arc<AtomicBool>,
     /// Whether the monitor thread should stop
     stop_monitor: Arc<AtomicBool>,
+    /// Last display payload sent (for deduplication)
+    last_display_payload: Mutex<String>,
     /// macOS hotplug watcher
     #[cfg(target_os = "macos")]
     hotplug_watcher: Option<HotplugWatcher>,
@@ -61,6 +63,7 @@ impl HidManager {
             event_tx: event_tx.clone(),
             connected: Arc::new(AtomicBool::new(false)),
             stop_monitor: Arc::new(AtomicBool::new(false)),
+            last_display_payload: Mutex::new(String::new()),
             #[cfg(target_os = "macos")]
             hotplug_watcher: None,
         };
@@ -386,8 +389,19 @@ impl HidManager {
         self.connected.load(Ordering::Relaxed)
     }
 
-    /// Send a display update with session name, current task, tab states, and active tab index
+    /// Send a display update with session name, current task, tab states, and active tab index.
+    /// Skips sending if the payload is identical to the last one sent.
     pub fn send_display_update(&self, session: &str, task: Option<&str>, tabs: &[u8], active: usize) -> Result<()> {
+        // Build a dedup key from the payload fields
+        let payload_key = format!("{}|{}|{:?}|{}", session, task.unwrap_or(""), tabs, active);
+        {
+            let mut last = self.last_display_payload.lock();
+            if *last == payload_key {
+                return Ok(());
+            }
+            *last = payload_key;
+        }
+
         let device_guard = self.device.lock();
         let device = device_guard
             .as_ref()
@@ -521,13 +535,13 @@ impl HidManager {
 
 
     /// Send an alert overlay to the device
-    pub fn send_alert(&self, tab: usize, session: &str, text: &str) -> Result<()> {
+    pub fn send_alert(&self, tab: usize, session: &str, text: &str, details: Option<&str>) -> Result<()> {
         let device_guard = self.device.lock();
         let device = device_guard
             .as_ref()
             .ok_or_else(|| anyhow!("Device not connected"))?;
 
-        let packets = commands::build_alert(tab, session, text);
+        let packets = commands::build_alert(tab, session, text, details);
         send_packets_to_device(device, &packets)?;
 
         self.drain_response(device);

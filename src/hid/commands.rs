@@ -55,12 +55,16 @@ pub fn build_set_mode(mode: DeviceMode) -> Vec<HidPacket> {
 }
 
 /// Build an alert command to show an overlay on the device
-pub fn build_alert(tab: usize, session: &str, text: &str) -> Vec<HidPacket> {
-    let json = serde_json::json!({
+pub fn build_alert(tab: usize, session: &str, text: &str, details: Option<&str>) -> Vec<HidPacket> {
+    let mut json = serde_json::json!({
         "tab": tab,
         "session": session,
         "text": text,
     });
+    if let Some(d) = details {
+        json["details"] = serde_json::Value::String(d.to_string());
+    }
+    tracing::info!("HID alert payload: {}", json);
     build_chunked_packets(HidCommand::Alert, json.to_string().as_bytes())
 }
 

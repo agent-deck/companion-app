@@ -444,6 +444,8 @@ impl App {
         if let Some(session) = self.terminal_window.session_manager.get_session_mut(session_id) {
             if session.hid_alert_active {
                 session.hid_alert_active = false;
+                session.hid_alert_text = None;
+                session.hid_alert_details = None;
                 session.bell_active = false;
                 session.finished_in_background = false;
                 if let Some(idx) = hid_tab_idx {
@@ -485,17 +487,56 @@ impl App {
                         }
                     }
                 }
-                // Clear HID alert before closing
+
+                // Before closing: record the closed tab's HID index and collect
+                // active alerts that will need re-indexing afterwards.
+                let closed_hid_idx = self.terminal_window.session_manager.session_hid_tab_index(session_id);
+
+                // Clear HID alert for the tab being closed
                 if let Some(session) = self.terminal_window.session_manager.get_session(session_id) {
                     if session.hid_alert_active {
-                        if let Some(idx) = self.terminal_window.session_manager.session_hid_tab_index(session_id) {
+                        if let Some(idx) = closed_hid_idx {
                             if let Some(ref hid) = self.hid_manager {
                                 let _ = hid.clear_alert(idx);
                             }
                         }
                     }
                 }
+
+                // Collect alerts whose HID index will shift down after the close.
+                // We need: (session_id, old_hid_index, session_name, text, details)
+                let shifted_alerts: Vec<_> = if let Some(closed_idx) = closed_hid_idx {
+                    self.terminal_window.session_manager.iter()
+                        .filter(|s| s.id != session_id && s.hid_alert_active)
+                        .filter_map(|s| {
+                            let old_idx = self.terminal_window.session_manager.session_hid_tab_index(s.id)?;
+                            if old_idx > closed_idx {
+                                Some((s.id, old_idx, s.hid_session_name().to_string(),
+                                      s.hid_alert_text.clone(), s.hid_alert_details.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                };
+
                 self.stop_claude_for_session(session_id);
+
+                // Re-send shifted alerts at their new (decremented) indices
+                if let Some(ref hid) = self.hid_manager {
+                    for (_, old_idx, session_name, text, details) in &shifted_alerts {
+                        // Clear the alert at the old index on the device
+                        let _ = hid.clear_alert(*old_idx);
+                        // Re-send at the new index (old - 1)
+                        let new_idx = old_idx - 1;
+                        if let Some(ref text) = text {
+                            let _ = hid.send_alert(new_idx, session_name, text, details.as_deref());
+                        }
+                    }
+                }
+
                 // Update window title after closing (active tab may have changed)
                 self.terminal_window.update_window_title();
                 // Save tabs after closing
@@ -528,6 +569,8 @@ impl App {
                     session.finished_in_background = false;
                     if session.hid_alert_active {
                         session.hid_alert_active = false;
+                        session.hid_alert_text = None;
+                        session.hid_alert_details = None;
                         if let Some(idx) = hid_tab_idx {
                             if let Some(ref hid) = self.hid_manager {
                                 if let Err(e) = hid.clear_alert(idx) {
@@ -802,9 +845,9 @@ impl App {
                     }
                 }
             }
-            TerminalAction::HidAlert { tab, session, text } => {
+            TerminalAction::HidAlert { tab, session, text, details } => {
                 if let Some(ref hid) = self.hid_manager {
-                    if let Err(e) = hid.send_alert(tab, &session, &text) {
+                    if let Err(e) = hid.send_alert(tab, &session, &text, details.as_deref()) {
                         error!("Failed to send HID alert: {}", e);
                     }
                 }
@@ -848,6 +891,8 @@ impl App {
                 // Clear all HID alert flags since device is gone
                 for session in self.terminal_window.session_manager.iter_mut() {
                     session.hid_alert_active = false;
+                    session.hid_alert_text = None;
+                    session.hid_alert_details = None;
                 }
             }
             AppEvent::HotkeyPressed(key) => {

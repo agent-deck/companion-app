@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use std::io::Write;
 use std::sync::{mpsc, Arc};
 use wezterm_term::color::ColorPalette;
+use wezterm_cell::Intensity;
 use wezterm_term::{Alert, CursorPosition, Terminal, TerminalSize};
 
 /// Writer that forwards terminal responses through an mpsc channel to the PTY.
@@ -208,6 +209,125 @@ impl Session {
         None
     }
 
+    /// Extract the prompt context block visible on the terminal screen.
+    ///
+    /// Claude Code permission prompts look like:
+    /// ```text
+    /// ─── (separator)
+    /// Bash command
+    ///     ls -la /Users/vden/.claude/
+    ///     List top-level ~/.claude/ directory contents
+    ///
+    /// Do you want to proceed?
+    /// ❯ 1. Yes
+    ///    2. Yes, allow reading from .claude/ from this project
+    ///    3. No
+    ///
+    /// Esc to cancel · Tab to amend · ctrl+e to explain
+    /// ```
+    ///
+    /// Scans upward from the cursor, finds the hints line ("Esc to cancel")
+    /// as the bottom boundary, then collects lines upward until hitting a
+    /// horizontal separator or a 25-line limit. Returns the block without
+    /// the hints line itself.
+    pub fn extract_prompt_context(&self) -> Option<String> {
+        let mut term = self.terminal.lock();
+        let screen = term.screen_mut();
+        let total_lines = screen.scrollback_rows();
+        let physical_rows = screen.physical_rows;
+
+        // Start from the bottom of the visible area (not cursor — cursor may be
+        // at row 0 for TUI prompts rendered by ink).
+        let bottom_phys = total_lines.saturating_sub(1);
+
+        // Scan upward from bottom of visible area looking for tool arguments or bold title.
+        // Priority: parens args > indented content > bold header > "Do you want..." question.
+        // Stop at a horizontal separator (top of the prompt block).
+        //
+        // Layout for Bash: bold "Bash command" → indented command → indented description → question → options
+        // Layout for Read: bold "Read file" → Read(path) → question → options
+        // Scanning upward, indented content lines between question and bold header
+        // are the tool arguments (e.g., the actual bash command).
+        let mut bold_fallback: Option<String> = None;
+        let mut args_fallback: Option<String> = None;
+        let mut question_fallback: Option<String> = None;
+        for offset in 0..physical_rows {
+            let phys_idx = bottom_phys.saturating_sub(offset);
+            if phys_idx >= total_lines {
+                break;
+            }
+            let line = screen.line_mut(phys_idx);
+            let mut line_text = String::new();
+            let mut has_bold = false;
+            for cell in line.visible_cells() {
+                let s = cell.str();
+                if !s.trim().is_empty()
+                    && matches!(cell.attrs().intensity(), Intensity::Bold)
+                {
+                    has_bold = true;
+                }
+                line_text.push_str(s);
+            }
+            let trimmed = line_text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Stop at separator only if we've already found content above it
+            // (the prompt block may contain inner separators between option groups)
+            if trimmed.chars().all(|c| is_horizontal_rule_char(c) || c == ' ') {
+                if bold_fallback.is_some() || question_fallback.is_some() {
+                    break;
+                }
+                continue;
+            }
+            // Skip hints lines, numbered option lines
+            if trimmed.contains("Esc to cancel") || trimmed.contains("esc to cancel") {
+                continue;
+            }
+            // Plan approval prompt — no useful details to extract
+            if trimmed.contains("ctrl-g to edit") {
+                return None;
+            }
+            let stripped = trimmed.trim_start_matches('❯').trim_start();
+            if stripped.starts_with(|c: char| c.is_ascii_digit()) {
+                let after_digits = stripped.trim_start_matches(|c: char| c.is_ascii_digit());
+                if after_digits.starts_with('.') {
+                    continue;
+                }
+            }
+
+            // Parenthesized args: e.g. Read(~/work/agentdeck/firmware/LICENSE)
+            if let (Some(open), Some(close)) = (trimmed.find('('), trimmed.rfind(')')) {
+                if open < close {
+                    let args = trimmed[open + 1..close].trim();
+                    if !args.is_empty() {
+                        return Some(truncate_ellipsis(args, 120));
+                    }
+                }
+            }
+
+            if has_bold {
+                bold_fallback = Some(truncate_ellipsis(trimmed, 120));
+                continue;
+            }
+
+            // "Do you want..." question
+            if trimmed.starts_with("Do you want") {
+                question_fallback = Some(truncate_ellipsis(trimmed, 120));
+                continue;
+            }
+
+            // Indented content between question and bold header = tool arguments.
+            // Scanning upward, the last one set before bold is closest to header
+            // (e.g., "ls /Users/..." for Bash commands).
+            if question_fallback.is_some() {
+                args_fallback = Some(truncate_ellipsis(trimmed, 120));
+            }
+        }
+
+        args_fallback.or(bold_fallback).or(question_fallback)
+    }
+
     /// Poll for terminal responses that need to be forwarded to the PTY.
     /// These are generated by the terminal emulator in response to queries
     /// (e.g., OSC 11 background color query).
@@ -224,6 +344,29 @@ impl Default for Session {
     fn default() -> Self {
         Self::new(0, 120, 50, ColorPalette::default())
     }
+}
+
+/// Truncate a string to `max` characters, appending "…" if truncated.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max).collect();
+        format!("{}…", truncated)
+    }
+}
+
+/// Check if a character is a horizontal rule/separator character.
+/// Covers solid, dashed, and dotted box-drawing horizontals plus em-dash.
+fn is_horizontal_rule_char(c: char) -> bool {
+    matches!(c,
+        '─' | '━' |        // solid horizontal (light / heavy)
+        '┄' | '┅' |        // triple dash horizontal
+        '┈' | '┉' |        // quadruple dash horizontal
+        '╌' | '╍' |        // double dash horizontal
+        '—' | '―' |        // em-dash, horizontal bar
+        '·' | '⋯' | '…'   // middle dot, ellipsis (used in some renderings)
+    )
 }
 
 /// Check if text is a duration summary line like "Worked for 40s", "Churned for 2m".
