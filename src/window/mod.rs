@@ -9,6 +9,10 @@ pub mod new_tab;
 mod render;
 pub mod settings_modal;
 mod terminal;
+mod terminal_input;
+mod terminal_notifications;
+mod terminal_pty;
+mod terminal_selection;
 
 pub use context_menu::{render_context_menu, ContextMenuState};
 pub use glyph_cache::{GlyphCache, StyleKey, BASE_DPI};

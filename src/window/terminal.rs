@@ -6,14 +6,12 @@
 
 use super::context_menu::{render_context_menu, ContextMenuState};
 use super::glyph_cache::GlyphCache;
-use super::input::{build_arrow_seq, build_f1_f4_seq, build_home_end_seq, build_tilde_seq, encode_modifiers, open_url};
 use super::render::{
     handle_settings_modal_result, render_hyperlink_tooltip, render_tab_bar,
     render_terminal_content, RenderParams, MAX_TAB_TITLE_LEN, TAB_BAR_HEIGHT,
 };
 use super::settings_modal::{render_settings_modal, SettingsModal};
 use crate::hid::{DeviceMode, SoftKeyEditState};
-use arboard::Clipboard;
 use crate::core::bookmarks::BookmarkManager;
 use crate::core::sessions::{SessionId, SessionManager};
 use crate::core::settings::{ColorScheme, Settings};
@@ -39,14 +37,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 use wezterm_cell::Hyperlink;
 use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::{ElementState, MouseButton, Modifiers, MouseScrollDelta, WindowEvent};
+use winit::event::Modifiers;
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use crate::core::claude_sessions::{find_most_recent_session, get_sessions_for_directory};
-#[cfg(target_os = "macos")]
-use crate::macos::{update_edit_menu_state, update_recent_sessions_menu, ContextMenuAction, ContextMenuSession, show_context_menu};
+use crate::core::claude_sessions::find_most_recent_session;
 
 /// Channel for sending input to PTY
 pub type InputSender = mpsc::UnboundedSender<Vec<u8>>;
@@ -117,7 +112,7 @@ pub struct TerminalWindowState {
     /// Glow context
     glow_context: Option<Arc<glow::Context>>,
     /// Egui integration
-    egui_glow: Option<EguiGlow>,
+    pub(super) egui_glow: Option<EguiGlow>,
     /// Session manager for multiple tabs
     pub session_manager: SessionManager,
     /// Bookmark manager
@@ -125,7 +120,7 @@ pub struct TerminalWindowState {
     /// App settings
     pub settings: Settings,
     /// Settings modal state
-    settings_modal: SettingsModal,
+    pub(super) settings_modal: SettingsModal,
     /// HID connection state
     pub hid_connected: bool,
     /// Device YOLO mode state
@@ -137,41 +132,41 @@ pub struct TerminalWindowState {
     /// Whether window should be visible
     visible: Arc<AtomicBool>,
     /// Whether the window currently has focus
-    window_focused: bool,
+    pub(super) window_focused: bool,
     /// Window ID (when created)
     window_id: Option<WindowId>,
     /// Callback to notify PTY of resize (for active session)
     resize_callback: Option<ResizeCallback>,
     /// Current scroll offset (0 = bottom, positive = viewing history)
-    scroll_offset: Arc<AtomicI32>,
+    pub(super) scroll_offset: Arc<AtomicI32>,
     /// Current keyboard modifiers state
-    modifiers: Modifiers,
+    pub(super) modifiers: Modifiers,
     /// Cached character width for resize calculations (Cell for interior mutability)
-    cached_char_width: Cell<f32>,
+    pub(super) cached_char_width: Cell<f32>,
     /// Cached line height for resize calculations (Cell for interior mutability)
-    cached_line_height: Cell<f32>,
+    pub(super) cached_line_height: Cell<f32>,
     /// Font size in points
     pub font_size: f32,
     /// Initial font size at app start (for reset)
     initial_font_size: f32,
     /// Selection start position (row, col) in terminal coordinates
-    selection_start: Option<(i64, usize)>,
+    pub(super) selection_start: Option<(i64, usize)>,
     /// Selection end position (row, col) in terminal coordinates
-    selection_end: Option<(i64, usize)>,
+    pub(super) selection_end: Option<(i64, usize)>,
     /// Whether mouse is currently dragging for selection
-    is_selecting: bool,
+    pub(super) is_selecting: bool,
     /// Current cursor position in logical pixels
-    cursor_position: Option<(f64, f64)>,
+    pub(super) cursor_position: Option<(f64, f64)>,
     /// WezTerm-based glyph cache for proper Unicode rendering
     glyph_cache: RefCell<Option<GlyphCache>>,
     /// Currently hovered hyperlink (for visual feedback)
-    hovered_hyperlink: Option<Arc<Hyperlink>>,
+    pub(super) hovered_hyperlink: Option<Arc<Hyperlink>>,
     /// Pending actions to be processed by the main app
-    pending_actions: Vec<TerminalAction>,
+    pub(super) pending_actions: Vec<TerminalAction>,
     /// Whether egui image loaders have been installed
     image_loaders_installed: bool,
     /// Context menu state for right-click popup
-    context_menu: ContextMenuState,
+    pub(super) context_menu: ContextMenuState,
     /// Theme registry with all available themes
     pub theme_registry: ThemeRegistry,
     /// Currently active theme
@@ -183,7 +178,7 @@ pub struct TerminalWindowState {
     /// Last known mtime of ~/.claude.json (for detecting theme changes)
     claude_json_mtime: Option<SystemTime>,
     /// Monotonic counter for HID alert insertion order (mirrors firmware FIFO)
-    alert_order_counter: u64,
+    pub(super) alert_order_counter: u64,
 }
 
 impl TerminalWindowState {
@@ -270,7 +265,6 @@ impl TerminalWindowState {
             .map(|s| Arc::clone(&s.session))
     }
 
-
     /// Set callback for PTY resize notifications
     pub fn set_resize_callback<F>(&mut self, callback: F)
     where
@@ -339,7 +333,7 @@ impl TerminalWindowState {
     }
 
     /// Try to resolve the actual Claude session ID for a fresh session
-    fn try_resolve_session_id(&mut self, session_id: SessionId) {
+    pub(super) fn try_resolve_session_id(&mut self, session_id: SessionId) {
         let working_dir = {
             let session = match self.session_manager.get_session(session_id) {
                 Some(s) => s,
@@ -409,173 +403,6 @@ impl TerminalWindowState {
 
     pub fn is_our_window(&self, id: WindowId) -> bool {
         self.window_id == Some(id)
-    }
-
-    /// Send input bytes to the active session's PTY
-    fn send_to_pty(&self, data: &[u8]) {
-        if let Some(session) = self.session_manager.active_session() {
-            if let Some(ref tx) = session.pty_input_tx {
-                let _ = tx.send(data.to_vec());
-            }
-        }
-    }
-
-    /// Send input bytes to the active session's PTY (public wrapper)
-    pub fn send_to_active_pty(&self, data: &[u8]) {
-        self.send_to_pty(data);
-    }
-
-    /// Send input bytes to a specific session's PTY
-    pub fn send_to_session_pty(&self, session_id: SessionId, data: &[u8]) {
-        if let Some(session) = self.session_manager.get_session(session_id) {
-            if let Some(ref tx) = session.pty_input_tx {
-                let _ = tx.send(data.to_vec());
-            }
-        }
-    }
-
-    /// Scroll the view (positive = scroll up into history, negative = scroll down)
-    pub fn scroll_view(&self, delta: i32) {
-        if let Some(session_info) = self.session_manager.active_session() {
-            let session = session_info.session.lock();
-            let max_offset = session.with_terminal(|term| {
-                let screen = term.screen();
-                screen.scrollback_rows().saturating_sub(screen.physical_rows) as i32
-            });
-            drop(session);
-
-            let current = self.scroll_offset.load(Ordering::Relaxed);
-            let new_offset = (current + delta).clamp(0, max_offset);
-            self.scroll_offset.store(new_offset, Ordering::Relaxed);
-        }
-    }
-
-    /// Reset scroll to bottom (viewing current content)
-    pub fn scroll_to_bottom(&self) {
-        self.scroll_offset.store(0, Ordering::Relaxed);
-    }
-
-    /// Clear current text selection
-    pub fn clear_selection(&mut self) {
-        self.selection_start = None;
-        self.selection_end = None;
-        self.is_selecting = false;
-    }
-
-    /// Check if there is an active selection with actual content
-    pub fn has_selection(&self) -> bool {
-        match (self.selection_start, self.selection_end) {
-            (Some(start), Some(end)) => start != end,
-            _ => false,
-        }
-    }
-
-    /// Open context menu at the specified position
-    fn open_context_menu(&mut self, x: f32, y: f32) {
-        let sessions = if let Some(session) = self.session_manager.active_session() {
-            let mut sessions = get_sessions_for_directory(&session.working_directory);
-            sessions.truncate(5);
-            sessions
-        } else {
-            Vec::new()
-        };
-
-        #[cfg(target_os = "macos")]
-        {
-            let menu_sessions: Vec<(String, String)> = sessions
-                .iter()
-                .map(|s| (s.session_id.clone(), s.display_title()))
-                .collect();
-            update_recent_sessions_menu(&menu_sessions);
-
-            if let Some(ref window) = self.window {
-                if let Ok(handle) = window.window_handle() {
-                    use raw_window_handle::RawWindowHandle;
-                    if let RawWindowHandle::AppKit(appkit_handle) = handle.as_raw() {
-                        let view = appkit_handle.ns_view.as_ptr();
-
-                        let has_selection = self.has_selection();
-                        let has_clipboard = Clipboard::new()
-                            .ok()
-                            .and_then(|mut c| c.get_text().ok())
-                            .map(|t| !t.is_empty())
-                            .unwrap_or(false);
-
-                        let menu_sessions: Vec<ContextMenuSession> = sessions
-                            .iter()
-                            .map(|s| ContextMenuSession {
-                                session_id: s.session_id.clone(),
-                                title: s.display_title(),
-                                time_ago: s.relative_modified_time(),
-                            })
-                            .collect();
-
-                        let action = show_context_menu(
-                            view,
-                            x as f64,
-                            y as f64,
-                            has_selection,
-                            has_clipboard,
-                            &menu_sessions,
-                        );
-
-                        if let Some(action) = action {
-                            match action {
-                                ContextMenuAction::NewSession => {
-                                    self.pending_actions.push(TerminalAction::NewTab);
-                                }
-                                ContextMenuAction::FreshSessionHere => {
-                                    self.pending_actions.push(TerminalAction::FreshSessionCurrentDir);
-                                }
-                                ContextMenuAction::LoadSession { session_id } => {
-                                    self.pending_actions.push(TerminalAction::LoadSession { session_id });
-                                }
-                                ContextMenuAction::Copy => {
-                                    self.pending_actions.push(TerminalAction::Copy);
-                                }
-                                ContextMenuAction::Paste => {
-                                    self.pending_actions.push(TerminalAction::Paste);
-                                }
-                            }
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Fallback to egui context menu
-        self.context_menu.available_sessions = sessions;
-        self.context_menu.position = egui::Pos2::new(x, y);
-        self.context_menu.is_open = true;
-        self.context_menu.submenu_open = false;
-    }
-
-    /// Close context menu
-    fn close_context_menu(&mut self) {
-        self.context_menu.is_open = false;
-        self.context_menu.submenu_open = false;
-        self.context_menu.opened_time = 0.0;
-    }
-
-    /// Select all text in the terminal
-    pub fn select_all(&mut self) {
-        if let Some(session_info) = self.session_manager.active_session() {
-            let session = session_info.session.lock();
-            let (first_row, last_row, cols) = session.with_terminal(|term| {
-                let screen = term.screen();
-                let scrollback = screen.scrollback_rows() as i64;
-                let physical = screen.physical_rows as i64;
-                let first_row = -(scrollback as i64);
-                let last_row = physical - 1;
-                let cols = screen.physical_cols;
-                (first_row, last_row, cols)
-            });
-            drop(session);
-
-            self.selection_start = Some((first_row, 0));
-            self.selection_end = Some((last_row, cols));
-        }
     }
 
     /// Invalidate the glyph cache (e.g., after font size change)
@@ -692,158 +519,6 @@ impl TerminalWindowState {
                 }
             }
         }
-    }
-
-    /// Get selected text from terminal
-    pub fn get_selection_text(&self) -> Option<String> {
-        let (start, end) = match (self.selection_start, self.selection_end) {
-            (Some(s), Some(e)) => (s, e),
-            _ => return None,
-        };
-
-        let (start, end) = if start.0 < end.0 || (start.0 == end.0 && start.1 <= end.1) {
-            (start, end)
-        } else {
-            (end, start)
-        };
-
-        let session_info = self.session_manager.active_session()?;
-        let session = session_info.session.lock();
-        let text = session.with_terminal_mut(|term| {
-            let screen = term.screen_mut();
-            let mut result = String::new();
-            let total_lines = screen.scrollback_rows();
-            let cols = screen.physical_cols;
-
-            for phys_idx in start.0..=end.0 {
-                if phys_idx < 0 || phys_idx as usize >= total_lines {
-                    continue;
-                }
-                let start_col = if phys_idx == start.0 { start.1 } else { 0 };
-                let end_col = if phys_idx == end.0 { end.1 } else { cols };
-
-                let line = screen.line_mut(phys_idx as usize);
-                for cell in line.visible_cells() {
-                    let col = cell.cell_index();
-                    if col >= start_col && col < end_col {
-                        result.push_str(cell.str());
-                    }
-                }
-
-                if phys_idx < end.0 {
-                    let trimmed = result.trim_end_matches(' ');
-                    result.truncate(trimmed.len());
-                    result.push('\n');
-                }
-            }
-
-            result.trim_end().to_string()
-        });
-        drop(session);
-
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    }
-
-    /// Convert screen position (in logical pixels) to terminal cell coordinates
-    fn screen_to_terminal_coords(&self, x: f64, y: f64) -> (i64, usize) {
-        let char_width = self.cached_char_width.get();
-        let line_height = self.cached_line_height.get();
-
-        let tab_bar_height = TAB_BAR_HEIGHT as f64;
-        let padding = 8.0;
-        let x = (x - padding).max(0.0);
-        let y = (y - tab_bar_height - padding).max(0.0);
-
-        let col = (x / char_width as f64) as usize;
-        let visible_row = (y / line_height as f64) as usize;
-
-        let scroll_offset = self.scroll_offset.load(Ordering::Relaxed) as usize;
-
-        if let Some(session_info) = self.session_manager.active_session() {
-            let session = session_info.session.lock();
-            let phys_row = session.with_terminal(|term| {
-                let screen = term.screen();
-                let total_lines = screen.scrollback_rows();
-                let physical_rows = screen.physical_rows;
-                let visible_start = total_lines.saturating_sub(physical_rows + scroll_offset);
-                (visible_start + visible_row) as i64
-            });
-            drop(session);
-            (phys_row, col)
-        } else {
-            (0, col)
-        }
-    }
-
-    /// Handle mouse button press for selection or hyperlink click
-    fn handle_mouse_press(&mut self, x: f64, y: f64) -> bool {
-        let (row, col) = self.screen_to_terminal_coords(x, y);
-
-        if let Some(hyperlink) = self.get_hyperlink_at(row as usize, col) {
-            let state = self.modifiers.state();
-            #[cfg(target_os = "macos")]
-            let should_open = state.super_key();
-            #[cfg(not(target_os = "macos"))]
-            let should_open = state.control_key();
-
-            if should_open {
-                open_url(hyperlink.uri());
-                return true;
-            }
-        }
-
-        self.selection_start = Some((row, col));
-        self.selection_end = Some((row, col));
-        self.is_selecting = true;
-        false
-    }
-
-    fn handle_mouse_release(&mut self) {
-        self.is_selecting = false;
-
-        #[cfg(target_os = "macos")]
-        {
-            let has_selection = self.has_selection();
-            let has_clipboard = arboard::Clipboard::new()
-                .ok()
-                .and_then(|mut c| c.get_text().ok())
-                .map(|t| !t.is_empty())
-                .unwrap_or(false);
-            update_edit_menu_state(has_selection, has_clipboard);
-        }
-    }
-
-    fn handle_mouse_move(&mut self, x: f64, y: f64) {
-        self.cursor_position = Some((x, y));
-
-        let (row, col) = self.screen_to_terminal_coords(x, y);
-        self.hovered_hyperlink = self.get_hyperlink_at(row as usize, col);
-
-        if self.is_selecting {
-            self.selection_end = Some((row, col));
-        }
-    }
-
-    fn get_hyperlink_at(&self, row: usize, col: usize) -> Option<Arc<Hyperlink>> {
-        let session_info = self.session_manager.active_session()?;
-        session_info.session.lock().with_terminal_mut(|term| {
-            let screen = term.screen_mut();
-            let total_lines = screen.scrollback_rows();
-            if row >= total_lines {
-                return None;
-            }
-            let line = screen.line_mut(row);
-            for cell in line.visible_cells() {
-                if cell.cell_index() == col {
-                    return cell.attrs().hyperlink().cloned();
-                }
-            }
-            None
-        })
     }
 
     /// Create the window (call from resumed handler)
@@ -1003,382 +678,6 @@ impl TerminalWindowState {
             x: position.map(|(x, _)| x),
             y: position.map(|(_, y)| y),
         })
-    }
-
-    /// Handle window event - returns true if event was consumed
-    pub fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
-        let egui_should_handle_keyboard = self.settings_modal.is_open
-            || self.session_manager.active_session().map_or(true, |s| !s.is_running);
-
-        let should_pass_to_egui = match event {
-            WindowEvent::KeyboardInput { .. } => egui_should_handle_keyboard,
-            _ => true,
-        };
-
-        if should_pass_to_egui {
-            if let Some(ref mut egui_glow) = self.egui_glow {
-                let response = egui_glow.on_window_event(self.window.as_ref().unwrap(), event);
-                if response.repaint {
-                    if let Some(ref window) = self.window {
-                        window.request_redraw();
-                    }
-                }
-            }
-        }
-
-        match event {
-            WindowEvent::ModifiersChanged(new_modifiers) => {
-                self.modifiers = new_modifiers.clone();
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if self.settings_modal.is_open {
-                    return false;
-                }
-
-                if event.state == ElementState::Pressed {
-                    if let Key::Named(NamedKey::Escape) = &event.logical_key {
-                        if self.context_menu.is_open {
-                            self.close_context_menu();
-                            if let Some(ref window) = self.window {
-                                window.request_redraw();
-                            }
-                            return true;
-                        }
-                    }
-
-                    if self.context_menu.is_open {
-                        self.close_context_menu();
-                        if let Some(ref window) = self.window {
-                            window.request_redraw();
-                        }
-                    }
-
-                    let state = self.modifiers.state();
-                    if state.super_key() && !state.control_key() && !state.alt_key() {
-                        if let Key::Character(c) = &event.logical_key {
-                            match c.as_str() {
-                                "t" | "T" => {
-                                    self.pending_actions.push(TerminalAction::NewTab);
-                                    return true;
-                                }
-                                "w" | "W" => {
-                                    if let Some(id) = self.session_manager.active_session_id() {
-                                        self.pending_actions.push(TerminalAction::CloseTab(id));
-                                    }
-                                    return true;
-                                }
-                                "," => {
-                                    self.settings_modal.open(&self.settings);
-                                    return true;
-                                }
-                                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
-                                    let idx = c.chars().next().unwrap().to_digit(10).unwrap() as usize - 1;
-                                    let sessions = self.session_manager.sessions();
-                                    if idx < sessions.len() {
-                                        let id = sessions[idx].id;
-                                        self.pending_actions.push(TerminalAction::SwitchTab(id));
-                                    }
-                                    return true;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-
-                    if let Key::Named(NamedKey::F20) = &event.logical_key {
-                        self.pending_actions.push(TerminalAction::NewTab);
-                        return true;
-                    }
-
-                    if let Some(session) = self.session_manager.active_session() {
-                        if session.is_running {
-                            self.handle_key_input(event);
-                            return true;
-                        }
-                    }
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                if self.context_menu.is_open {
-                    return true;
-                }
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => *y as i32 * 3,
-                    MouseScrollDelta::PixelDelta(pos) => (pos.y / 20.0) as i32,
-                };
-                if lines != 0 {
-                    self.scroll_view(lines);
-                    if let Some(ref window) = self.window {
-                        window.request_redraw();
-                    }
-                }
-                return true;
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                if *button == MouseButton::Left {
-                    if *state == ElementState::Pressed {
-                        if !self.context_menu.is_open {
-                            if let Some((x, y)) = self.cursor_position {
-                                self.handle_mouse_press(x, y);
-                                if let Some(ref window) = self.window {
-                                    window.request_redraw();
-                                }
-                            }
-                        }
-                    } else {
-                        if !self.context_menu.is_open {
-                            self.handle_mouse_release();
-                        }
-                    }
-                    return true;
-                } else if *button == MouseButton::Right && *state == ElementState::Pressed {
-                    if let Some(session) = self.session_manager.active_session() {
-                        if !session.is_new_tab() {
-                            if let Some((x, y)) = self.cursor_position {
-                                self.open_context_menu(x as f32, y as f32);
-                                if let Some(ref window) = self.window {
-                                    window.request_redraw();
-                                }
-                            }
-                        }
-                    }
-                    return true;
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                let scale_factor = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0);
-                let logical_x = position.x / scale_factor;
-                let logical_y = position.y / scale_factor;
-                self.handle_mouse_move(logical_x, logical_y);
-                if self.is_selecting {
-                    if let Some(ref window) = self.window {
-                        window.request_redraw();
-                    }
-                }
-            }
-            WindowEvent::Focused(focused) => {
-                self.window_focused = *focused;
-                if *focused {
-                    // Clear HID alert for active session when window gains focus
-                    if let Some(session_id) = self.session_manager.active_session_id() {
-                        let tab_idx = self.session_manager.session_hid_tab_index(session_id);
-                        if let Some(session) = self.session_manager.get_session_mut(session_id) {
-                            if session.hid_alert_active {
-                                session.hid_alert_active = false;
-                                session.hid_alert_text = None;
-                                session.hid_alert_details = None;
-                                if let Some(idx) = tab_idx {
-                                    self.pending_actions.push(TerminalAction::HidClearAlert(idx));
-                                }
-                            }
-                        }
-                    }
-
-                    #[cfg(target_os = "macos")]
-                    {
-                        let has_selection = self.has_selection();
-                        let has_clipboard = arboard::Clipboard::new()
-                            .ok()
-                            .and_then(|mut c| c.get_text().ok())
-                            .map(|t| !t.is_empty())
-                            .unwrap_or(false);
-                        update_edit_menu_state(has_selection, has_clipboard);
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        false
-    }
-
-    fn handle_key_input(&mut self, event: &winit::event::KeyEvent) {
-        let state = self.modifiers.state();
-        let ctrl = state.control_key();
-        let alt = state.alt_key();
-        let shift = state.shift_key();
-        let super_key = state.super_key();
-
-        if super_key && !ctrl && !alt {
-            if let Key::Character(c) = &event.logical_key {
-                match c.as_str() {
-                    "v" | "V" => {
-                        if let Ok(mut clipboard) = Clipboard::new() {
-                            if let Ok(text) = clipboard.get_text() {
-                                self.send_to_pty(text.as_bytes());
-                            }
-                        }
-                        return;
-                    }
-                    "c" | "C" => {
-                        if let Some(text) = self.get_selection_text() {
-                            if let Ok(mut clipboard) = Clipboard::new() {
-                                let _ = clipboard.set_text(&text);
-                            }
-                            self.clear_selection();
-                        }
-                        return;
-                    }
-                    "a" | "A" => {
-                        self.select_all();
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let modifiers = encode_modifiers(shift, alt, ctrl);
-
-        let bytes: Option<Vec<u8>> = match &event.logical_key {
-            Key::Named(named) => match named {
-                NamedKey::Enter => {
-                    if shift {
-                        Some(vec![b'\n'])
-                    } else if alt {
-                        Some(vec![0x1b, b'\r'])
-                    } else {
-                        Some(vec![b'\r'])
-                    }
-                }
-                NamedKey::Backspace => {
-                    if alt {
-                        Some(vec![0x1b, 0x7f])
-                    } else if ctrl {
-                        Some(vec![0x17])
-                    } else {
-                        Some(vec![0x7f])
-                    }
-                }
-                NamedKey::Tab => {
-                    if shift {
-                        Some(vec![0x1b, b'[', b'Z'])
-                    } else {
-                        Some(vec![b'\t'])
-                    }
-                }
-                NamedKey::Escape => Some(vec![0x1b]),
-                NamedKey::ArrowUp => Some(build_arrow_seq(modifiers, b'A')),
-                NamedKey::ArrowDown => Some(build_arrow_seq(modifiers, b'B')),
-                NamedKey::ArrowRight => Some(build_arrow_seq(modifiers, b'C')),
-                NamedKey::ArrowLeft => Some(build_arrow_seq(modifiers, b'D')),
-                NamedKey::Home => Some(build_home_end_seq(modifiers, b'H')),
-                NamedKey::End => Some(build_home_end_seq(modifiers, b'F')),
-                NamedKey::PageUp => Some(build_tilde_seq(modifiers, b"5")),
-                NamedKey::PageDown => Some(build_tilde_seq(modifiers, b"6")),
-                NamedKey::Delete => Some(build_tilde_seq(modifiers, b"3")),
-                NamedKey::Insert => Some(build_tilde_seq(modifiers, b"2")),
-                NamedKey::Space => {
-                    if ctrl {
-                        Some(vec![0x00])
-                    } else if alt {
-                        Some(vec![0x1b, b' '])
-                    } else {
-                        Some(vec![b' '])
-                    }
-                }
-                NamedKey::F1 => Some(build_f1_f4_seq(modifiers, b'P')),
-                NamedKey::F2 => Some(build_f1_f4_seq(modifiers, b'Q')),
-                NamedKey::F3 => Some(build_f1_f4_seq(modifiers, b'R')),
-                NamedKey::F4 => Some(build_f1_f4_seq(modifiers, b'S')),
-                NamedKey::F5 => Some(build_tilde_seq(modifiers, b"15")),
-                NamedKey::F6 => Some(build_tilde_seq(modifiers, b"17")),
-                NamedKey::F7 => Some(build_tilde_seq(modifiers, b"18")),
-                NamedKey::F8 => Some(build_tilde_seq(modifiers, b"19")),
-                NamedKey::F9 => Some(build_tilde_seq(modifiers, b"20")),
-                NamedKey::F10 => Some(build_tilde_seq(modifiers, b"21")),
-                NamedKey::F11 => Some(build_tilde_seq(modifiers, b"23")),
-                NamedKey::F12 => Some(build_tilde_seq(modifiers, b"24")),
-                _ => None,
-            },
-            Key::Character(c) => {
-                let s = c.as_str();
-                if ctrl && s.len() == 1 {
-                    let ch = s.chars().next().unwrap();
-                    match ch.to_ascii_lowercase() {
-                        'a'..='z' => {
-                            let ctrl_char = (ch.to_ascii_lowercase() as u8) - b'a' + 1;
-                            if alt {
-                                Some(vec![0x1b, ctrl_char])
-                            } else {
-                                Some(vec![ctrl_char])
-                            }
-                        }
-                        '[' => Some(vec![0x1b]),
-                        '\\' => Some(vec![0x1c]),
-                        ']' => Some(vec![0x1d]),
-                        '^' | '6' => Some(vec![0x1e]),
-                        '_' | '-' => Some(vec![0x1f]),
-                        '@' | '2' => Some(vec![0x00]),
-                        '/' => {
-                            if alt {
-                                Some(vec![0x1b, 0x1f])
-                            } else {
-                                Some(vec![0x1f])
-                            }
-                        }
-                        _ => Some(s.as_bytes().to_vec()),
-                    }
-                } else if alt && !ctrl && !s.is_empty() {
-                    let mut bytes = vec![0x1b];
-                    bytes.extend_from_slice(s.as_bytes());
-                    Some(bytes)
-                } else if s.len() == 1 {
-                    let ch = s.chars().next().unwrap();
-                    if (ch as u32) < 0x20 {
-                        Some(vec![ch as u8])
-                    } else {
-                        Some(s.as_bytes().to_vec())
-                    }
-                } else {
-                    Some(s.as_bytes().to_vec())
-                }
-            }
-            _ => None,
-        };
-
-        let bytes = bytes.or_else(|| {
-            if let PhysicalKey::Code(key_code) = event.physical_key {
-                match key_code {
-                    KeyCode::KeyA if ctrl => Some(if alt { vec![0x1b, 0x01] } else { vec![0x01] }),
-                    KeyCode::KeyB if ctrl => Some(if alt { vec![0x1b, 0x02] } else { vec![0x02] }),
-                    KeyCode::KeyC if ctrl => Some(if alt { vec![0x1b, 0x03] } else { vec![0x03] }),
-                    KeyCode::KeyD if ctrl => Some(if alt { vec![0x1b, 0x04] } else { vec![0x04] }),
-                    KeyCode::KeyE if ctrl => Some(if alt { vec![0x1b, 0x05] } else { vec![0x05] }),
-                    KeyCode::KeyF if ctrl => Some(if alt { vec![0x1b, 0x06] } else { vec![0x06] }),
-                    KeyCode::KeyG if ctrl => Some(if alt { vec![0x1b, 0x07] } else { vec![0x07] }),
-                    KeyCode::KeyH if ctrl => Some(if alt { vec![0x1b, 0x08] } else { vec![0x08] }),
-                    KeyCode::KeyI if ctrl => Some(if alt { vec![0x1b, 0x09] } else { vec![0x09] }),
-                    KeyCode::KeyJ if ctrl => Some(if alt { vec![0x1b, 0x0a] } else { vec![0x0a] }),
-                    KeyCode::KeyK if ctrl => Some(if alt { vec![0x1b, 0x0b] } else { vec![0x0b] }),
-                    KeyCode::KeyL if ctrl => Some(if alt { vec![0x1b, 0x0c] } else { vec![0x0c] }),
-                    KeyCode::KeyM if ctrl => Some(if alt { vec![0x1b, 0x0d] } else { vec![0x0d] }),
-                    KeyCode::KeyN if ctrl => Some(if alt { vec![0x1b, 0x0e] } else { vec![0x0e] }),
-                    KeyCode::KeyO if ctrl => Some(if alt { vec![0x1b, 0x0f] } else { vec![0x0f] }),
-                    KeyCode::KeyP if ctrl => Some(if alt { vec![0x1b, 0x10] } else { vec![0x10] }),
-                    KeyCode::KeyQ if ctrl => Some(if alt { vec![0x1b, 0x11] } else { vec![0x11] }),
-                    KeyCode::KeyR if ctrl => Some(if alt { vec![0x1b, 0x12] } else { vec![0x12] }),
-                    KeyCode::KeyS if ctrl => Some(if alt { vec![0x1b, 0x13] } else { vec![0x13] }),
-                    KeyCode::KeyT if ctrl => Some(if alt { vec![0x1b, 0x14] } else { vec![0x14] }),
-                    KeyCode::KeyU if ctrl => Some(if alt { vec![0x1b, 0x15] } else { vec![0x15] }),
-                    KeyCode::KeyV if ctrl => Some(if alt { vec![0x1b, 0x16] } else { vec![0x16] }),
-                    KeyCode::KeyW if ctrl => Some(if alt { vec![0x1b, 0x17] } else { vec![0x17] }),
-                    KeyCode::KeyX if ctrl => Some(if alt { vec![0x1b, 0x18] } else { vec![0x18] }),
-                    KeyCode::KeyY if ctrl => Some(if alt { vec![0x1b, 0x19] } else { vec![0x19] }),
-                    KeyCode::KeyZ if ctrl => Some(if alt { vec![0x1b, 0x1a] } else { vec![0x1a] }),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        });
-
-        if let Some(ref data) = bytes {
-            debug!("Sending to PTY: {:?}", data);
-            self.scroll_to_bottom();
-            self.clear_selection();
-            self.send_to_pty(data);
-        }
     }
 
     pub fn handle_resize(&mut self, physical_width: u32, physical_height: u32) {
@@ -1578,294 +877,10 @@ impl TerminalWindowState {
         egui_glow.paint(window);
         gl_surface.swap_buffers(gl_context).unwrap();
     }
-
-    /// Forward terminal responses (e.g., OSC 11 bg color replies) to PTY input.
-    /// Call this periodically to ensure programs get responses to their queries.
-    pub fn process_terminal_responses(&self) {
-        for session_info in self.session_manager.iter() {
-            let session = session_info.session.lock();
-            let responses = session.poll_responses();
-            if !responses.is_empty() {
-                if let Some(ref tx) = session_info.pty_input_tx {
-                    for response in responses {
-                        let _ = tx.send(response);
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn process_notifications(&mut self) {
-        use crate::core::sessions::ClaudeActivity;
-        use wezterm_term::Alert;
-
-        // Collect (session_id, activity, cleaned_title) tuples from title changes.
-        // Title is None when the cleaned title is "Claude Code" (activity still tracked).
-        let mut title_activity_changes: Vec<(SessionId, ClaudeActivity, Option<String>)> = Vec::new();
-        let mut bell_sessions: Vec<SessionId> = Vec::new();
-        let mut attention_sessions: Vec<(SessionId, String)> = Vec::new(); // (id, body) for toast notifications
-        let active_session_id = self.session_manager.active_session_id();
-
-        for session_info in self.session_manager.iter() {
-            let session = session_info.session.lock();
-            let alerts: Vec<Alert> = session.poll_notifications();
-            for alert in alerts {
-                match alert {
-                    Alert::ToastNotification { title, body, focus } => {
-                        info!(
-                            "Terminal notification: title={:?}, body={}, focus={}",
-                            title, body, focus
-                        );
-                        // Treat toast notifications as attention requests when user can't see them
-                        // (background tab or window not focused)
-                        if Some(session_info.id) != active_session_id || !self.window_focused {
-                            attention_sessions.push((session_info.id, body.clone()));
-                        }
-                    }
-                    Alert::Bell => {
-                        debug!("Terminal bell for session {} (active={:?})", session_info.id, active_session_id);
-                        if Some(session_info.id) != active_session_id {
-                            debug!("Adding bell indicator for background session {}", session_info.id);
-                            bell_sessions.push(session_info.id);
-                        }
-                    }
-                    Alert::CurrentWorkingDirectoryChanged => {
-                        debug!("Working directory changed");
-                    }
-                    Alert::WindowTitleChanged(title) => {
-                        debug!("Window title changed for session {}: {}", session_info.id, title);
-                        let activity = ClaudeActivity::from_title(&title);
-                        let clean = clean_terminal_title(&title);
-                        if !clean.is_empty() {
-                            // Pass None for title when it's just "Claude Code" (still track activity)
-                            let display_title = if clean == "Claude Code" { None } else { Some(clean) };
-                            title_activity_changes.push((session_info.id, activity, display_title));
-                        }
-                    }
-                    Alert::IconTitleChanged(title) => {
-                        debug!("Icon title changed: {:?}", title);
-                    }
-                    Alert::TabTitleChanged(title) => {
-                        debug!("Tab title changed for session {}: {:?}", session_info.id, title);
-                        if let Some(t) = title {
-                            let activity = ClaudeActivity::from_title(&t);
-                            let clean = clean_terminal_title(&t);
-                            if !clean.is_empty() {
-                                let display_title = if clean == "Claude Code" { None } else { Some(clean) };
-                                title_activity_changes.push((session_info.id, activity, display_title));
-                            }
-                        }
-                    }
-                    Alert::SetUserVar { name, value } => {
-                        debug!("User var set: {}={}", name, value);
-                    }
-                    Alert::OutputSinceFocusLost => {
-                        debug!("Output since focus lost");
-                    }
-                    _ => {
-                        debug!("Other alert received");
-                    }
-                }
-            }
-        }
-
-        let mut sessions_needing_resolution: Vec<SessionId> = Vec::new();
-        let mut hid_needs_update = false;
-        let active_session_id = self.session_manager.active_session_id();
-        for (session_id, activity, clean_title) in title_activity_changes {
-            if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
-                // Track activity transitions for background notification
-                let was_working = session_info.claude_activity.is_working();
-                let is_background = Some(session_id) != active_session_id;
-
-                // Check what actually changed before updating state
-                let activity_changed = session_info.claude_activity != activity;
-                let title_changed = match &clean_title {
-                    Some(t) => session_info.terminal_title.as_ref() != Some(t),
-                    None => false,
-                };
-
-                // Route title based on activity:
-                // - Title text is always the session name (both working and idle)
-                // - Task comes from the terminal screen content (spinner status line)
-                // - None means "Claude Code" default — don't overwrite existing title
-                if let Some(title) = clean_title {
-                    session_info.terminal_title = Some(title);
-                }
-
-                match activity {
-                    ClaudeActivity::Working => {
-                        // Scan terminal content for the spinner task line.
-                        // If not found (mid-redraw), keep previous task.
-                        let task = {
-                            let session = session_info.session.lock();
-                            session.find_spinner_task()
-                        };
-                        debug!("Session {}: working, task = {:?}", session_id, task);
-                        if task.is_some() {
-                            session_info.current_task = task;
-                        }
-                    }
-                    _ => {
-                        if session_info.current_task.is_some() {
-                            debug!("Session {}: idle, clearing task", session_id);
-                        }
-                        session_info.current_task = None;
-                    }
-                }
-
-                // Detect finished-in-background
-                if was_working && !activity.is_working() && is_background {
-                    session_info.finished_in_background = true;
-                }
-
-                session_info.claude_activity = activity;
-
-                // Only trigger HID update when something actually changed
-                if activity_changed || title_changed {
-                    hid_needs_update = true;
-                }
-
-                if session_info.needs_session_resolution {
-                    sessions_needing_resolution.push(session_id);
-                }
-            }
-        }
-
-        for session_id in sessions_needing_resolution {
-            self.try_resolve_session_id(session_id);
-        }
-
-        crate::update_working_session_count(self.session_manager.working_session_count());
-
-        for session_id in bell_sessions {
-            // Compute HID tab index before mutable borrow
-            let tab_idx = self.session_manager.session_hid_tab_index(session_id);
-            if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
-                if !session_info.hid_alert_active {
-                    if let Some(idx) = tab_idx {
-                        let session_name = session_info.hid_session_name().to_string();
-                        let details = {
-                            let session = session_info.session.lock();
-                            session.extract_prompt_context()
-                        };
-                        self.alert_order_counter += 1;
-                        session_info.alert_order = self.alert_order_counter;
-                        session_info.hid_alert_active = true;
-                        session_info.hid_alert_text = Some("Bell".to_string());
-                        session_info.hid_alert_details = details.clone();
-                        self.pending_actions.push(TerminalAction::HidAlert {
-                            tab: idx,
-                            session: session_name,
-                            text: "Bell".to_string(),
-                            details,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Toast notifications (OSC 9) — Claude asking for permission
-        for (session_id, body) in attention_sessions {
-            let tab_idx = self.session_manager.session_hid_tab_index(session_id);
-            if let Some(session_info) = self.session_manager.get_session_mut(session_id) {
-                if !session_info.hid_alert_active {
-                    if let Some(idx) = tab_idx {
-                        let session_name = session_info.hid_session_name().to_string();
-                        let details = {
-                            let session = session_info.session.lock();
-                            session.extract_prompt_context()
-                        };
-                        self.alert_order_counter += 1;
-                        session_info.alert_order = self.alert_order_counter;
-                        session_info.hid_alert_active = true;
-                        session_info.hid_alert_text = Some(body.clone());
-                        session_info.hid_alert_details = details.clone();
-                        self.pending_actions.push(TerminalAction::HidAlert {
-                            tab: idx,
-                            session: session_name,
-                            text: body,
-                            details,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Periodically rescan task for active working session, even without title changes.
-        // The spinner task line on screen can change independently of OSC title updates.
-        if !hid_needs_update {
-            if let Some(session_info) = self.session_manager.active_session_mut() {
-                if session_info.claude_activity.is_working() {
-                    let task = {
-                        let session = session_info.session.lock();
-                        session.find_spinner_task()
-                    };
-                    if task.is_some() && task != session_info.current_task {
-                        session_info.current_task = task;
-                        hid_needs_update = true;
-                    }
-                }
-            }
-        }
-
-        // Detect Claude Code mode changes for active session
-        if let Some(session_info) = self.session_manager.active_session() {
-            let mode = {
-                let session = session_info.session.lock();
-                session.detect_claude_mode()
-            };
-            if mode != self.detected_mode {
-                self.detected_mode = mode;
-                self.pending_actions.push(TerminalAction::HidSetMode(mode));
-            }
-        }
-
-        // Push HID display update if any tab's state changed
-        if hid_needs_update {
-            if let Some(session_info) = self.session_manager.active_session() {
-                let session_name = session_info.hid_session_name().to_string();
-                let current_task = session_info.current_task.clone();
-                let (tabs, active) = self.session_manager.collect_tab_states();
-                self.pending_actions.push(TerminalAction::HidDisplayUpdate {
-                    session: session_name,
-                    task: current_task,
-                    tabs,
-                    active,
-                });
-            }
-        }
-    }
-
-    /// Process PTY output for a specific session
-    pub fn process_output_for_session(&self, session_id: SessionId, data: &[u8]) {
-        if let Some(session_info) = self.session_manager.get_session(session_id) {
-            debug!("PTY output for session {}: {} bytes", session_id, data.len());
-            let session = session_info.session.lock();
-            session.advance_bytes(data);
-        }
-    }
-
-    /// Process PTY output for active session (legacy compatibility)
-    pub fn process_output(&self, data: &[u8]) {
-        if let Some(session_info) = self.session_manager.active_session() {
-            debug!("PTY output: {} bytes", data.len());
-            let session = session_info.session.lock();
-            session.advance_bytes(data);
-        }
-    }
 }
 
 impl Default for TerminalWindowState {
     fn default() -> Self {
         Self::new(17.0)
     }
-}
-
-/// Clean terminal title by removing leading symbols/emojis
-fn clean_terminal_title(title: &str) -> String {
-    title
-        .trim_start_matches(|c: char| !c.is_alphanumeric())
-        .trim()
-        .to_string()
 }
