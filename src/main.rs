@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use winit::{
     application::ApplicationHandler,
@@ -432,7 +432,7 @@ impl App {
                 let current_task = session.current_task.clone();
                 let (tabs, active) = self.terminal_window.session_manager.collect_tab_states();
                 if let Err(e) = hid.send_display_update(&session_name, current_task.as_deref(), &tabs, active) {
-                    error!("Failed to send HID display update: {}", e);
+                    debug!("Failed to send HID display update: {}", e);
                 }
             }
         }
@@ -451,7 +451,7 @@ impl App {
                 if let Some(idx) = hid_tab_idx {
                     if let Some(ref hid) = self.hid_manager {
                         if let Err(e) = hid.clear_alert(idx) {
-                            error!("Failed to clear HID alert on input: {}", e);
+                            debug!("Failed to clear HID alert on input: {}", e);
                         }
                     }
                 }
@@ -574,7 +574,7 @@ impl App {
                         if let Some(idx) = hid_tab_idx {
                             if let Some(ref hid) = self.hid_manager {
                                 if let Err(e) = hid.clear_alert(idx) {
-                                    error!("Failed to clear HID alert on tab switch: {}", e);
+                                    debug!("Failed to clear HID alert on tab switch: {}", e);
                                 }
                             }
                         }
@@ -841,21 +841,21 @@ impl App {
             TerminalAction::HidDisplayUpdate { session, task, tabs, active } => {
                 if let Some(ref hid) = self.hid_manager {
                     if let Err(e) = hid.send_display_update(&session, task.as_deref(), &tabs, active) {
-                        error!("Failed to send HID display update: {}", e);
+                        debug!("Failed to send HID display update: {}", e);
                     }
                 }
             }
             TerminalAction::HidAlert { tab, session, text, details } => {
                 if let Some(ref hid) = self.hid_manager {
                     if let Err(e) = hid.send_alert(tab, &session, &text, details.as_deref()) {
-                        error!("Failed to send HID alert: {}", e);
+                        debug!("Failed to send HID alert: {}", e);
                     }
                 }
             }
             TerminalAction::HidClearAlert(tab) => {
                 if let Some(ref hid) = self.hid_manager {
                     if let Err(e) = hid.clear_alert(tab) {
-                        error!("Failed to clear HID alert: {}", e);
+                        debug!("Failed to clear HID alert: {}", e);
                     }
                 }
             }
@@ -875,8 +875,10 @@ impl App {
                 if let Some(ref mut tray) = self.tray_manager {
                     tray.set_connected(true);
                 }
-                // Send initial display state to the newly connected device
-                self.send_hid_for_active_session();
+                // Send initial display state to the newly connected device (only if window is shown)
+                if self.terminal_window.is_visible() {
+                    self.send_hid_for_active_session();
+                }
             }
             AppEvent::HidDisconnected => {
                 info!("HID device disconnected");
