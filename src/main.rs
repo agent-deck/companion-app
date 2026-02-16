@@ -428,7 +428,7 @@ impl App {
     fn send_hid_for_active_session(&self) {
         if let Some(ref hid) = self.hid_manager {
             if let Some(session) = self.terminal_window.session_manager.active_session() {
-                let session_name = session.terminal_title.clone().unwrap_or_default();
+                let session_name = session.hid_session_name().to_string();
                 let current_task = session.current_task.clone();
                 let (tabs, active) = self.terminal_window.session_manager.collect_tab_states();
                 if let Err(e) = hid.send_display_update(&session_name, current_task.as_deref(), &tabs, active) {

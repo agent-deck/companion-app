@@ -1695,7 +1695,7 @@ impl TerminalWindowState {
         // Push HID display update if any tab's state changed
         if hid_needs_update {
             if let Some(session_info) = self.session_manager.active_session() {
-                let session_name = session_info.terminal_title.clone().unwrap_or_default();
+                let session_name = session_info.hid_session_name().to_string();
                 let current_task = session_info.current_task.clone();
                 let (tabs, active) = self.session_manager.collect_tab_states();
                 self.pending_actions.push(TerminalAction::HidDisplayUpdate {

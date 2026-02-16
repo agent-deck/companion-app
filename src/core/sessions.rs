@@ -141,6 +141,15 @@ impl SessionInfo {
         self.title = title;
     }
 
+    /// Get the session name for HID display.
+    /// Prefers the terminal-set title (Claude session name); falls back to directory name.
+    pub fn hid_session_name(&self) -> &str {
+        self.terminal_title
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .unwrap_or(&self.title)
+    }
+
     /// Get the display title (truncated if necessary)
     pub fn display_title(&self, max_len: usize) -> String {
         if self.title.len() <= max_len {
