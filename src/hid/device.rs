@@ -582,9 +582,10 @@ impl HidManager {
         Ok(())
     }
 
-    /// Read and discard response packets, dispatching any state reports
+    /// Read and discard response packets, forwarding key/string events but NOT state reports.
+    /// State reports from command confirmations are consumed silently — the reader thread
+    /// handles device-initiated state reports (button presses, YOLO switch).
     fn drain_response(&self, device: &HidDevice) {
-        // Read up to a few packets, forwarding any device-initiated packets
         let mut type_string_buf = Vec::new();
         for _ in 0..3 {
             match read_raw_packet(device, 50) {
@@ -596,7 +597,9 @@ impl HidManager {
                             | Some(HidCommand::TypeString)
                             | Some(HidCommand::Ping)
                     );
-                    if is_device_initiated {
+                    // Forward key/string/ping events but skip StateReport —
+                    // it's a confirmation echo, not a user action
+                    if is_device_initiated && pkt.command() != Some(HidCommand::StateReport) {
                         dispatch_incoming_packet(&pkt, &self.event_tx, &mut type_string_buf);
                     }
                     // If this is END packet of a response, we're done

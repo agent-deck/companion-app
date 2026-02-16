@@ -423,16 +423,25 @@ impl App {
         info!("Claude stopped for session {}", session_id);
     }
 
-    /// Send HID display update for the currently active session.
+    /// Send HID display update and mode for the currently active session.
     /// Called whenever the active tab changes (switch, close, new tab, etc.)
-    fn send_hid_for_active_session(&self) {
-        if let Some(ref hid) = self.hid_manager {
-            if let Some(session) = self.terminal_window.session_manager.active_session() {
-                let session_name = session.hid_session_name().to_string();
-                let current_task = session.current_task.clone();
-                let (tabs, active) = self.terminal_window.session_manager.collect_tab_states();
+    fn send_hid_for_active_session(&mut self) {
+        if let Some(session) = self.terminal_window.session_manager.active_session() {
+            let session_name = session.hid_session_name().to_string();
+            let current_task = session.current_task.clone();
+            let mode = {
+                let s = session.session.lock();
+                s.detect_claude_mode()
+            };
+            let (tabs, active) = self.terminal_window.session_manager.collect_tab_states();
+            if let Some(ref hid) = self.hid_manager {
                 if let Err(e) = hid.send_display_update(&session_name, current_task.as_deref(), &tabs, active) {
                     debug!("Failed to send HID display update: {}", e);
+                }
+                self.terminal_window.detected_mode = mode;
+                self.terminal_window.last_device_reported_mode = Some(mode);
+                if let Err(e) = hid.set_mode(mode) {
+                    debug!("Failed to set HID mode: {}", e);
                 }
             }
         }
@@ -541,7 +550,7 @@ impl App {
                 self.terminal_window.update_window_title();
                 // Save tabs after closing
                 self.save_tabs();
-                // Send HID update for newly active tab
+                // Send HID update and mode for newly active tab
                 self.send_hid_for_active_session();
 
                 // Start PTY for newly active session if needed (lazy loading)
@@ -584,7 +593,7 @@ impl App {
                 // Update window title to reflect active tab
                 self.terminal_window.update_window_title();
 
-                // Send HID display update for the newly active session
+                // Send HID display update and mode for the newly active session
                 self.send_hid_for_active_session();
 
                 // Update recent sessions menu for the new active tab's directory
@@ -861,6 +870,9 @@ impl App {
             }
             TerminalAction::HidSetMode(mode) => {
                 if let Some(ref hid) = self.hid_manager {
+                    // Update last known device mode so the confirmation StateReport
+                    // is recognized as a repeat (not a button press)
+                    self.terminal_window.last_device_reported_mode = Some(mode);
                     if let Err(e) = hid.set_mode(mode) {
                         debug!("Failed to set HID mode: {}", e);
                     }
@@ -1044,6 +1056,19 @@ impl App {
                 }
                 self.terminal_window.device_yolo = yolo;
                 self.terminal_window.update_window_title();
+
+                // Send Shift+Tab only when the device mode actually changed since
+                // the last report (i.e., user pressed the mode button on the device).
+                // Ignore confirmations from our SetMode commands and repeated reports.
+                let prev_device_mode = self.terminal_window.last_device_reported_mode;
+                self.terminal_window.last_device_reported_mode = Some(mode);
+                if prev_device_mode.is_some() && prev_device_mode != Some(mode) {
+                    if let Some(session) = self.terminal_window.session_manager.active_session() {
+                        if session.is_running {
+                            self.terminal_window.send_to_session_pty(session.id, b"\x1b[Z");
+                        }
+                    }
+                }
             }
             AppEvent::HidKeyEvent { keycode } => {
                 // Resolve target: oldest alerting session (if any), and fallback to active

@@ -131,7 +131,9 @@ pub struct TerminalWindowState {
     /// Device YOLO mode state
     pub device_yolo: bool,
     /// Last detected Claude Code mode (to send updates only on change)
-    detected_mode: DeviceMode,
+    pub detected_mode: DeviceMode,
+    /// Last mode reported by the device (to detect actual button presses vs confirmations)
+    pub last_device_reported_mode: Option<DeviceMode>,
     /// Whether window should be visible
     visible: Arc<AtomicBool>,
     /// Whether the window currently has focus
@@ -220,6 +222,7 @@ impl TerminalWindowState {
             hid_connected: false,
             device_yolo: false,
             detected_mode: DeviceMode::Default,
+            last_device_reported_mode: None,
             visible: Arc::new(AtomicBool::new(false)),
             window_focused: false,
             window_id: None,
