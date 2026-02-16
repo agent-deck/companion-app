@@ -6,6 +6,7 @@
 use crate::core::settings::{Settings, MAX_FONT_SIZE, MIN_FONT_SIZE};
 use crate::hid::keycodes::{self, QmkKeycode};
 use crate::hid::soft_keys::{self, is_builtin_preset_name, KeycodeEntry, PresetManager, SoftKeyEditState};
+use super::glyph_cache::BASE_DPI;
 
 /// Which settings tab is active
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,12 +265,34 @@ pub fn render_settings_modal(
             // Reserve all remaining space so the window doesn't shrink
             let available = ui.available_size();
             ui.allocate_ui(available, |ui| {
+                // Sticky bottom buttons
+                let mut btn_result = SettingsModalResult::None;
+                egui::TopBottomPanel::bottom("settings_buttons")
+                    .frame(
+                        egui::Frame::default()
+                            .fill(egui::Color32::TRANSPARENT)
+                            .inner_margin(egui::Margin { left: 0.0, right: 0.0, top: 0.0, bottom: 4.0 }),
+                    )
+                    .show_inside(ui, |ui| {
+                        ui.separator();
+                        ui.add_space(4.0);
+                        btn_result = render_bottom_buttons(ui, modal, hid_connected);
+                    });
+
+                if btn_result != SettingsModalResult::None {
+                    result = btn_result;
+                }
+
+                // Tab content fills remaining space
                 match modal.active_tab {
                     SettingsTab::General => {
-                        result = render_general_tab(ui, modal);
+                        render_general_content(ui, modal);
                     }
                     SettingsTab::SoftKeys => {
-                        result = render_soft_keys_tab(ui, modal, hid_connected);
+                        let tab_result = render_soft_keys_content(ui, modal, hid_connected);
+                        if tab_result != SettingsModalResult::None {
+                            result = tab_result;
+                        }
                     }
                 }
             });
@@ -284,10 +307,8 @@ pub fn render_settings_modal(
     result
 }
 
-/// Render the General settings tab
-fn render_general_tab(ui: &mut egui::Ui, modal: &mut SettingsModal) -> SettingsModalResult {
-    let mut result = SettingsModalResult::None;
-
+/// Render the General settings tab content (no buttons — those are in the sticky bottom panel)
+fn render_general_content(ui: &mut egui::Ui, modal: &mut SettingsModal) {
     ui.add_space(10.0);
 
     // Font Family
@@ -329,6 +350,31 @@ fn render_general_tab(ui: &mut egui::Ui, modal: &mut SettingsModal) -> SettingsM
 
     ui.add_space(20.0);
 
+    // Font preview
+    ui.label(
+        egui::RichText::new("Preview:")
+            .size(12.0)
+            .color(egui::Color32::GRAY),
+    );
+    ui.add_space(4.0);
+    // Scale to match WezTerm glyph cache rasterization DPI vs standard 72 PPI
+    let preview_font_size = modal.working_settings.font_size * (BASE_DPI as f32 / 72.0);
+    egui::Frame::default()
+        .fill(egui::Color32::from_gray(30))
+        .rounding(4.0)
+        .inner_margin(egui::Margin::same(12.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let font = egui::FontId::monospace(preview_font_size);
+            let text_color = egui::Color32::from_gray(200);
+            ui.label(egui::RichText::new("$ echo \"Hello, World!\"").font(font.clone()).color(text_color));
+            ui.label(egui::RichText::new("Hello, World!").font(font.clone()).color(egui::Color32::from_gray(140)));
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new("ABCDEFGHIJKLM 0123456789").font(font).color(text_color));
+        });
+
+    ui.add_space(15.0);
+
     // Color theme hint
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
@@ -349,40 +395,15 @@ fn render_general_tab(ui: &mut egui::Ui, modal: &mut SettingsModal) -> SettingsM
                 .color(egui::Color32::GRAY),
         );
     });
-
-    ui.add_space(15.0);
-
-    // Buttons
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("Cancel").clicked() {
-                modal.close();
-                result = SettingsModalResult::Cancel;
-            }
-
-            if ui
-                .add_enabled(modal.is_modified(), egui::Button::new("Apply"))
-                .clicked()
-            {
-                modal.is_open = false;
-                result = SettingsModalResult::Apply(modal.working_settings.clone());
-            }
-        });
-    });
-
-    result
 }
 
-/// Render the Soft Keys configuration tab
-fn render_soft_keys_tab(
+/// Render the Soft Keys tab content (no buttons — those are in the sticky bottom panel)
+fn render_soft_keys_content(
     ui: &mut egui::Ui,
     modal: &mut SettingsModal,
     hid_connected: bool,
 ) -> SettingsModalResult {
-    let mut result = SettingsModalResult::None;
-
     if !hid_connected {
-        // Show "not connected" message
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
             ui.label(
@@ -391,16 +412,7 @@ fn render_soft_keys_tab(
                     .color(egui::Color32::GRAY),
             );
         });
-        ui.add_space(20.0);
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Cancel").clicked() {
-                    modal.close();
-                    result = SettingsModalResult::Cancel;
-                }
-            });
-        });
-        return result;
+        return SettingsModalResult::None;
     }
 
     // Check if we need to request data from device
@@ -424,7 +436,7 @@ fn render_soft_keys_tab(
                 modal.soft_keys_error = None;
             }
         });
-        return result;
+        return SettingsModalResult::None;
     }
 
     // Show loading if not yet loaded
@@ -439,7 +451,7 @@ fn render_soft_keys_tab(
                     .color(egui::Color32::GRAY),
             );
         });
-        return result;
+        return SettingsModalResult::None;
     }
 
     // We have soft keys loaded — render editors
@@ -452,54 +464,163 @@ fn render_soft_keys_tab(
     ui.add_space(6.0);
     ui.separator();
 
-    // Soft key editors in scroll area
+    // Soft key editors in scroll area (fills remaining space)
     let mut capturing = modal.capturing_key;
     egui::ScrollArea::vertical()
-        .max_height(280.0)
         .show(ui, |ui| {
             let keys = modal.soft_keys.as_mut().unwrap();
             for i in 0..3 {
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.group(|ui| {
                     ui.set_min_width(ui.available_width() - 4.0);
+                    ui.add_space(4.0);
                     render_soft_key_editor(ui, i, &mut keys[i], &mut capturing);
+                    ui.add_space(4.0);
                 });
             }
-            ui.add_space(4.0);
+            ui.add_space(8.0);
         });
     modal.capturing_key = capturing;
 
-    ui.add_space(4.0);
+    SettingsModalResult::None
+}
 
-    // Bottom buttons
+/// Render the sticky bottom buttons based on active tab and state
+fn render_bottom_buttons(
+    ui: &mut egui::Ui,
+    modal: &mut SettingsModal,
+    hid_connected: bool,
+) -> SettingsModalResult {
+    let mut result = SettingsModalResult::None;
+    let soft_keys_loaded =
+        hid_connected && modal.soft_keys.is_some() && modal.soft_keys_error.is_none();
+
     ui.horizontal(|ui| {
-        if ui.button("Reset to Defaults").clicked() {
-            result = SettingsModalResult::ResetSoftKeys;
+        // Left-aligned: Reset to Defaults (only for soft keys when loaded)
+        if modal.active_tab == SettingsTab::SoftKeys && soft_keys_loaded {
+            if ui.button("Reset to Defaults").clicked() {
+                result = SettingsModalResult::ResetSoftKeys;
+            }
         }
 
+        // Right-aligned buttons
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("Cancel").clicked() {
                 modal.close();
                 result = SettingsModalResult::Cancel;
             }
 
-            if ui
-                .add_enabled(
-                    modal.soft_keys_modified(),
-                    egui::Button::new("Apply to Device"),
-                )
-                .clicked()
-            {
-                if let Some(ref keys) = modal.soft_keys {
-                    result = SettingsModalResult::ApplySoftKeys(keys.clone());
-                    // Update original to reflect saved state
-                    modal.original_soft_keys = modal.soft_keys.clone();
+            match modal.active_tab {
+                SettingsTab::General => {
+                    if ui
+                        .add_enabled(modal.is_modified(), egui::Button::new("Apply"))
+                        .clicked()
+                    {
+                        modal.is_open = false;
+                        result = SettingsModalResult::Apply(modal.working_settings.clone());
+                    }
                 }
+                SettingsTab::SoftKeys if soft_keys_loaded => {
+                    if ui
+                        .add_enabled(
+                            modal.soft_keys_modified(),
+                            egui::Button::new("Apply to Device"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(ref keys) = modal.soft_keys {
+                            result = SettingsModalResult::ApplySoftKeys(keys.clone());
+                            modal.original_soft_keys = modal.soft_keys.clone();
+                        }
+                    }
+                }
+                _ => {}
             }
         });
     });
 
     result
+}
+
+/// Render a segmented control (horizontal radio buttons with pill outline)
+fn segmented_control(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    selected: &mut usize,
+    options: &[&str],
+) {
+    let rounding = 5.0;
+    let height = 22.0;
+    let segment_width = 72.0;
+    let total_width = segment_width * options.len() as f32;
+
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(total_width, height),
+        egui::Sense::hover(),
+    );
+
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let painter = ui.painter();
+    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    let seg_w = rect.width() / options.len() as f32;
+
+    for (i, label) in options.iter().enumerate() {
+        let x = rect.min.x + i as f32 * seg_w;
+        let seg_rect = egui::Rect::from_min_size(
+            egui::pos2(x, rect.min.y),
+            egui::vec2(seg_w, height),
+        );
+
+        let is_selected = *selected == i;
+
+        // Selected fill with position-aware rounding
+        if is_selected {
+            let fill_rounding = if options.len() == 1 {
+                egui::Rounding::same(rounding)
+            } else if i == 0 {
+                egui::Rounding { nw: rounding, sw: rounding, ne: 0.0, se: 0.0 }
+            } else if i == options.len() - 1 {
+                egui::Rounding { nw: 0.0, sw: 0.0, ne: rounding, se: rounding }
+            } else {
+                egui::Rounding::ZERO
+            };
+            painter.rect_filled(seg_rect, fill_rounding, ui.visuals().selection.bg_fill);
+        }
+
+        // Vertical separator between segments
+        if i > 0 {
+            painter.line_segment(
+                [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                stroke,
+            );
+        }
+
+        // Label
+        painter.text(
+            seg_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            *label,
+            egui::FontId::proportional(11.0),
+            if is_selected {
+                ui.visuals().strong_text_color()
+            } else {
+                ui.visuals().text_color()
+            },
+        );
+
+        // Click handling
+        let id = ui.id().with(id_salt).with(i);
+        let response = ui.interact(seg_rect, id, egui::Sense::click());
+        if response.clicked() && !is_selected {
+            *selected = i;
+        }
+    }
+
+    // Outer pill border
+    painter.rect_stroke(rect, egui::Rounding::same(rounding), stroke);
 }
 
 /// Render editor for a single soft key
@@ -518,17 +639,15 @@ fn render_soft_key_editor(
 
         ui.add_space(8.0);
 
-        // Type selector
+        // Type selector (segmented control)
         let current_type_idx = key.type_index();
         let mut selected_type = current_type_idx;
-        egui::ComboBox::from_id_salt(format!("sk_type_{}", index))
-            .selected_text(SOFT_KEY_TYPE_NAMES[current_type_idx])
-            .width(90.0)
-            .show_ui(ui, |ui| {
-                for (i, name) in SOFT_KEY_TYPE_NAMES.iter().enumerate() {
-                    ui.selectable_value(&mut selected_type, i, *name);
-                }
-            });
+        segmented_control(
+            ui,
+            &format!("sk_type_{}", index),
+            &mut selected_type,
+            &SOFT_KEY_TYPE_NAMES,
+        );
 
         if selected_type != current_type_idx {
             *key = SoftKeyEditState::default_for_type(selected_type);
@@ -536,7 +655,7 @@ fn render_soft_key_editor(
         }
     });
 
-    ui.add_space(4.0);
+    ui.add_space(8.0);
 
     // Type-specific editor
     match key {

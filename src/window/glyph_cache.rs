@@ -82,6 +82,9 @@ pub struct GlyphCache {
 /// Default font size used by WezTerm's config
 const WEZTERM_DEFAULT_FONT_SIZE: f64 = 12.0;
 
+/// Base DPI used for glyph rasterization (Windows/Linux standard)
+pub const BASE_DPI: f64 = 96.0;
+
 impl GlyphCache {
     /// Create a new glyph cache with the specified scale factor and font size
     ///
@@ -94,7 +97,7 @@ impl GlyphCache {
         // We use 96 as base and multiply by scale factor for physical pixel rendering
         // Scale DPI by (desired_font_size / wezterm_default_font_size) to achieve the right size
         let font_scale = font_size as f64 / WEZTERM_DEFAULT_FONT_SIZE;
-        let dpi = (96.0 * scale_factor * font_scale) as usize;
+        let dpi = (BASE_DPI * scale_factor * font_scale) as usize;
         debug!(
             "Creating GlyphCache with scale_factor={}, font_size={}, DPI={}",
             scale_factor, font_size, dpi

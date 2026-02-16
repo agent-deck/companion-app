@@ -11,7 +11,7 @@ pub mod settings_modal;
 mod terminal;
 
 pub use context_menu::{render_context_menu, ContextMenuState};
-pub use glyph_cache::{GlyphCache, StyleKey};
+pub use glyph_cache::{GlyphCache, StyleKey, BASE_DPI};
 pub use input::{build_arrow_seq, build_f1_f4_seq, build_home_end_seq, build_tilde_seq, encode_modifiers, open_url};
 pub use new_tab::{render_new_tab_page, NewTabAction};
 pub use render::{
