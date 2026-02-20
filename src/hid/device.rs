@@ -6,7 +6,7 @@ use super::protocol::{
     PACKET_SIZE,
 };
 use crate::core::config::HidConfig;
-use crate::core::events::AppEvent;
+use crate::core::events::{AppEvent, EventSender};
 use anyhow::{anyhow, Context, Result};
 use hidapi::{HidApi, HidDevice};
 use parking_lot::Mutex;
@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 #[cfg(target_os = "macos")]
@@ -38,8 +37,8 @@ pub struct HidManager {
     device: Arc<Mutex<Option<HidDevice>>>,
     /// Configuration
     config: HidConfig,
-    /// Event sender for status updates
-    event_tx: mpsc::UnboundedSender<AppEvent>,
+    /// Event sender for status updates (wakes event loop)
+    event_tx: EventSender,
     /// Whether currently connected
     connected: Arc<AtomicBool>,
     /// Whether the monitor thread should stop
@@ -53,7 +52,7 @@ pub struct HidManager {
 
 impl HidManager {
     /// Create a new HID manager
-    pub fn new(config: HidConfig, event_tx: mpsc::UnboundedSender<AppEvent>) -> Result<Self> {
+    pub fn new(config: HidConfig, event_tx: EventSender) -> Result<Self> {
         let api = HidApi::new().context("Failed to initialize HID API")?;
 
         let mut manager = Self {
@@ -92,9 +91,9 @@ impl HidManager {
 
     /// Start macOS IOKit hotplug watcher
     #[cfg(target_os = "macos")]
-    fn start_macos_hotplug(&mut self, config: HidConfig, _event_tx: mpsc::UnboundedSender<AppEvent>) {
+    fn start_macos_hotplug(&mut self, config: HidConfig, _event_tx: EventSender) {
         // Create channel for hotplug events
-        let (hotplug_tx, mut hotplug_rx) = mpsc::unbounded_channel();
+        let (hotplug_tx, mut hotplug_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Start the IOKit watcher
         match HotplugWatcher::new(config.vendor_id, config.product_id, hotplug_tx) {
@@ -714,7 +713,7 @@ fn read_raw_packet(device: &HidDevice, timeout_ms: i32) -> Result<Option<HidPack
 fn read_response(
     device: &HidDevice,
     expected_cmd: HidCommand,
-    event_tx: &mpsc::UnboundedSender<AppEvent>,
+    event_tx: &EventSender,
 ) -> Result<ResponsePacket> {
     let mut payload = Vec::new();
     let mut got_start = false;
@@ -801,7 +800,7 @@ fn read_response(
 /// `type_string_buf` accumulates chunked TypeString payloads across calls.
 fn dispatch_incoming_packet(
     pkt: &HidPacket,
-    event_tx: &mpsc::UnboundedSender<AppEvent>,
+    event_tx: &EventSender,
     type_string_buf: &mut Vec<u8>,
 ) {
     match pkt.command() {

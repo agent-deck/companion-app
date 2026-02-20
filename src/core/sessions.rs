@@ -324,6 +324,11 @@ impl SessionManager {
     }
 
     /// Check if any sessions have Claude actively working
+    /// Check if any sessions have an active PTY process
+    pub fn has_running_sessions(&self) -> bool {
+        self.sessions.iter().any(|s| s.is_running)
+    }
+
     pub fn has_working_sessions(&self) -> bool {
         self.sessions.iter().any(|s| s.claude_activity.is_working())
     }

@@ -1,9 +1,8 @@
 //! Tray menu management
 
-use crate::core::events::AppEvent;
+use crate::core::events::{AppEvent, EventSender};
 use super::icon::TrayIcon;
 use anyhow::{Context, Result};
-use tokio::sync::mpsc;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
     TrayIcon as TrayIconHandle, TrayIconBuilder,
@@ -27,8 +26,8 @@ pub struct TrayManager {
     tray: TrayIconHandle,
     /// Icons for connected/disconnected states
     icons: TrayIcon,
-    /// Event sender
-    event_tx: mpsc::UnboundedSender<AppEvent>,
+    /// Event sender (wakes event loop)
+    event_tx: EventSender,
     /// Toggle window menu item (for dynamic text updates)
     toggle_item: MenuItem,
     /// Toggle menu item ID
@@ -41,7 +40,7 @@ pub struct TrayManager {
 
 impl TrayManager {
     /// Create a new tray manager
-    pub fn new(event_tx: mpsc::UnboundedSender<AppEvent>) -> Result<Self> {
+    pub fn new(event_tx: EventSender) -> Result<Self> {
         // Load icons
         let icons = TrayIcon::new().context("Failed to load tray icons")?;
 

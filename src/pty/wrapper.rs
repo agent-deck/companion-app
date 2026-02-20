@@ -2,14 +2,14 @@
 
 use crate::core::claude_sessions::get_session_count;
 use crate::core::config::ClaudeConfig;
-use crate::core::events::AppEvent;
+use crate::core::events::{AppEvent, EventSender};
 use crate::core::sessions::SessionId;
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use parking_lot::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -19,8 +19,8 @@ pub struct PtyWrapper {
     master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     /// Writer to PTY
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
-    /// Event sender
-    event_tx: mpsc::UnboundedSender<AppEvent>,
+    /// Event sender (wakes event loop)
+    event_tx: EventSender,
     /// Configuration
     config: ClaudeConfig,
     /// Whether process is running
@@ -38,11 +38,13 @@ pub struct PtyWrapper {
     is_new_session: bool,
     /// COLORFGBG value to set in environment (for background color detection)
     colorfgbg: Option<String>,
+    /// Login shell environment captured at startup
+    login_env: Arc<HashMap<String, String>>,
 }
 
 impl PtyWrapper {
     /// Create a new PTY wrapper
-    pub fn new(config: ClaudeConfig, event_tx: mpsc::UnboundedSender<AppEvent>) -> Self {
+    pub fn new(config: ClaudeConfig, event_tx: EventSender, login_env: Arc<HashMap<String, String>>) -> Self {
         Self {
             master: Arc::new(Mutex::new(None)),
             writer: Arc::new(Mutex::new(None)),
@@ -54,6 +56,7 @@ impl PtyWrapper {
             resume_session: None,
             is_new_session: false,
             colorfgbg: None,
+            login_env,
         }
     }
 
@@ -65,12 +68,13 @@ impl PtyWrapper {
     /// * `colorfgbg` - COLORFGBG env var value for background color detection
     pub fn new_with_cwd(
         config: ClaudeConfig,
-        event_tx: mpsc::UnboundedSender<AppEvent>,
+        event_tx: EventSender,
         working_directory: PathBuf,
         session_id: SessionId,
         resume_session: Option<String>,
         is_new_session: bool,
         colorfgbg: Option<String>,
+        login_env: Arc<HashMap<String, String>>,
     ) -> Self {
         Self {
             master: Arc::new(Mutex::new(None)),
@@ -83,6 +87,7 @@ impl PtyWrapper {
             resume_session,
             is_new_session,
             colorfgbg,
+            login_env,
         }
     }
 
@@ -153,35 +158,19 @@ impl PtyWrapper {
             cmd.cwd(cwd);
         }
 
-        // Set TERM for color support
+        // Apply login shell environment (captures user's PATH, LANG, etc.)
+        // This must come before TERM/COLORTERM/COLORFGBG so our overrides take precedence.
+        for (key, value) in self.login_env.iter() {
+            cmd.env(key, value);
+        }
+
+        // Set TERM for color support (override login env values)
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
 
         // Set COLORFGBG for background color detection (used by programs like Claude Code)
         if let Some(ref colorfgbg) = self.colorfgbg {
             cmd.env("COLORFGBG", colorfgbg);
-        }
-
-        // On macOS, apps launched from Finder don't inherit the shell's PATH.
-        // Add common installation directories to ensure we can find claude and other tools.
-        #[cfg(target_os = "macos")]
-        {
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            let home = std::env::var("HOME").unwrap_or_default();
-            let mut paths = vec![
-                "/opt/homebrew/bin".to_string(),
-                "/opt/homebrew/sbin".to_string(),
-                "/usr/local/bin".to_string(),
-                "/usr/local/sbin".to_string(),
-                // Common npm global paths
-                format!("{}/.npm-global/bin", home),
-                // Claude Code local install
-                format!("{}/.claude/local", home),
-            ];
-            if !current_path.is_empty() {
-                paths.push(current_path);
-            }
-            cmd.env("PATH", paths.join(":"));
         }
 
         info!("Starting Claude CLI: {} {:?}", cli_path, self.config.default_args);
@@ -442,11 +431,17 @@ fn strip_ansi_codes(s: &str) -> String {
 mod tests {
     use super::*;
 
+    // Note: This test requires an EventLoop which can only be created on the main
+    // thread on macOS. It is kept as an ignored test and can be run manually.
     #[test]
+    #[ignore]
     fn test_pty_wrapper_creation() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let event_loop = winit::event_loop::EventLoop::new().unwrap();
+        let proxy = event_loop.create_proxy();
+        let sender = EventSender::new(tx, proxy);
         let config = ClaudeConfig::default();
-        let wrapper = PtyWrapper::new(config, tx);
+        let wrapper = PtyWrapper::new(config, sender, Arc::new(HashMap::new()));
 
         assert!(!wrapper.is_running());
     }

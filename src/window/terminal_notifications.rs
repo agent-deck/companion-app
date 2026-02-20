@@ -278,6 +278,12 @@ impl TerminalWindowState {
                     .push(TerminalAction::HidSetMode(mode));
             }
         }
+        // Clear stale mode suppression (safety net in case confirmation never arrives)
+        if let Some(sent_at) = self.mode_set_from_app_at {
+            if sent_at.elapsed() > std::time::Duration::from_secs(2) {
+                self.mode_set_from_app_at = None;
+            }
+        }
 
         // Push HID display update if any tab's state changed
         if hid_needs_update {

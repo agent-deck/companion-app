@@ -1,11 +1,34 @@
 //! Application event definitions
 
 use super::sessions::SessionId;
-use crate::hid::protocol::{DeviceMode};
-use crate::hotkey::HotkeyType;
+use crate::hid::protocol::DeviceMode;
 #[cfg(target_os = "macos")]
 use crate::macos::MenuAction;
 use crate::tray::TrayAction;
+use tokio::sync::mpsc;
+use winit::event_loop::EventLoopProxy;
+
+/// Wrapper around `mpsc::UnboundedSender<AppEvent>` that also wakes the winit
+/// event loop via `EventLoopProxy::wake_up()` after every send.  This allows
+/// switching from `ControlFlow::Poll` to `ControlFlow::Wait` without losing
+/// responsiveness to background events (PTY output, HID, tray).
+#[derive(Clone)]
+pub struct EventSender {
+    tx: mpsc::UnboundedSender<AppEvent>,
+    proxy: EventLoopProxy<()>,
+}
+
+impl EventSender {
+    pub fn new(tx: mpsc::UnboundedSender<AppEvent>, proxy: EventLoopProxy<()>) -> Self {
+        Self { tx, proxy }
+    }
+
+    pub fn send(&self, event: AppEvent) -> Result<(), mpsc::error::SendError<AppEvent>> {
+        let result = self.tx.send(event);
+        let _ = self.proxy.send_event(());
+        result
+    }
+}
 
 /// Application-wide events for inter-module communication
 #[derive(Debug, Clone)]
@@ -15,9 +38,6 @@ pub enum AppEvent {
 
     /// HID device disconnected
     HidDisconnected,
-
-    /// Global hotkey was pressed
-    HotkeyPressed(HotkeyType),
 
     /// Tray menu action triggered
     TrayAction(TrayAction),
