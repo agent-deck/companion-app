@@ -439,6 +439,29 @@ pub fn from_egui_key(key: egui::Key) -> Option<QmkKeycode> {
     }
 }
 
+/// Map a QMK keycode (u16, with modifier bits) to an egui::Key (ignoring modifiers).
+/// Returns None for keycodes that have no egui equivalent.
+pub fn qmk_keycode_to_egui_key(keycode: u16) -> Option<egui::Key> {
+    let (base_key, _mods) = decompose_keycode(keycode);
+    let base = base_key?;
+    match base {
+        QmkKeycode::Up => Some(egui::Key::ArrowUp),
+        QmkKeycode::Down => Some(egui::Key::ArrowDown),
+        QmkKeycode::Left => Some(egui::Key::ArrowLeft),
+        QmkKeycode::Right => Some(egui::Key::ArrowRight),
+        QmkKeycode::Enter => Some(egui::Key::Enter),
+        QmkKeycode::Escape => Some(egui::Key::Escape),
+        QmkKeycode::Backspace => Some(egui::Key::Backspace),
+        QmkKeycode::Tab => Some(egui::Key::Tab),
+        QmkKeycode::Space => Some(egui::Key::Space),
+        QmkKeycode::Home => Some(egui::Key::Home),
+        QmkKeycode::End => Some(egui::Key::End),
+        QmkKeycode::PageUp => Some(egui::Key::PageUp),
+        QmkKeycode::PageDown => Some(egui::Key::PageDown),
+        _ => None,
+    }
+}
+
 /// Map egui::Modifiers to KeyModifiers
 pub fn from_egui_modifiers(mods: &egui::Modifiers) -> KeyModifiers {
     KeyModifiers {

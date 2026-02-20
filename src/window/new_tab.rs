@@ -166,6 +166,7 @@ pub fn render_new_tab_page(
     bookmark_manager: &BookmarkManager,
     color_scheme: ColorScheme,
     session_id: usize,
+    hid_nav_keys: &mut Vec<egui::Key>,
 ) -> Option<NewTabAction> {
     let fg_color = color_scheme.foreground();
 
@@ -187,12 +188,15 @@ pub fn render_new_tab_page(
         .collect();
     cache.preload(&all_paths);
 
+    // Drain HID navigation keys into the nav state before rendering
+    let drained_hid_keys: Vec<egui::Key> = hid_nav_keys.drain(..).collect();
+
     let action = match state.clone() {
         NewTabState::SelectDirectory => {
-            render_directory_selection(ui, bookmark_manager, color_scheme, fg_color, &mut cache, &mut state, &mut nav)
+            render_directory_selection(ui, bookmark_manager, color_scheme, fg_color, &mut cache, &mut state, &mut nav, &drained_hid_keys)
         }
         NewTabState::SelectSession { path, sessions, last_refresh } => {
-            render_session_selection(ui, color_scheme, fg_color, &path, &sessions, last_refresh, &mut state, &mut nav)
+            render_session_selection(ui, color_scheme, fg_color, &path, &sessions, last_refresh, &mut state, &mut nav, &drained_hid_keys)
         }
     };
 
@@ -213,6 +217,7 @@ fn render_directory_selection(
     cache: &mut DirectoryInfoCache,
     state: &mut NewTabState,
     nav: &mut KeyboardNavState,
+    hid_keys: &[egui::Key],
 ) -> Option<NewTabAction> {
     let mut action = None;
 
@@ -248,40 +253,46 @@ fn render_directory_selection(
     all_items.extend(recent_items);
     let item_count = all_items.len();
 
-    // Handle keyboard navigation
-    ui.input(|i| {
-        if i.key_pressed(egui::Key::ArrowDown) {
-            if item_count > 0 {
-                nav.selected_index = Some(match nav.selected_index {
-                    None => 0,
-                    Some(idx) => (idx + 1).min(item_count - 1),
-                });
-            }
+    // Clamp nav index to valid range (handles state transitions)
+    if let Some(idx) = nav.selected_index {
+        if item_count == 0 || idx >= item_count {
+            nav.selected_index = None;
         }
-        if i.key_pressed(egui::Key::ArrowUp) {
-            if item_count > 0 {
-                nav.selected_index = Some(match nav.selected_index {
-                    None => 0,
-                    Some(idx) => idx.saturating_sub(1),
-                });
-            }
+    }
+
+    // Handle keyboard navigation (egui input + HID nav keys from encoder)
+    let key_down = |key: egui::Key| -> bool {
+        hid_keys.contains(&key) || ui.input(|i| i.key_pressed(key))
+    };
+
+    if key_down(egui::Key::ArrowDown) {
+        if item_count > 0 {
+            nav.selected_index = Some(match nav.selected_index {
+                None => 0,
+                Some(idx) => (idx + 1).min(item_count - 1),
+            });
         }
-        if i.key_pressed(egui::Key::Enter) {
-            if let Some(idx) = nav.selected_index {
-                if let Some(item) = all_items.get(idx) {
-                    // Trigger the same action as clicking
-                    if let Some(a) = handle_directory_click(&item.path, state) {
-                        action = Some(a);
-                    }
-                    // Reset selection when transitioning to session selection
-                    nav.selected_index = Some(0);
+    }
+    if key_down(egui::Key::ArrowUp) {
+        if item_count > 0 {
+            nav.selected_index = Some(match nav.selected_index {
+                None => 0,
+                Some(idx) => idx.saturating_sub(1),
+            });
+        }
+    }
+    if key_down(egui::Key::Enter) {
+        if let Some(idx) = nav.selected_index {
+            if let Some(item) = all_items.get(idx) {
+                if let Some(a) = handle_directory_click(&item.path, item.info.session_count, state) {
+                    action = Some(a);
                 }
             }
         }
-        if i.key_pressed(egui::Key::Escape) {
-            nav.selected_index = None;
-        }
-    });
+    }
+    if key_down(egui::Key::Escape) {
+        nav.selected_index = None;
+    }
 
     // Center the content with max width
     let max_width = 550.0;
@@ -368,8 +379,6 @@ fn render_directory_selection(
                             is_selected,
                         ) {
                             action = Some(a);
-                            // Reset selection on click
-                            nav.selected_index = Some(0);
                         }
                     }
                 });
@@ -612,7 +621,7 @@ fn render_directory_card(
 
     // Click on card (but not star or X) opens directory
     if response.clicked() && action.is_none() {
-        action = handle_directory_click(&item.path, state);
+        action = handle_directory_click(&item.path, item.info.session_count, state);
     }
 
     ui.add_space(2.0); // Spacing between cards
@@ -630,6 +639,7 @@ fn render_session_selection(
     last_refresh: Instant,
     state: &mut NewTabState,
     nav: &mut KeyboardNavState,
+    hid_keys: &[egui::Key],
 ) -> Option<NewTabAction> {
     let mut action = None;
 
@@ -650,43 +660,50 @@ fn render_session_selection(
     // Total selectable items: "Start New" button + all sessions
     let item_count = 1 + sessions.len();
 
-    // Handle keyboard navigation
-    ui.input(|i| {
-        if i.key_pressed(egui::Key::ArrowDown) {
-            nav.selected_index = Some(match nav.selected_index {
-                None => 0,
-                Some(idx) => (idx + 1).min(item_count - 1),
-            });
-        }
-        if i.key_pressed(egui::Key::ArrowUp) {
-            nav.selected_index = Some(match nav.selected_index {
-                None => 0,
-                Some(idx) => idx.saturating_sub(1),
-            });
-        }
-        if i.key_pressed(egui::Key::Enter) {
-            if let Some(idx) = nav.selected_index {
-                if idx == 0 {
-                    // "Start New Session" selected
-                    action = Some(NewTabAction::OpenDirectory {
-                        path: path.clone(),
-                        resume_session: Some(String::new()),
-                    });
-                } else if let Some(session) = sessions.get(idx - 1) {
-                    // Session selected - always use --resume with session ID
-                    action = Some(NewTabAction::OpenDirectory {
-                        path: path.clone(),
-                        resume_session: Some(session.session_id.clone()),
-                    });
-                }
+    // Clamp nav index to valid range (handles state transitions from directory list)
+    if nav.selected_index.map_or(false, |idx| idx >= item_count) {
+        nav.selected_index = Some(0);
+    }
+
+    // Handle keyboard navigation (egui input + HID nav keys from encoder)
+    let key_down = |key: egui::Key| -> bool {
+        hid_keys.contains(&key) || ui.input(|i| i.key_pressed(key))
+    };
+
+    if key_down(egui::Key::ArrowDown) {
+        nav.selected_index = Some(match nav.selected_index {
+            None => 0,
+            Some(idx) => (idx + 1).min(item_count - 1),
+        });
+    }
+    if key_down(egui::Key::ArrowUp) {
+        nav.selected_index = Some(match nav.selected_index {
+            None => 0,
+            Some(idx) => idx.saturating_sub(1),
+        });
+    }
+    if key_down(egui::Key::Enter) {
+        if let Some(idx) = nav.selected_index {
+            if idx == 0 {
+                // "Start New Session" selected
+                action = Some(NewTabAction::OpenDirectory {
+                    path: path.clone(),
+                    resume_session: Some(String::new()),
+                });
+            } else if let Some(session) = sessions.get(idx - 1) {
+                // Session selected - always use --resume with session ID
+                action = Some(NewTabAction::OpenDirectory {
+                    path: path.clone(),
+                    resume_session: Some(session.session_id.clone()),
+                });
             }
         }
-        if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Backspace) {
-            // Go back to directory selection
-            *state = NewTabState::SelectDirectory;
-            nav.selected_index = None;
-        }
-    });
+    }
+    if key_down(egui::Key::Escape) || key_down(egui::Key::Backspace) {
+        // Go back to directory selection
+        *state = NewTabState::SelectDirectory;
+        nav.selected_index = None;
+    }
 
     // Center the content with max width
     let max_width = 550.0;
@@ -897,11 +914,10 @@ fn render_session_selection(
     action
 }
 
-/// Handle directory selection - transitions to session picker or opens directly
-fn handle_directory_click(path: &PathBuf, state: &mut NewTabState) -> Option<NewTabAction> {
-    let sessions = get_sessions_for_directory(path);
-
-    match sessions.len() {
+/// Handle directory selection - transitions to session picker or opens directly.
+/// Uses the cached session_count to avoid redundant disk scans for 0/1 session cases.
+fn handle_directory_click(path: &PathBuf, session_count: usize, state: &mut NewTabState) -> Option<NewTabAction> {
+    match session_count {
         0 => {
             // No sessions - start fresh directly (empty string = no flags)
             Some(NewTabAction::OpenDirectory {
@@ -911,13 +927,23 @@ fn handle_directory_click(path: &PathBuf, state: &mut NewTabState) -> Option<New
         }
         1 => {
             // One session - open directly with that session
-            Some(NewTabAction::OpenDirectory {
-                path: path.clone(),
-                resume_session: Some(sessions[0].session_id.clone()),
-            })
+            let sessions = get_sessions_for_directory(path);
+            if let Some(session) = sessions.first() {
+                Some(NewTabAction::OpenDirectory {
+                    path: path.clone(),
+                    resume_session: Some(session.session_id.clone()),
+                })
+            } else {
+                // Cache was stale, fall back to fresh start
+                Some(NewTabAction::OpenDirectory {
+                    path: path.clone(),
+                    resume_session: Some(String::new()),
+                })
+            }
         }
         _ => {
-            // Multiple sessions - show session picker
+            // Multiple sessions - show session picker (needs full list)
+            let sessions = get_sessions_for_directory(path);
             *state = NewTabState::SelectSession {
                 path: path.clone(),
                 sessions,

@@ -129,6 +129,10 @@ pub struct TerminalWindowState {
     pub detected_mode: DeviceMode,
     /// Last mode reported by the device (to detect actual button presses vs confirmations)
     pub last_device_reported_mode: Option<DeviceMode>,
+    /// When the app last sent SetMode to the device (suppresses stale StateReports)
+    pub mode_set_from_app_at: Option<std::time::Instant>,
+    /// Pending HID navigation keys for new-tab UI (encoder knob, etc.)
+    pub pending_hid_nav_keys: Vec<egui::Key>,
     /// Whether window should be visible
     visible: Arc<AtomicBool>,
     /// Whether the window currently has focus
@@ -218,6 +222,8 @@ impl TerminalWindowState {
             device_yolo: false,
             detected_mode: DeviceMode::Default,
             last_device_reported_mode: None,
+            mode_set_from_app_at: None,
+            pending_hid_nav_keys: Vec::new(),
             visible: Arc::new(AtomicBool::new(false)),
             window_focused: false,
             window_id: None,
@@ -793,7 +799,7 @@ impl TerminalWindowState {
 
         let need_install_loaders = !self.image_loaders_installed;
 
-        let render_params = RenderParams {
+        let mut render_params = RenderParams {
             scroll_offset,
             font_size,
             color_scheme,
@@ -809,6 +815,7 @@ impl TerminalWindowState {
             cached_line_height: &self.cached_line_height,
             glyph_cache: &self.glyph_cache,
             hovered_hyperlink: &self.hovered_hyperlink,
+            hid_nav_keys: &mut self.pending_hid_nav_keys,
         };
 
         egui_glow.run(window, |ctx| {
@@ -829,7 +836,7 @@ impl TerminalWindowState {
                         .inner_margin(8.0),
                 )
                 .show(ctx, |ui| {
-                    render_terminal_content(ui, ctx, &render_params, &mut new_actions);
+                    render_terminal_content(ui, ctx, &mut render_params, &mut new_actions);
                 });
 
             // Hyperlink tooltip
@@ -850,7 +857,13 @@ impl TerminalWindowState {
                 new_actions.extend(context_actions);
             }
 
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            // Only schedule periodic repaints when there's active content that needs animation.
+            // With ControlFlow::Wait, the event loop sleeps until woken by an event,
+            // so we only need repaints for cursor blink, loading spinners, or working indicators.
+            let has_active_content = self.session_manager.has_running_sessions();
+            if has_active_content {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
         });
 
         // Handle OpenSettings action

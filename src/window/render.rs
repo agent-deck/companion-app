@@ -88,6 +88,7 @@ pub struct RenderParams<'a> {
     pub cached_line_height: &'a Cell<f32>,
     pub glyph_cache: &'a RefCell<Option<GlyphCache>>,
     pub hovered_hyperlink: &'a Option<Arc<Hyperlink>>,
+    pub hid_nav_keys: &'a mut Vec<egui::Key>,
 }
 
 /// Render the tab bar
@@ -393,9 +394,9 @@ fn render_single_tab(
                     egui::Color32::from_gray(100) // Gray for inactive/new tabs
                 };
 
-                // Request repaint for pulsing animation
+                // Request repaint for pulsing animation (10 FPS is plenty for a pulse)
                 if is_claude_working && !is_active {
-                    ui.ctx().request_repaint();
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
                 }
 
                 ui.add(
@@ -522,7 +523,7 @@ fn render_single_tab(
 pub fn render_terminal_content(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
-    params: &RenderParams<'_>,
+    params: &mut RenderParams<'_>,
     new_actions: &mut Vec<TerminalAction>,
 ) {
     let color_scheme = params.color_scheme;
@@ -539,7 +540,7 @@ pub fn render_terminal_content(
         if *is_new_tab {
             // Render new tab page with session_id for per-tab state
             if let Some(action) =
-                render_new_tab_page(ui, bookmark_manager, color_scheme, *session_id)
+                render_new_tab_page(ui, bookmark_manager, color_scheme, *session_id, params.hid_nav_keys)
             {
                 match action {
                     NewTabAction::OpenDirectory { path, resume_session } => {
