@@ -15,14 +15,6 @@ reconnect_interval_ms = 1000
 # Default brightness (0-255)
 default_brightness = 200
 
-[hotkeys]
-# Global hotkeys configuration
-claude_key = "F20"
-soft_key_1 = "F15"
-soft_key_2 = "F16"
-soft_key_3 = "F17"
-soft_key_4 = "F18"
-
 [terminal]
 # Preferred terminal emulator (auto-detect if empty)
 # Options: "auto", "terminal.app", "iterm", "wezterm", "alacritty", "gnome-terminal", "konsole", "windows-terminal"

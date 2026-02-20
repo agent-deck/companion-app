@@ -5,16 +5,13 @@
 //! # Features
 //! - Wraps Claude Code CLI in a PTY to monitor its state
 //! - Sends status updates to the macropad display via Raw HID
-//! - Watches for F20 (Claude key) to launch/focus terminal
 //! - Runs as a system tray application
-//! - Allows customization of soft keys (F15-F18)
 //! - Supports multiple tabs with browser-style tab bar
 //! - Bookmark and recent directories management
 //! - Settings modal for font and color scheme
 
 pub mod core;
 pub mod hid;
-pub mod hotkey;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod pty;

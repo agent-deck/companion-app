@@ -21,9 +21,6 @@ hidapi = "2.6"
 # System tray (from Tauri team)
 tray-icon = "0.19"
 
-# Global hotkeys (from Tauri team)
-global-hotkey = "0.6"
-
 # Event loop integration (required for tray on macOS)
 winit = "0.30"
 

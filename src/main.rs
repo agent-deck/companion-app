@@ -12,14 +12,13 @@
 use agent_deck::{
     core::{
         config::Config,
-        events::AppEvent,
+        events::{AppEvent, EventSender},
         sessions::SessionId,
         state::AppState,
         tabs::{TabEntry, TabState},
     },
-    hid::{keycodes::qmk_keycode_to_terminal_bytes, HidManager, SoftKeyEditState},
-    hotkey::HotkeyManager,
-    pty::PtyWrapper,
+    hid::{keycodes::{qmk_keycode_to_egui_key, qmk_keycode_to_terminal_bytes}, HidManager, SoftKeyEditState},
+    pty::{resolve_login_env, PtyWrapper},
     tray::TrayManager,
     window::{TerminalAction, TerminalWindowState},
 };
@@ -40,7 +39,6 @@ use winit::{
     window::WindowId,
 };
 
-use agent_deck::hotkey;
 use agent_deck::tray;
 
 /// Per-session PTY state
@@ -53,14 +51,12 @@ struct SessionPty {
 struct App {
     /// Application state
     state: Arc<RwLock<AppState>>,
-    /// Event sender for inter-module communication
-    event_tx: mpsc::UnboundedSender<AppEvent>,
+    /// Event sender for inter-module communication (wakes event loop)
+    event_tx: EventSender,
     /// Event receiver for inter-module communication
     event_rx: Option<mpsc::UnboundedReceiver<AppEvent>>,
     /// HID manager for device communication
     hid_manager: Option<HidManager>,
-    /// Hotkey manager for global key handling
-    hotkey_manager: Option<HotkeyManager>,
     /// Tray manager for system tray
     tray_manager: Option<TrayManager>,
     /// PTY wrappers per session
@@ -69,17 +65,22 @@ struct App {
     terminal_window: TerminalWindowState,
     /// Configuration
     config: Config,
+    /// Login shell environment captured at startup
+    login_env: Arc<HashMap<String, String>>,
     /// Whether the macOS menu bar has been created
     #[cfg(target_os = "macos")]
     menu_created: bool,
+    /// Last time check_claude_theme was called (throttle to once per 2s)
+    last_theme_check: std::time::Instant,
 }
 
 impl App {
     fn new(
         state: Arc<RwLock<AppState>>,
-        event_tx: mpsc::UnboundedSender<AppEvent>,
+        event_tx: EventSender,
         event_rx: mpsc::UnboundedReceiver<AppEvent>,
         config: Config,
+        login_env: Arc<HashMap<String, String>>,
     ) -> Self {
         let font_size = config.terminal.font_size;
         Self {
@@ -87,13 +88,14 @@ impl App {
             event_tx,
             event_rx: Some(event_rx),
             hid_manager: None,
-            hotkey_manager: None,
             tray_manager: None,
             session_ptys: HashMap::new(),
             terminal_window: TerminalWindowState::new(font_size),
             config,
+            login_env,
             #[cfg(target_os = "macos")]
             menu_created: false,
+            last_theme_check: std::time::Instant::now(),
         }
     }
 
@@ -189,6 +191,7 @@ impl App {
             actual_resume_session,
             is_new_session,
             colorfgbg,
+            Arc::clone(&self.login_env),
         ));
 
         match pty.start() {
@@ -440,6 +443,7 @@ impl App {
                 }
                 self.terminal_window.detected_mode = mode;
                 self.terminal_window.last_device_reported_mode = Some(mode);
+                self.terminal_window.mode_set_from_app_at = Some(std::time::Instant::now());
                 if let Err(e) = hid.set_mode(mode) {
                     debug!("Failed to set HID mode: {}", e);
                 }
@@ -873,6 +877,9 @@ impl App {
                     // Update last known device mode so the confirmation StateReport
                     // is recognized as a repeat (not a button press)
                     self.terminal_window.last_device_reported_mode = Some(mode);
+                    // Suppress device StateReports briefly — the device may echo back
+                    // stale state before processing our SetMode command
+                    self.terminal_window.mode_set_from_app_at = Some(std::time::Instant::now());
                     if let Err(e) = hid.set_mode(mode) {
                         debug!("Failed to set HID mode: {}", e);
                     }
@@ -914,57 +921,6 @@ impl App {
                     session.hid_alert_active = false;
                     session.hid_alert_text = None;
                     session.hid_alert_details = None;
-                }
-            }
-            AppEvent::HotkeyPressed(key) => {
-                info!("Hotkey pressed: {:?}", key);
-                match key {
-                    hotkey::HotkeyType::ClaudeKey => {
-                        // If window visible and focused, create new tab; otherwise show/focus window
-                        if self.terminal_window.is_visible() && self.terminal_window.is_focused() {
-                            self.handle_terminal_action(TerminalAction::NewTab, event_loop);
-                        } else if self.terminal_window.is_visible() {
-                            // Visible but not focused → bring to front
-                            self.terminal_window.show();
-                        } else if !self.session_ptys.is_empty() {
-                            self.terminal_window.show();
-                            self.send_hid_for_active_session();
-                            // Sync tray menu
-                            if let Some(ref mut tray) = self.tray_manager {
-                                tray.set_window_visible(true);
-                            }
-                        } else if !self.terminal_window.session_manager.is_empty() {
-                            // We have saved tabs but no PTY running - show window and start active tab
-                            self.terminal_window.create_window(event_loop);
-                            self.terminal_window.show();
-                            self.send_hid_for_active_session();
-                            // Sync tray menu
-                            if let Some(ref mut tray) = self.tray_manager {
-                                tray.set_window_visible(true);
-                            }
-
-                            // Start PTY for active session if it has a working directory
-                            if let Some(session) = self.terminal_window.session_manager.active_session() {
-                                if !session.is_new_tab() && !session.is_running {
-                                    let session_id = session.id;
-                                    let working_dir = session.working_directory.clone();
-                                    let claude_session_id = session.claude_session_id.clone();
-                                    self.start_claude_for_session(session_id, working_dir, claude_session_id, event_loop);
-                                }
-                            }
-                        } else {
-                            self.start_claude(event_loop);
-                            self.send_hid_for_active_session();
-                            // Sync tray menu (start_claude shows the window)
-                            if let Some(ref mut tray) = self.tray_manager {
-                                tray.set_window_visible(true);
-                            }
-                        }
-                    }
-                    hotkey::HotkeyType::SoftKey(n) => {
-                        info!("Soft key {} pressed", n);
-                        // TODO: Handle soft key actions
-                    }
                 }
             }
             AppEvent::TrayAction(action) => {
@@ -1057,14 +1013,37 @@ impl App {
                 self.terminal_window.device_yolo = yolo;
                 self.terminal_window.update_window_title();
 
+                // Check if the app recently sent a SetMode command. If so, this
+                // StateReport is a confirmation (or stale echo) — not a user button
+                // press. Suppress Shift+Tab to prevent feedback loops when Claude
+                // auto-switches modes (e.g., entering plan mode on its own).
+                let suppressed = if let Some(sent_at) = self.terminal_window.mode_set_from_app_at {
+                    if sent_at.elapsed() < std::time::Duration::from_millis(500) {
+                        // Within suppression window — treat as confirmation
+                        if mode == self.terminal_window.detected_mode {
+                            // Device confirmed the mode we set — clear suppression
+                            self.terminal_window.mode_set_from_app_at = None;
+                        }
+                        true
+                    } else {
+                        // Suppression expired
+                        self.terminal_window.mode_set_from_app_at = None;
+                        false
+                    }
+                } else {
+                    false
+                };
+
                 // Send Shift+Tab only when the device mode actually changed since
                 // the last report (i.e., user pressed the mode button on the device).
                 // Ignore confirmations from our SetMode commands and repeated reports.
                 let prev_device_mode = self.terminal_window.last_device_reported_mode;
                 self.terminal_window.last_device_reported_mode = Some(mode);
-                if prev_device_mode.is_some() && prev_device_mode != Some(mode) {
+                if !suppressed && prev_device_mode.is_some() && prev_device_mode != Some(mode) {
                     if let Some(session) = self.terminal_window.session_manager.active_session() {
                         if session.is_running {
+                            debug!("Device mode button press: {} -> {}, sending Shift+Tab",
+                                   prev_device_mode.unwrap(), mode);
                             self.terminal_window.send_to_session_pty(session.id, b"\x1b[Z");
                         }
                     }
@@ -1126,13 +1105,28 @@ impl App {
                             tray.set_window_visible(true);
                         }
                     }
-                } else if let Some(bytes) = qmk_keycode_to_terminal_bytes(keycode) {
-                    // Route keypress to alerting session (or active if no alerts)
-                    if let Some(sid) = target_id {
-                        self.terminal_window.send_to_session_pty(sid, &bytes);
-                    }
-                    if let Some(ref window) = self.terminal_window.window {
-                        window.request_redraw();
+                } else {
+                    // Check if active session is a new-tab page (no PTY)
+                    let active_is_new_tab = self.terminal_window.session_manager
+                        .active_session()
+                        .map_or(false, |s| s.is_new_tab());
+
+                    if active_is_new_tab {
+                        // Route navigation keys to the new-tab UI
+                        if let Some(egui_key) = qmk_keycode_to_egui_key(keycode) {
+                            self.terminal_window.pending_hid_nav_keys.push(egui_key);
+                            if let Some(ref window) = self.terminal_window.window {
+                                window.request_redraw();
+                            }
+                        }
+                    } else if let Some(bytes) = qmk_keycode_to_terminal_bytes(keycode) {
+                        // Route keypress to alerting session (or active if no alerts)
+                        if let Some(sid) = target_id {
+                            self.terminal_window.send_to_session_pty(sid, &bytes);
+                        }
+                        if let Some(ref window) = self.terminal_window.window {
+                            window.request_redraw();
+                        }
                     }
                 }
             }
@@ -1346,7 +1340,7 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::Poll);
+        event_loop.set_control_flow(ControlFlow::Wait);
 
         // Create macOS native menu bar (must happen after winit starts the event loop)
         #[cfg(target_os = "macos")]
@@ -1367,17 +1361,6 @@ impl ApplicationHandler for App {
             }
             Err(e) => {
                 error!("Failed to initialize tray manager: {}", e);
-            }
-        }
-
-        // Initialize hotkey manager
-        match HotkeyManager::new(self.event_tx.clone(), &self.config.hotkeys) {
-            Ok(hotkey) => {
-                self.hotkey_manager = Some(hotkey);
-                info!("Hotkey manager initialized");
-            }
-            Err(e) => {
-                error!("Failed to initialize hotkey manager: {}", e);
             }
         }
 
@@ -1458,10 +1441,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Process hotkey events
-        if let Some(ref manager) = self.hotkey_manager {
-            manager.process_events();
-        }
+        let mut needs_redraw = false;
 
         // Collect events first, then process them
         let events: Vec<AppEvent> = if let Some(ref mut rx) = self.event_rx {
@@ -1474,25 +1454,32 @@ impl ApplicationHandler for App {
             Vec::new()
         };
 
+        if !events.is_empty() {
+            needs_redraw = true;
+        }
         for event in events {
             self.handle_event(event, event_loop);
         }
 
         // Process any pending terminal actions
         let actions = self.terminal_window.take_pending_actions();
+        if !actions.is_empty() {
+            needs_redraw = true;
+        }
         for action in actions {
             self.handle_terminal_action(action, event_loop);
         }
 
-        // Check for Claude theme changes (polls ~/.claude.json mtime)
-        if self.terminal_window.check_claude_theme() {
-            if let Some(ref window) = self.terminal_window.window {
-                window.request_redraw();
+        // Check for Claude theme changes (throttled to once per 2 seconds)
+        if self.last_theme_check.elapsed() >= std::time::Duration::from_secs(2) {
+            self.last_theme_check = std::time::Instant::now();
+            if self.terminal_window.check_claude_theme() {
+                needs_redraw = true;
             }
         }
 
-        // Request redraw if terminal window is visible
-        if self.terminal_window.is_visible() {
+        // Request redraw if any events or actions were processed
+        if needs_redraw {
             if let Some(ref window) = self.terminal_window.window {
                 window.request_redraw();
             }
@@ -1544,7 +1531,7 @@ impl ApplicationHandler for App {
 /// Set up macOS application: process name and full native menu bar
 #[cfg(target_os = "macos")]
 #[allow(deprecated, unused_imports)]
-fn setup_macos_app(event_tx: mpsc::UnboundedSender<AppEvent>) {
+fn setup_macos_app(event_tx: EventSender) {
     use cocoa::appkit::NSApp;
     use cocoa::base::nil;
     use cocoa::foundation::NSString;
@@ -1585,7 +1572,7 @@ fn setup_macos_app(event_tx: mpsc::UnboundedSender<AppEvent>) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn setup_macos_app(_event_tx: mpsc::UnboundedSender<AppEvent>) {
+fn setup_macos_app(_event_tx: EventSender) {
     // No-op on other platforms
 }
 
@@ -1614,6 +1601,11 @@ fn main() -> Result<()> {
 
     info!("Starting Agent Deck companion app");
 
+    // Capture login shell environment (PATH, LANG, etc.) before anything else.
+    // When launched from Finder/.app bundle, the process inherits a bare-bones
+    // environment — this ensures PTY processes get the user's full setup.
+    let login_env = Arc::new(resolve_login_env());
+
     // Load configuration
     let config = Config::load()?;
     info!("Configuration loaded");
@@ -1627,14 +1619,18 @@ fn main() -> Result<()> {
     // Create event loop
     let event_loop = EventLoop::new()?;
 
+    // Create EventSender that wraps the channel + event loop proxy for wake-up
+    let proxy = event_loop.create_proxy();
+    let event_sender = EventSender::new(event_tx, proxy);
+
     // Set up macOS app (process name and native menu bar, must be after event loop creation)
-    setup_macos_app(event_tx.clone());
+    setup_macos_app(event_sender.clone());
 
     // Set up macOS quit confirmation handler (must be after event loop creation)
     setup_macos_quit_handler();
 
     // Create application
-    let mut app = App::new(state, event_tx, event_rx, config);
+    let mut app = App::new(state, event_sender, event_rx, config, login_env);
 
     // Run event loop
     event_loop.run_app(&mut app)?;

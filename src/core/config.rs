@@ -80,54 +80,6 @@ impl Default for DisplayConfig {
     }
 }
 
-/// Hotkey configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HotkeyConfig {
-    /// Claude key (main key to launch/focus Claude)
-    #[serde(default = "default_claude_key")]
-    pub claude_key: String,
-    /// Soft key 1
-    #[serde(default = "default_soft_key_1")]
-    pub soft_key_1: String,
-    /// Soft key 2
-    #[serde(default = "default_soft_key_2")]
-    pub soft_key_2: String,
-    /// Soft key 3
-    #[serde(default = "default_soft_key_3")]
-    pub soft_key_3: String,
-    /// Soft key 4
-    #[serde(default = "default_soft_key_4")]
-    pub soft_key_4: String,
-}
-
-fn default_claude_key() -> String {
-    "F20".to_string()
-}
-fn default_soft_key_1() -> String {
-    "F15".to_string()
-}
-fn default_soft_key_2() -> String {
-    "F16".to_string()
-}
-fn default_soft_key_3() -> String {
-    "F17".to_string()
-}
-fn default_soft_key_4() -> String {
-    "F18".to_string()
-}
-
-impl Default for HotkeyConfig {
-    fn default() -> Self {
-        Self {
-            claude_key: default_claude_key(),
-            soft_key_1: default_soft_key_1(),
-            soft_key_2: default_soft_key_2(),
-            soft_key_3: default_soft_key_3(),
-            soft_key_4: default_soft_key_4(),
-        }
-    }
-}
-
 /// Terminal configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalConfig {
@@ -181,9 +133,6 @@ pub struct Config {
     /// Display configuration
     #[serde(default)]
     pub display: DisplayConfig,
-    /// Hotkey configuration
-    #[serde(default)]
-    pub hotkeys: HotkeyConfig,
     /// Terminal configuration
     #[serde(default)]
     pub terminal: TerminalConfig,
@@ -251,7 +200,6 @@ mod tests {
         assert_eq!(config.hid.usage_page, 0xFF60);
         assert_eq!(config.hid.usage_id, 0x61);
         assert_eq!(config.display.default_brightness, 200);
-        assert_eq!(config.hotkeys.claude_key, "F20");
     }
 
     #[test]
