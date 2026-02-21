@@ -102,6 +102,22 @@ impl TerminalWindowState {
                         return true;
                     }
 
+                    // Ctrl+Tab / Ctrl+Shift+Tab → cycle tabs
+                    if let Key::Named(NamedKey::Tab) = &event.logical_key {
+                        let state = self.modifiers.state();
+                        if state.control_key() && !state.super_key() && !state.alt_key() {
+                            let id = if state.shift_key() {
+                                self.session_manager.prev_session_id()
+                            } else {
+                                self.session_manager.next_session_id()
+                            };
+                            if let Some(id) = id {
+                                self.pending_actions.push(TerminalAction::SwitchTab(id));
+                            }
+                            return true;
+                        }
+                    }
+
                     if let Some(session) = self.session_manager.active_session() {
                         if session.is_running {
                             self.handle_key_input(event);

@@ -45,6 +45,7 @@ use agent_deck::tray;
 /// HID events arrive as individual packets ~20ms apart, so 150ms is sufficient.
 const HID_COMBO_WINDOW: std::time::Duration = std::time::Duration::from_millis(150);
 
+
 /// Per-session PTY state
 struct SessionPty {
     pty: Arc<PtyWrapper>,
@@ -1155,8 +1156,18 @@ impl App {
                             window.request_redraw();
                         }
                     }
+                } else if keycode == 0x012B || keycode == 0x032B {
+                    // Ctrl+Tab / Ctrl+Shift+Tab from HID → switch tabs
+                    let id = if keycode == 0x032B {
+                        self.terminal_window.session_manager.prev_session_id()
+                    } else {
+                        self.terminal_window.session_manager.next_session_id()
+                    };
+                    if let Some(id) = id {
+                        self.handle_terminal_action(TerminalAction::SwitchTab(id), event_loop);
+                    }
                 } else {
-                    // Check if active session is a new-tab page (no PTY)
+                    // Normal key routing
                     let active_is_new_tab = self.terminal_window.session_manager
                         .active_session()
                         .map_or(false, |s| s.is_new_tab());

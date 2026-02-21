@@ -288,6 +288,20 @@ impl SessionManager {
         self.active_session
     }
 
+    /// Get the session ID for the next tab (with wraparound)
+    pub fn next_session_id(&self) -> Option<SessionId> {
+        if self.sessions.is_empty() { return None; }
+        let next = (self.active_session + 1) % self.sessions.len();
+        Some(self.sessions[next].id)
+    }
+
+    /// Get the session ID for the previous tab (with wraparound)
+    pub fn prev_session_id(&self) -> Option<SessionId> {
+        if self.sessions.is_empty() { return None; }
+        let prev = if self.active_session == 0 { self.sessions.len() - 1 } else { self.active_session - 1 };
+        Some(self.sessions[prev].id)
+    }
+
     /// Close a session by ID, returns true if the session was found and closed
     pub fn close_session(&mut self, id: SessionId) -> bool {
         if let Some(idx) = self.sessions.iter().position(|s| s.id == id) {
