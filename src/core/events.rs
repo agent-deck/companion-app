@@ -60,6 +60,9 @@ pub enum AppEvent {
     /// HID key event: single key press with QMK 16-bit keycode
     HidKeyEvent { keycode: u16 },
 
+    /// HID combo timeout: deferred F20 window expired, execute new-tab
+    HidComboTimeout,
+
     /// HID type string: string injection from device
     HidTypeString { text: String, send_enter: bool },
 

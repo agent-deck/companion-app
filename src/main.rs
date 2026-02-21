@@ -41,6 +41,10 @@ use winit::{
 
 use agent_deck::tray;
 
+/// Time window for detecting F20 + Ctrl+C combo from HID device.
+/// HID events arrive as individual packets ~20ms apart, so 150ms is sufficient.
+const HID_COMBO_WINDOW: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// Per-session PTY state
 struct SessionPty {
     pty: Arc<PtyWrapper>,
@@ -72,6 +76,10 @@ struct App {
     menu_created: bool,
     /// Last time check_claude_theme was called (throttle to once per 2s)
     last_theme_check: std::time::Instant,
+    /// Pending F20 press timestamp (deferred for combo detection when focused)
+    pending_hid_f20: Option<std::time::Instant>,
+    /// Last Ctrl+C HID keypress timestamp (for reverse-order combo detection)
+    last_hid_ctrlc: Option<std::time::Instant>,
 }
 
 impl App {
@@ -96,6 +104,8 @@ impl App {
             #[cfg(target_os = "macos")]
             menu_created: false,
             last_theme_check: std::time::Instant::now(),
+            pending_hid_f20: None,
+            last_hid_ctrlc: None,
         }
     }
 
@@ -888,6 +898,16 @@ impl App {
         }
     }
 
+    /// Close the active tab via HID combo (F20 + Ctrl+C).
+    /// Reuses the existing CloseTab action which handles confirmation dialogs.
+    fn close_active_tab_via_combo(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(session) = self.terminal_window.session_manager.active_session() {
+            let session_id = session.id;
+            info!("HID combo: closing active tab {}", session_id);
+            self.handle_terminal_action(TerminalAction::CloseTab(session_id), event_loop);
+        }
+    }
+
     /// Process an application event
     fn handle_event(&mut self, event: AppEvent, event_loop: &ActiveEventLoop) {
         match event {
@@ -1069,8 +1089,20 @@ impl App {
                         }
                         self.handle_terminal_action(TerminalAction::SwitchTab(alert_sid), event_loop);
                     } else if self.terminal_window.is_visible() && self.terminal_window.is_focused() {
-                        // Window is visible and focused → new tab
-                        self.handle_terminal_action(TerminalAction::NewTab, event_loop);
+                        // Window is visible and focused → defer new tab for combo detection.
+                        // If Ctrl+C arrived recently (reverse-order combo), close active tab instead.
+                        if self.last_hid_ctrlc.map_or(false, |t| t.elapsed() < HID_COMBO_WINDOW) {
+                            self.last_hid_ctrlc = None;
+                            self.close_active_tab_via_combo(event_loop);
+                        } else {
+                            // Defer F20: set pending timestamp and spawn timeout thread
+                            self.pending_hid_f20 = Some(std::time::Instant::now());
+                            let tx = self.event_tx.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(HID_COMBO_WINDOW);
+                                let _ = tx.send(AppEvent::HidComboTimeout);
+                            });
+                        }
                     } else if self.terminal_window.is_visible() {
                         // Window is visible but not focused → just bring to front
                         self.terminal_window.show();
@@ -1105,6 +1137,24 @@ impl App {
                             tray.set_window_visible(true);
                         }
                     }
+                } else if keycode == 0x0106 {
+                    // Ctrl+C from HID — check for combo with pending F20
+                    self.last_hid_ctrlc = Some(std::time::Instant::now());
+                    let f20_pending = self.pending_hid_f20
+                        .map_or(false, |t| t.elapsed() < HID_COMBO_WINDOW);
+                    if f20_pending {
+                        // F20 was pending → combo detected, close active tab
+                        self.pending_hid_f20 = None;
+                        self.close_active_tab_via_combo(event_loop);
+                    } else {
+                        // No pending F20 → send Ctrl+C (0x03) to terminal normally
+                        if let Some(sid) = target_id {
+                            self.terminal_window.send_to_session_pty(sid, &[0x03]);
+                        }
+                        if let Some(ref window) = self.terminal_window.window {
+                            window.request_redraw();
+                        }
+                    }
                 } else {
                     // Check if active session is a new-tab page (no PTY)
                     let active_is_new_tab = self.terminal_window.session_manager
@@ -1129,6 +1179,15 @@ impl App {
                         }
                     }
                 }
+            }
+            AppEvent::HidComboTimeout => {
+                // Combo window expired — if F20 is still pending, execute deferred NewTab
+                if let Some(pending) = self.pending_hid_f20.take() {
+                    if pending.elapsed() >= HID_COMBO_WINDOW {
+                        self.handle_terminal_action(TerminalAction::NewTab, event_loop);
+                    }
+                }
+                // If pending_hid_f20 was already consumed by combo, do nothing
             }
             AppEvent::HidTypeString { text, send_enter } => {
                 // Resolve target: oldest alerting session, or active session as fallback
