@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build and bundle Agent Deck for macOS
+# Build and bundle Core Deck for macOS
 # Creates a proper .app bundle ready for signing
 
 set -e
@@ -8,9 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 MACOS_DIR="$PROJECT_ROOT/macos"
 
-APP_NAME="Agent Deck"
-BUNDLE_ID="com.agentdeck.AgentDeck"
-EXECUTABLE_NAME="agent-deck"
+APP_NAME="Core Deck"
+BUNDLE_ID="com.coredeck.CoreDeck"
+EXECUTABLE_NAME="core-deck"
 
 # Parse arguments
 BUILD_TYPE="release"
@@ -65,7 +65,7 @@ fi
 DIST_DIR="$PROJECT_ROOT/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 
-echo "=== Building Agent Deck ==="
+echo "=== Building Core Deck ==="
 echo "Build type: $BUILD_TYPE"
 echo "Universal binary: $UNIVERSAL"
 

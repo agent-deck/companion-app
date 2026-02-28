@@ -171,7 +171,7 @@ The HID device interface was opened and is communicating.
 **Payload:** JSON-encoded [DeviceInfo](Types.md#deviceinfo)
 
 ```json
-{"name":"Agent Deck","firmware":"1.0.0"}
+{"name":"Core Deck","firmware":"1.0.0"}
 ```
 
 ### 0x81 — DeviceDisconnected

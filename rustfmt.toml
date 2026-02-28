@@ -1,4 +1,4 @@
-# Rust formatting configuration for Agent Deck
+# Rust formatting configuration for Core Deck
 edition = "2021"
 max_width = 100
 hard_tabs = false

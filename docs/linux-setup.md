@@ -1,6 +1,6 @@
 # Linux Setup Guide
 
-This guide covers the additional setup required to run Agent Deck on Linux.
+This guide covers the additional setup required to run Core Deck on Linux.
 
 ## System Dependencies
 
@@ -23,15 +23,15 @@ sudo pacman -S hidapi
 
 ## HID Device Permissions
 
-By default, Linux requires root access to communicate with HID devices. To allow non-root access to the Agent Deck:
+By default, Linux requires root access to communicate with HID devices. To allow non-root access to the Core Deck:
 
 ### 1. Create udev rules file
 
-Create `/etc/udev/rules.d/99-agentdeck.rules`:
+Create `/etc/udev/rules.d/99-coredeck.rules`:
 
 ```bash
-sudo tee /etc/udev/rules.d/99-agentdeck.rules << 'EOF'
-# Agent Deck QMK Raw HID device
+sudo tee /etc/udev/rules.d/99-coredeck.rules << 'EOF'
+# Core Deck QMK Raw HID device
 # VID: 0xFEED, PID: 0x0803 (default QMK VID/PID)
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="feed", ATTRS{idProduct}=="0803", MODE="0666"
 SUBSYSTEM=="usb", ATTRS{idVendor}=="feed", ATTRS{idProduct}=="0803", MODE="0666"
@@ -49,14 +49,14 @@ sudo udevadm trigger
 
 ### 3. Reconnect the device
 
-Unplug and replug the Agent Deck for the new rules to take effect.
+Unplug and replug the Core Deck for the new rules to take effect.
 
 ## Verification
 
 After setup, verify the device is accessible:
 
 ```bash
-# List HID devices (should show Agent Deck without sudo)
+# List HID devices (should show Core Deck without sudo)
 ls -la /dev/hidraw*
 
 # Check device permissions
@@ -72,7 +72,7 @@ stat /dev/hidraw* | grep -E "(File|Access)"
 
 ### Permission denied
 - Verify the udev rule file syntax
-- Check file is in correct location: `ls -la /etc/udev/rules.d/99-agentdeck.rules`
+- Check file is in correct location: `ls -la /etc/udev/rules.d/99-coredeck.rules`
 - Try logging out and back in, or reboot
 
 ### hidapi initialization fails

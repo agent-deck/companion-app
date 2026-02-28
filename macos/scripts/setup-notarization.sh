@@ -25,7 +25,7 @@ if [ -z "$APP_PASSWORD" ]; then
     echo ""
 fi
 
-PROFILE_NAME="${1:-agentdeck-notary}"
+PROFILE_NAME="${1:-coredeck-notary}"
 
 echo "Storing credentials with profile name: $PROFILE_NAME"
 

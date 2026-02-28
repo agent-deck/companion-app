@@ -31,7 +31,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: binary-arm64
-          path: target/aarch64-apple-darwin/release/agent-deck
+          path: target/aarch64-apple-darwin/release/core-deck
 
   build-macos-x86_64:
     runs-on: macos-13  # Intel runner
@@ -49,7 +49,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: binary-x86_64
-          path: target/x86_64-apple-darwin/release/agent-deck
+          path: target/x86_64-apple-darwin/release/core-deck
 
   # Combine binaries and create signed app bundle
   package-macos:
@@ -76,15 +76,15 @@ jobs:
 
       - name: Make binaries executable
         run: |
-          chmod +x target/aarch64-apple-darwin/release/agent-deck
-          chmod +x target/x86_64-apple-darwin/release/agent-deck
+          chmod +x target/aarch64-apple-darwin/release/core-deck
+          chmod +x target/x86_64-apple-darwin/release/core-deck
 
       - name: Verify binaries
         run: |
           echo "ARM64 binary:"
-          file target/aarch64-apple-darwin/release/agent-deck
+          file target/aarch64-apple-darwin/release/core-deck
           echo "x86_64 binary:"
-          file target/x86_64-apple-darwin/release/agent-deck
+          file target/x86_64-apple-darwin/release/core-deck
 
       - name: Generate app icon
         run: ./macos/scripts/generate-icon.sh
@@ -95,8 +95,8 @@ jobs:
       - name: Verify universal binary
         run: |
           echo "Universal binary:"
-          file "dist/Agent Deck.app/Contents/MacOS/agent-deck"
-          lipo -info "dist/Agent Deck.app/Contents/MacOS/agent-deck"
+          file "dist/Core Deck.app/Contents/MacOS/core-deck"
+          lipo -info "dist/Core Deck.app/Contents/MacOS/core-deck"
 
       - name: Import signing certificate
         if: ${{ env.MACOS_CERTIFICATE != '' }}
@@ -140,7 +140,7 @@ jobs:
         if: ${{ env.MACOS_CERTIFICATE == '' }}
         run: |
           echo "No signing certificate provided, creating ad-hoc signed build"
-          codesign --force --deep --sign - "dist/Agent Deck.app"
+          codesign --force --deep --sign - "dist/Core Deck.app"
 
       - name: Create DMG
         env:
@@ -172,7 +172,7 @@ jobs:
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AgentDeck-${{ steps.version.outputs.version }}-macos-universal
+          name: CoreDeck-${{ steps.version.outputs.version }}-macos-universal
           path: dist/*.dmg
 
   create-release:
@@ -189,13 +189,13 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: AgentDeck-${{ steps.version.outputs.version }}-macos-universal
+          name: CoreDeck-${{ steps.version.outputs.version }}-macos-universal
           path: artifacts
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          name: Agent Deck v${{ steps.version.outputs.version }}
+          name: Core Deck v${{ steps.version.outputs.version }}
           draft: true
           generate_release_notes: true
           files: artifacts/*.dmg

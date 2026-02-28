@@ -1,6 +1,6 @@
 # Shared Type Reference
 
-JSON schemas for all types used across the HTTP REST and WebSocket APIs. These types are defined in the `agentdeck-protocol` crate.
+JSON schemas for all types used across the HTTP REST and WebSocket APIs. These types are defined in the `coredeck-protocol` crate.
 
 ## DaemonStatus
 
@@ -10,7 +10,7 @@ Returned by `GET /api/status`.
 {
   "device_available": true,
   "device_connected": true,
-  "device_name": "Agent Deck",
+  "device_name": "Core Deck",
   "firmware_version": "1.0.0",
   "device_mode": "Default",
   "device_yolo": false,
@@ -163,7 +163,7 @@ JSON payload of the WS `DeviceConnected` event (tag `0x80`).
 
 ```json
 {
-  "name": "Agent Deck",
+  "name": "Core Deck",
   "firmware": "1.0.0"
 }
 ```

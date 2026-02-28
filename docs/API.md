@@ -1,6 +1,6 @@
 # Daemon API Overview
 
-The AgentDeck daemon (`agentdeck-daemon`) is a background service that owns the HID connection to the AgentDeck macropad. It exposes HTTP REST and WebSocket APIs for controlling the device display, LEDs, alerts, and soft keys.
+The CoreDeck daemon (`coredeck-daemon`) is a background service that owns the HID connection to the CoreDeck macropad. It exposes HTTP REST and WebSocket APIs for controlling the device display, LEDs, alerts, and soft keys.
 
 For build instructions and project setup, see the [README](../README.md) and [Building from Source](Building.md).
 
@@ -29,7 +29,7 @@ curl -s http://127.0.0.1:19384/api/status | jq
 {
   "device_available": true,
   "device_connected": false,
-  "device_name": "Agent Deck",
+  "device_name": "Core Deck",
   "firmware_version": null,
   "device_mode": "Default",
   "device_yolo": false,

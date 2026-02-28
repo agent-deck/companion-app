@@ -24,7 +24,7 @@ Returns current daemon and device state. Always available regardless of lock sta
 {
   "device_available": true,
   "device_connected": true,
-  "device_name": "Agent Deck",
+  "device_name": "Core Deck",
   "firmware_version": "1.0.0",
   "device_mode": "Default",
   "device_yolo": false,

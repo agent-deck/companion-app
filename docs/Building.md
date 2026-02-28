@@ -41,12 +41,12 @@ The project is a Cargo workspace with 3 crates:
 
 ```
 crates/
-  agentdeck-protocol/   # Shared types & wire format (serde only, no system deps)
-  agentdeck-daemon/     # Background daemon (HID, tray icon, axum server)
-  agentdeck/            # GUI app (egui, wezterm-term, PTY)
+  coredeck-protocol/   # Shared types & wire format (serde only, no system deps)
+  coredeck-daemon/     # Background daemon (HID, tray icon, axum server)
+  coredeck/            # GUI app (egui, wezterm-term, PTY)
 ```
 
-The default member is `agentdeck` (the GUI app), so a bare `cargo build` only builds the app and its dependencies.
+The default member is `coredeck` (the GUI app), so a bare `cargo build` only builds the app and its dependencies.
 
 ## Build Commands
 
@@ -60,15 +60,15 @@ cargo build --workspace
 
 ```bash
 # Daemon only
-cargo build -p agentdeck-daemon
+cargo build -p coredeck-daemon
 
 # GUI app only (default)
-cargo build -p agent-deck
+cargo build -p core-deck
 # or just:
 cargo build
 
 # Protocol crate only
-cargo build -p agentdeck-protocol
+cargo build -p coredeck-protocol
 ```
 
 ### Release build
@@ -83,20 +83,20 @@ Output binaries:
 
 | Binary | Path |
 |--------|------|
-| `agent-deck` | `target/release/agent-deck` |
-| `agentdeck-daemon` | `target/release/agentdeck-daemon` |
+| `core-deck` | `target/release/core-deck` |
+| `coredeck-daemon` | `target/release/coredeck-daemon` |
 
 ### Run
 
 ```bash
 # Run the GUI app
-cargo run -p agent-deck
+cargo run -p core-deck
 
 # Run the daemon
-cargo run -p agentdeck-daemon
+cargo run -p coredeck-daemon
 
 # Run the daemon on a custom port
-cargo run -p agentdeck-daemon -- --listen 127.0.0.1:9000
+cargo run -p coredeck-daemon -- --listen 127.0.0.1:9000
 ```
 
 ### Tests
@@ -113,7 +113,7 @@ The workspace patches `zune-jpeg` (vendored in `patches/zune-jpeg/`) to fix an u
 
 ### Build Scripts
 
-Both the root workspace and the `agentdeck` crate have `build.rs` scripts that generate placeholder tray icon PNGs (16x16 solid color) if they don't already exist in `assets/icons/`. Real icons are checked into the repo, so the build scripts are effectively no-ops on a normal clone.
+Both the root workspace and the `coredeck` crate have `build.rs` scripts that generate placeholder tray icon PNGs (16x16 solid color) if they don't already exist in `assets/icons/`. Real icons are checked into the repo, so the build scripts are effectively no-ops on a normal clone.
 
 ### WezTerm Git Dependencies
 
@@ -128,6 +128,6 @@ The GUI app loads terminal color themes from Ghostty.app if installed at `/Appli
 Both binaries use `tracing` with `RUST_LOG` env filter:
 
 ```bash
-RUST_LOG=debug cargo run -p agentdeck-daemon
-RUST_LOG=agent_deck=trace cargo run -p agent-deck
+RUST_LOG=debug cargo run -p coredeck-daemon
+RUST_LOG=core_deck=trace cargo run -p core-deck
 ```

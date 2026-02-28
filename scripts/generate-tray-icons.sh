@@ -1,12 +1,12 @@
 #!/bin/bash
-# Generate macOS tray icons from AgentDeckTray.png
+# Generate macOS tray icons from CoreDeckTray.png
 # Requires ImageMagick (magick command)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ICONS_DIR="$SCRIPT_DIR/../assets/icons"
-SOURCE="$ICONS_DIR/AgentDeckTray.png"
+SOURCE="$ICONS_DIR/CoreDeckTray.png"
 
 if [ ! -f "$SOURCE" ]; then
     echo "Error: Source file not found: $SOURCE"

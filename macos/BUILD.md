@@ -1,6 +1,6 @@
 # macOS Build & Distribution Guide
 
-This directory contains everything needed to build, sign, and distribute Agent Deck for macOS.
+This directory contains everything needed to build, sign, and distribute Core Deck for macOS.
 
 ## Prerequisites
 
@@ -71,11 +71,11 @@ builds on separate runners (ARM and Intel) and combines them with `lipo`.
 First, create an app-specific password:
 1. Go to https://appleid.apple.com
 2. Sign In → Security → App-Specific Passwords
-3. Generate a password for "Agent Deck Notarization"
+3. Generate a password for "Core Deck Notarization"
 
 Then store credentials:
 ```bash
-./macos/scripts/setup-notarization.sh agentdeck-notary
+./macos/scripts/setup-notarization.sh coredeck-notary
 ```
 
 ### 4. Sign and Notarize
@@ -87,7 +87,7 @@ security find-identity -v -p codesigning
 # Sign and notarize
 ./macos/scripts/sign.sh \
     --identity "Developer ID Application: Your Name (TEAM_ID)" \
-    --keychain-profile agentdeck-notary
+    --keychain-profile coredeck-notary
 ```
 
 ### 5. Create DMG
@@ -95,10 +95,10 @@ security find-identity -v -p codesigning
 ```bash
 ./macos/scripts/create-dmg.sh \
     --identity "Developer ID Application: Your Name (TEAM_ID)" \
-    --keychain-profile agentdeck-notary
+    --keychain-profile coredeck-notary
 ```
 
-The final DMG will be at `dist/AgentDeck-X.Y.Z.dmg`
+The final DMG will be at `dist/CoreDeck-X.Y.Z.dmg`
 
 ## Certificate Setup
 
@@ -114,7 +114,7 @@ In Apple Developer Portal (https://developer.apple.com/account/resources/certifi
 
 1. Create **Mac App Distribution** certificate
 2. Create **Mac Installer Distribution** certificate
-3. Create an App ID with identifier `com.agentdeck.AgentDeck`
+3. Create an App ID with identifier `com.coredeck.CoreDeck`
 
 ## Environment Variables
 
@@ -123,7 +123,7 @@ You can set these to avoid passing arguments:
 ```bash
 export SIGNING_IDENTITY="Developer ID Application: Your Name (ABC123)"
 export TEAM_ID="ABC123"
-export KEYCHAIN_PROFILE="agentdeck-notary"
+export KEYCHAIN_PROFILE="coredeck-notary"
 ```
 
 ## Troubleshooting
@@ -143,14 +143,14 @@ Ensure you're using `--options runtime` (hardened runtime) during signing.
 
 Make sure you stapled the notarization ticket:
 ```bash
-xcrun stapler staple "dist/Agent Deck.app"
+xcrun stapler staple "dist/Core Deck.app"
 ```
 
 ### Gatekeeper still blocks the app
 
 Check the detailed assessment:
 ```bash
-spctl --assess --type execute -vvv "dist/Agent Deck.app"
+spctl --assess --type execute -vvv "dist/Core Deck.app"
 ```
 
 ## App Store Considerations

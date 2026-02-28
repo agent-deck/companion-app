@@ -1,13 +1,13 @@
-# AgentDeck
+# CoreDeck
 
-Companion software for the Agent Deck macropad — a hardware control surface for Claude Code. Connects the USB macropad's TFT display, soft keys, mode LEDs, and rotary encoder to your terminal sessions.
+Companion software for the Core Deck macropad — a hardware control surface for Claude Code. Connects the USB macropad's TFT display, soft keys, mode LEDs, and rotary encoder to your terminal sessions.
 
 ## Architecture
 
 The system consists of two binaries:
 
-- **`agentdeck-daemon`** — Background service that owns the HID device. Exposes HTTP REST and WebSocket APIs on `127.0.0.1:19384`. Runs as a tray icon with no dock presence.
-- **`agent-deck`** — GUI app with embedded terminal emulator (wezterm-term + egui). Connects to the daemon via WebSocket for real-time device control.
+- **`coredeck-daemon`** — Background service that owns the HID device. Exposes HTTP REST and WebSocket APIs on `127.0.0.1:19384`. Runs as a tray icon with no dock presence.
+- **`core-deck`** — GUI app with embedded terminal emulator (wezterm-term + egui). Connects to the daemon via WebSocket for real-time device control.
 
 Third-party tools can also integrate with the daemon via its REST API — no GUI app required.
 
@@ -26,7 +26,7 @@ cargo build --workspace
 cargo build --workspace --release
 ```
 
-Output binaries: `target/release/agent-deck` and `target/release/agentdeck-daemon`.
+Output binaries: `target/release/core-deck` and `target/release/coredeck-daemon`.
 
 See [docs/Building.md](docs/Building.md) for Linux dependencies, individual crate builds, and detailed notes.
 
@@ -34,13 +34,13 @@ See [docs/Building.md](docs/Building.md) for Linux dependencies, individual crat
 
 ```bash
 # Start the daemon (must be running first)
-agentdeck-daemon
+coredeck-daemon
 
 # Install as launchd service for auto-start
-agentdeck-daemon install
+coredeck-daemon install
 
 # Start the GUI app
-agent-deck
+core-deck
 ```
 
 ## Quick API Test
@@ -66,9 +66,9 @@ curl -X POST http://127.0.0.1:19384/api/alert \
 
 ```
 crates/
-  agentdeck-protocol/   # Shared types & wire format (serde only)
-  agentdeck-daemon/     # Background daemon (HID, tray, axum server)
-  agentdeck/            # GUI app (egui, wezterm-term, PTY)
+  coredeck-protocol/   # Shared types & wire format (serde only)
+  coredeck-daemon/     # Background daemon (HID, tray, axum server)
+  coredeck/            # GUI app (egui, wezterm-term, PTY)
 docs/                   # API documentation
 ```
 

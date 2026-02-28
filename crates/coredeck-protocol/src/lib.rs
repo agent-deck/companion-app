@@ -1,0 +1,436 @@
+//! Shared types and wire format for CoreDeck daemon ↔ app communication.
+//!
+//! This crate is intentionally lightweight (only `serde` + `serde_json`).
+//! It defines:
+//! - Device types shared between daemon and app (DeviceMode, DeviceState, etc.)
+//! - WebSocket binary protocol (WsTag, frame encoding/decoding)
+//! - HTTP REST request/response types
+
+use serde::{Deserialize, Serialize};
+
+// ── Device types (shared) ──────────────────────────────────────────
+
+/// Device operating mode (LED indicator)
+///
+/// Cycle order on the device: Default -> Accept -> Plan -> Default
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum DeviceMode {
+    #[default]
+    Default = 0,
+    Accept = 1,
+    Plan = 2,
+}
+
+impl DeviceMode {
+    pub fn from_byte(byte: u8) -> Self {
+        match byte {
+            1 => DeviceMode::Accept,
+            2 => DeviceMode::Plan,
+            _ => DeviceMode::Default,
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviceMode::Default => write!(f, "default"),
+            DeviceMode::Accept => write!(f, "accept"),
+            DeviceMode::Plan => write!(f, "plan"),
+        }
+    }
+}
+
+/// Device state parsed from state report
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DeviceState {
+    pub mode: DeviceMode,
+    pub yolo: bool,
+}
+
+impl DeviceState {
+    /// Parse from a single state byte.
+    /// Bit layout: bits[1:0] = mode, bit[2] = yolo
+    pub fn from_byte(byte: u8) -> Self {
+        Self {
+            mode: DeviceMode::from_byte(byte & 0x03),
+            yolo: byte & 0x04 != 0,
+        }
+    }
+
+    /// Encode to a single state byte.
+    pub fn to_byte(&self) -> u8 {
+        let mut b = self.mode as u8;
+        if self.yolo {
+            b |= 0x04;
+        }
+        b
+    }
+}
+
+/// Display update data structure matching firmware JSON format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayUpdate {
+    /// Session name
+    pub session: String,
+    /// Current task description (empty when idle)
+    pub task: String,
+    /// Second task line (pre-split by app), empty when unused
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub task2: String,
+    /// Tab states for all non-new-tab sessions
+    pub tabs: Vec<u8>,
+    /// Index into tabs array for the currently active tab
+    pub active: usize,
+}
+
+/// Tab state constants
+pub const TAB_STATE_INACTIVE: u8 = 0;
+pub const TAB_STATE_STARTED: u8 = 1;
+pub const TAB_STATE_WORKING: u8 = 2;
+
+/// Soft key type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SoftKeyType {
+    Default = 0,
+    Keycode = 1,
+    String = 2,
+    Sequence = 3,
+}
+
+impl SoftKeyType {
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(SoftKeyType::Default),
+            1 => Some(SoftKeyType::Keycode),
+            2 => Some(SoftKeyType::String),
+            3 => Some(SoftKeyType::Sequence),
+            _ => None,
+        }
+    }
+}
+
+/// Soft key configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoftKeyConfig {
+    pub index: u8,
+    pub key_type: SoftKeyType,
+    pub data: Vec<u8>,
+}
+
+// ── WebSocket binary protocol ──────────────────────────────────────
+//
+// Every binary WS frame: [tag: u8][seq_lo: u8][seq_hi: u8][payload...]
+// seq is a 16-bit little-endian sequence number.
+// Daemon→App events use seq=0. App→Daemon commands use seq>0.
+// Daemon→App responses echo the seq from the original command.
+
+/// WebSocket message tags: App → Daemon (commands)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WsCommandTag {
+    UpdateDisplay = 0x01,
+    Ping = 0x02,
+    SetBrightness = 0x03,
+    SetSoftKey = 0x04,
+    GetSoftKey = 0x05,
+    ResetSoftKeys = 0x06,
+    SetMode = 0x07,
+    Alert = 0x08,
+    GetVersion = 0x09,
+    ClearAlert = 0x0A,
+}
+
+impl WsCommandTag {
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x01 => Some(Self::UpdateDisplay),
+            0x02 => Some(Self::Ping),
+            0x03 => Some(Self::SetBrightness),
+            0x04 => Some(Self::SetSoftKey),
+            0x05 => Some(Self::GetSoftKey),
+            0x06 => Some(Self::ResetSoftKeys),
+            0x07 => Some(Self::SetMode),
+            0x08 => Some(Self::Alert),
+            0x09 => Some(Self::GetVersion),
+            0x0A => Some(Self::ClearAlert),
+            _ => None,
+        }
+    }
+}
+
+/// WebSocket message tags: Daemon → App (events, seq=0)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WsEventTag {
+    DeviceConnected = 0x80,
+    DeviceDisconnected = 0x81,
+    StateChanged = 0x82,
+    KeyEvent = 0x83,
+    TypeString = 0x84,
+    AppControl = 0x89,
+}
+
+impl WsEventTag {
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x80 => Some(Self::DeviceConnected),
+            0x81 => Some(Self::DeviceDisconnected),
+            0x82 => Some(Self::StateChanged),
+            0x83 => Some(Self::KeyEvent),
+            0x84 => Some(Self::TypeString),
+            0x89 => Some(Self::AppControl),
+            _ => None,
+        }
+    }
+}
+
+/// WebSocket message tags: Daemon → App (responses, seq echoed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WsResponseTag {
+    SoftKeyResponse = 0x85,
+    VersionResponse = 0x86,
+    CommandAck = 0x87,
+    CommandError = 0x88,
+}
+
+impl WsResponseTag {
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x85 => Some(Self::SoftKeyResponse),
+            0x86 => Some(Self::VersionResponse),
+            0x87 => Some(Self::CommandAck),
+            0x88 => Some(Self::CommandError),
+            _ => None,
+        }
+    }
+}
+
+/// AppControl actions sent from daemon tray to app via WS
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AppControlAction {
+    ShowWindow = 0x01,
+    HideWindow = 0x02,
+}
+
+impl AppControlAction {
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x01 => Some(Self::ShowWindow),
+            0x02 => Some(Self::HideWindow),
+        _ => None,
+        }
+    }
+}
+
+/// Device info sent in DeviceConnected event
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub firmware: String,
+}
+
+// ── Frame encoding/decoding helpers ────────────────────────────────
+
+/// Build a binary WS frame: [tag][seq_lo][seq_hi][payload...]
+pub fn encode_ws_frame(tag: u8, seq: u16, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(3 + payload.len());
+    frame.push(tag);
+    frame.push((seq & 0xFF) as u8);
+    frame.push((seq >> 8) as u8);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Decode the header of a binary WS frame. Returns (tag, seq, payload_slice).
+pub fn decode_ws_frame(data: &[u8]) -> Option<(u8, u16, &[u8])> {
+    if data.len() < 3 {
+        return None;
+    }
+    let tag = data[0];
+    let seq = (data[1] as u16) | ((data[2] as u16) << 8);
+    Some((tag, seq, &data[3..]))
+}
+
+// ── HTTP REST types ────────────────────────────────────────────────
+
+/// Default daemon listen address
+pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:19384";
+
+/// Response for GET /api/status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    /// Whether the USB device is physically present (enumerated)
+    #[serde(default)]
+    pub device_available: bool,
+    /// Whether a HID device is connected (interface open, communicating)
+    pub device_connected: bool,
+    /// Device name (if available or connected)
+    pub device_name: Option<String>,
+    /// Firmware version (if connected)
+    pub firmware_version: Option<String>,
+    /// Current device mode
+    pub device_mode: DeviceMode,
+    /// YOLO mode active
+    pub device_yolo: bool,
+    /// Whether a WebSocket client (app) is connected (has the lock)
+    pub ws_locked: bool,
+}
+
+/// Request body for POST /api/display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayUpdateRequest {
+    pub session: String,
+    #[serde(default)]
+    pub task: String,
+    #[serde(default)]
+    pub task2: String,
+    #[serde(default)]
+    pub tabs: Vec<u8>,
+    #[serde(default)]
+    pub active: usize,
+}
+
+/// Request body for POST /api/alert
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertRequest {
+    pub tab: usize,
+    pub session: String,
+    pub text: String,
+    pub details: Option<String>,
+}
+
+/// Request body for POST /api/alert/clear
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClearAlertRequest {
+    pub tab: usize,
+}
+
+/// Request body for POST /api/brightness
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrightnessRequest {
+    pub level: u8,
+    #[serde(default)]
+    pub save: bool,
+}
+
+/// Request body for POST /api/mode
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetModeRequest {
+    pub mode: DeviceMode,
+}
+
+/// Generic API error response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiError {
+    pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_device_mode_roundtrip() {
+        for mode in [DeviceMode::Default, DeviceMode::Accept, DeviceMode::Plan] {
+            assert_eq!(DeviceMode::from_byte(mode as u8), mode);
+        }
+    }
+
+    #[test]
+    fn test_device_state_byte_roundtrip() {
+        let state = DeviceState { mode: DeviceMode::Plan, yolo: true };
+        let byte = state.to_byte();
+        let parsed = DeviceState::from_byte(byte);
+        assert_eq!(parsed.mode, DeviceMode::Plan);
+        assert!(parsed.yolo);
+    }
+
+    #[test]
+    fn test_ws_frame_encode_decode() {
+        let payload = b"hello";
+        let frame = encode_ws_frame(0x01, 42, payload);
+        let (tag, seq, data) = decode_ws_frame(&frame).unwrap();
+        assert_eq!(tag, 0x01);
+        assert_eq!(seq, 42);
+        assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn test_ws_frame_empty_payload() {
+        let frame = encode_ws_frame(0x82, 0, &[]);
+        let (tag, seq, data) = decode_ws_frame(&frame).unwrap();
+        assert_eq!(tag, 0x82);
+        assert_eq!(seq, 0);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_ws_frame_too_short() {
+        assert!(decode_ws_frame(&[0x01]).is_none());
+        assert!(decode_ws_frame(&[0x01, 0x02]).is_none());
+    }
+
+    #[test]
+    fn test_soft_key_type_roundtrip() {
+        for t in [SoftKeyType::Default, SoftKeyType::Keycode, SoftKeyType::String, SoftKeyType::Sequence] {
+            assert_eq!(SoftKeyType::from_byte(t as u8), Some(t));
+        }
+        assert_eq!(SoftKeyType::from_byte(4), None);
+    }
+
+    #[test]
+    fn test_display_update_json() {
+        let update = DisplayUpdate {
+            session: "my-project".to_string(),
+            task: "Reading files".to_string(),
+            task2: String::new(),
+            tabs: vec![0, 1, 2],
+            active: 1,
+        };
+        let json = serde_json::to_string(&update).unwrap();
+        assert!(json.contains("\"session\":\"my-project\""));
+    }
+
+    #[test]
+    fn test_daemon_status_json() {
+        let status = DaemonStatus {
+            device_available: true,
+            device_connected: true,
+            device_name: Some("Core Deck".to_string()),
+            firmware_version: Some("1.0.0".to_string()),
+            device_mode: DeviceMode::Default,
+            device_yolo: false,
+            ws_locked: false,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: DaemonStatus = serde_json::from_str(&json).unwrap();
+        assert!(parsed.device_connected);
+        assert_eq!(parsed.device_name.as_deref(), Some("Core Deck"));
+    }
+
+    #[test]
+    fn test_command_tags() {
+        assert_eq!(WsCommandTag::from_byte(0x01), Some(WsCommandTag::UpdateDisplay));
+        assert_eq!(WsCommandTag::from_byte(0x0A), Some(WsCommandTag::ClearAlert));
+        assert_eq!(WsCommandTag::from_byte(0xFF), None);
+    }
+
+    #[test]
+    fn test_event_tags() {
+        assert_eq!(WsEventTag::from_byte(0x80), Some(WsEventTag::DeviceConnected));
+        assert_eq!(WsEventTag::from_byte(0x89), Some(WsEventTag::AppControl));
+        assert_eq!(WsEventTag::from_byte(0x00), None);
+    }
+
+    #[test]
+    fn test_response_tags() {
+        assert_eq!(WsResponseTag::from_byte(0x85), Some(WsResponseTag::SoftKeyResponse));
+        assert_eq!(WsResponseTag::from_byte(0x88), Some(WsResponseTag::CommandError));
+        assert_eq!(WsResponseTag::from_byte(0x00), None);
+    }
+}

@@ -1,0 +1,63 @@
+[package]
+name = "coredeck-daemon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Background daemon for CoreDeck - owns HID device and exposes WebSocket/REST APIs"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "coredeck-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# Shared protocol types
+coredeck-protocol = { path = "../coredeck-protocol" }
+
+# Async runtime
+tokio = { version = "1.43", features = ["full", "sync", "time", "process", "io-util", "signal"] }
+
+# HTTP + WebSocket server
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+# USB HID communication
+hidapi = "2.6"
+
+# System tray
+tray-icon = "0.19"
+winit = "0.30"
+
+# Image handling for tray icons
+png = "0.17"
+
+# Configuration & serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+
+# Concurrency
+parking_lot = "0.12"
+
+# WebSocket stream utilities
+futures-util = "0.3"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+io-kit-sys = "0.4"
+mach2 = "0.4"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\"))"] }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sign and notarize Agent Deck for macOS distribution
+# Sign and notarize Core Deck for macOS distribution
 # Run this after bundle.sh
 
 set -e
@@ -9,7 +9,7 @@ PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 MACOS_DIR="$PROJECT_ROOT/macos"
 DIST_DIR="$PROJECT_ROOT/dist"
 
-APP_NAME="Agent Deck"
+APP_NAME="Core Deck"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 ENTITLEMENTS="$MACOS_DIR/entitlements.plist"
 
@@ -106,7 +106,7 @@ if [ ! -d "$APP_BUNDLE" ]; then
     exit 1
 fi
 
-echo "=== Signing Agent Deck ==="
+echo "=== Signing Core Deck ==="
 echo "Identity: $SIGNING_IDENTITY"
 echo "Entitlements: $ENTITLEMENTS"
 echo "App Store: $APPSTORE"
@@ -120,7 +120,7 @@ codesign --force --options runtime \
     --sign "$SIGNING_IDENTITY" \
     --entitlements "$ENTITLEMENTS" \
     --timestamp \
-    "$APP_BUNDLE/Contents/MacOS/agent-deck"
+    "$APP_BUNDLE/Contents/MacOS/core-deck"
 
 # Sign the entire app bundle
 echo "Signing app bundle..."
@@ -170,7 +170,7 @@ fi
 echo "=== Notarizing App ==="
 
 # Create a zip for notarization
-ZIP_PATH="$DIST_DIR/AgentDeck-notarize.zip"
+ZIP_PATH="$DIST_DIR/CoreDeck-notarize.zip"
 ditto -c -k --keepParent "$APP_BUNDLE" "$ZIP_PATH"
 
 # Submit for notarization

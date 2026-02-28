@@ -1,4 +1,4 @@
-# Clippy configuration for Agent Deck
+# Clippy configuration for Core Deck
 msrv = "1.75"
 cognitive-complexity-threshold = 25
 too-many-arguments-threshold = 10

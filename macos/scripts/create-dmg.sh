@@ -1,5 +1,5 @@
 #!/bin/bash
-# Create a signed DMG for Agent Deck distribution
+# Create a signed DMG for Core Deck distribution
 # Run this after sign.sh
 
 set -e
@@ -8,10 +8,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 DIST_DIR="$PROJECT_ROOT/dist"
 
-APP_NAME="Agent Deck"
+APP_NAME="Core Deck"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 VERSION=$(grep '^version' "$PROJECT_ROOT/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')
-DMG_NAME="AgentDeck-${VERSION}"
+DMG_NAME="CoreDeck-${VERSION}"
 DMG_PATH="$DIST_DIR/$DMG_NAME.dmg"
 
 # Signing identity (optional, for signed DMG)

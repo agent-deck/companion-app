@@ -123,93 +123,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "agent-deck"
-version = "0.1.0"
-dependencies = [
- "agentdeck-protocol",
- "anyhow",
- "arboard",
- "chrono",
- "cocoa 0.26.1",
- "config",
- "core-foundation 0.10.0",
- "core-foundation-sys",
- "directories",
- "dirs 5.0.1",
- "eframe",
- "egui",
- "egui_extras",
- "egui_glow",
- "futures-util",
- "glow 0.16.0",
- "glutin",
- "glutin-winit",
- "objc",
- "once_cell",
- "open",
- "parking_lot",
- "portable-pty 0.9.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "raw-window-handle",
- "regex",
- "rfd",
- "serde",
- "serde_json",
- "tempfile",
- "termwiz",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tokio-tungstenite 0.26.2",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "vte",
- "wezterm-cell",
- "wezterm-escape-parser",
- "wezterm-font",
- "wezterm-surface",
- "wezterm-term",
- "winit",
-]
-
-[[package]]
-name = "agentdeck-daemon"
-version = "0.1.0"
-dependencies = [
- "agentdeck-protocol",
- "anyhow",
- "axum",
- "clap",
- "cocoa 0.26.1",
- "core-foundation 0.10.0",
- "core-foundation-sys",
- "futures-util",
- "hidapi",
- "io-kit-sys",
- "mach2",
- "objc",
- "parking_lot",
- "png 0.17.16",
- "serde",
- "serde_json",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "tray-icon",
- "winit",
-]
-
-[[package]]
-name = "agentdeck-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1299,6 +1212,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-deck"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "chrono",
+ "cocoa 0.26.1",
+ "config",
+ "core-foundation 0.10.0",
+ "core-foundation-sys",
+ "coredeck-protocol",
+ "directories",
+ "dirs 5.0.1",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "egui_glow",
+ "futures-util",
+ "glow 0.16.0",
+ "glutin",
+ "glutin-winit",
+ "objc",
+ "once_cell",
+ "open",
+ "parking_lot",
+ "portable-pty 0.9.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "raw-window-handle",
+ "regex",
+ "rfd",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "termwiz",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tokio-tungstenite 0.26.2",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "vte",
+ "wezterm-cell",
+ "wezterm-escape-parser",
+ "wezterm-font",
+ "wezterm-surface",
+ "wezterm-term",
+ "winit",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1391,6 +1355,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b49ba7ef1ad6107f8824dbe97de947cbaac53c44e7f9756a1fba0d37c1eec505"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "coredeck-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "cocoa 0.26.1",
+ "core-foundation 0.10.0",
+ "core-foundation-sys",
+ "coredeck-protocol",
+ "futures-util",
+ "hidapi",
+ "io-kit-sys",
+ "mach2",
+ "objc",
+ "parking_lot",
+ "png 0.17.16",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "tray-icon",
+ "winit",
+]
+
+[[package]]
+name = "coredeck-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

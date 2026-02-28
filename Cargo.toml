@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/agentdeck-protocol",
-    "crates/agentdeck",
-    "crates/agentdeck-daemon",
+    "crates/coredeck-protocol",
+    "crates/coredeck",
+    "crates/coredeck-daemon",
 ]
 
 # Default members for `cargo build` / `cargo run`
-default-members = ["crates/agentdeck"]
+default-members = ["crates/coredeck"]
 
 [profile.release]
 opt-level = 3
