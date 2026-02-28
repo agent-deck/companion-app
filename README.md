@@ -1,6 +1,6 @@
 # AgentDeck
 
-Companion software for the Agent Deck macropad — a hardware control surface for Claude Code. Connects the USB macropad's OLED display, soft keys, mode LEDs, and rotary encoder to your terminal sessions.
+Companion software for the Agent Deck macropad — a hardware control surface for Claude Code. Connects the USB macropad's TFT display, soft keys, mode LEDs, and rotary encoder to your terminal sessions.
 
 ## Architecture
 

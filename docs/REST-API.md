@@ -44,7 +44,7 @@ curl -s http://127.0.0.1:19384/api/status
 
 ### POST /api/display
 
-Update the OLED display content (session name, task text, tab states).
+Update the TFT display content (session name, task text, tab states).
 
 **Request body:** [DisplayUpdateRequest](Types.md#displayupdaterequest)
 
@@ -163,7 +163,7 @@ curl -X POST http://127.0.0.1:19384/api/alert/clear \
 
 ### POST /api/brightness
 
-Set the OLED display backlight brightness.
+Set the TFT display backlight brightness.
 
 **Request body:** [BrightnessRequest](Types.md#brightnessrequest)
 

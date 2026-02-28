@@ -47,7 +47,7 @@ Commands are sent by the client to control the device. Each command receives eit
 
 ### 0x01 — UpdateDisplay
 
-Update the OLED display content.
+Update the TFT display content.
 
 **Payload:** JSON-encoded [DisplayUpdate](Types.md#displayupdate)
 
