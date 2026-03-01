@@ -80,6 +80,8 @@ pub struct SessionInfo {
     pub current_task: Option<String>,
     /// Whether Claude finished working while tab was in background (for notification indicator)
     pub finished_in_background: bool,
+    /// Whether plan-fork detection already found a result (skip further checks)
+    pub fork_checked: bool,
     /// Whether an HID alert is currently active for this session
     pub hid_alert_active: bool,
     /// Monotonic order value for FIFO alert resolution (0 = no alert)
@@ -88,6 +90,14 @@ pub struct SessionInfo {
     pub hid_alert_text: Option<String>,
     /// Stored alert details (for re-sending after tab index shifts)
     pub hid_alert_details: Option<String>,
+    /// YOLO mode: this tab auto-answers permission prompts
+    pub yolo_active: bool,
+    /// YOLO mode: confirmation panel should be shown for this tab
+    pub yolo_pending_confirmation: bool,
+    /// YOLO mode: fingerprint of last auto-answered prompt (dedup)
+    pub last_yolo_answer_fingerprint: Option<u64>,
+    /// YOLO mode: pending auto-answer (answer_bytes, fingerprint, send_at)
+    pub yolo_pending_answer: Option<(Vec<u8>, u64, std::time::Instant)>,
 }
 
 impl SessionInfo {
@@ -115,10 +125,15 @@ impl SessionInfo {
             claude_activity: ClaudeActivity::default(),
             current_task: None,
             finished_in_background: false,
+            fork_checked: false,
             hid_alert_active: false,
             alert_order: 0,
             hid_alert_text: None,
             hid_alert_details: None,
+            yolo_active: false,
+            yolo_pending_confirmation: false,
+            last_yolo_answer_fingerprint: None,
+            yolo_pending_answer: None,
         }
     }
 
@@ -140,10 +155,15 @@ impl SessionInfo {
             claude_activity: ClaudeActivity::default(),
             current_task: None,
             finished_in_background: false,
+            fork_checked: false,
             hid_alert_active: false,
             alert_order: 0,
             hid_alert_text: None,
             hid_alert_details: None,
+            yolo_active: false,
+            yolo_pending_confirmation: false,
+            last_yolo_answer_fingerprint: None,
+            yolo_pending_answer: None,
         }
     }
 

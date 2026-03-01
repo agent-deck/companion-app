@@ -202,6 +202,8 @@ curl -X POST http://127.0.0.1:19384/api/brightness \
 
 Set the device operating mode (changes the LED indicator color).
 
+> **Note:** This endpoint only controls the LED mode indicator. The YOLO (auto-approve) state is read-only — it is controlled exclusively by the physical toggle switch on the device and cannot be set via the API.
+
 **Request body:** [SetModeRequest](Types.md#setmoderequest)
 
 ```json

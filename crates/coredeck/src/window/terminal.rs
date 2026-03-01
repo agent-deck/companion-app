@@ -8,7 +8,7 @@ use super::context_menu::{render_context_menu, ContextMenuState};
 use super::glyph_cache::GlyphCache;
 use super::render::{
     handle_settings_modal_result, render_device_popup, render_hyperlink_tooltip, render_tab_bar,
-    render_terminal_content, RenderParams, MAX_TAB_TITLE_LEN, TAB_BAR_HEIGHT,
+    render_terminal_content, render_yolo_confirmation_panel, RenderParams, MAX_TAB_TITLE_LEN, TAB_BAR_HEIGHT,
 };
 use super::settings_modal::{render_settings_modal, SettingsModal};
 use crate::hid::{DeviceMode, SoftKeyEditState};
@@ -99,6 +99,10 @@ pub enum TerminalAction {
     HidClearAlert(usize),
     /// Set HID device LED mode
     HidSetMode(DeviceMode),
+    /// Confirm YOLO mode for a tab
+    YoloConfirm(SessionId),
+    /// Deny/skip YOLO mode for a tab
+    YoloDeny(SessionId),
 }
 
 /// Terminal window state managed within the main app
@@ -191,6 +195,8 @@ pub struct TerminalWindowState {
     claude_json_mtime: Option<SystemTime>,
     /// Monotonic counter for HID alert insertion order (mirrors firmware FIFO)
     pub(super) alert_order_counter: u64,
+    /// Last time we checked for plan-mode session forks
+    pub(super) last_fork_check: std::time::Instant,
 }
 
 impl TerminalWindowState {
@@ -261,6 +267,7 @@ impl TerminalWindowState {
             color_scheme,
             claude_json_mtime: cj_mtime,
             alert_order_counter: 0,
+            last_fork_check: std::time::Instant::now(),
         }
     }
 
@@ -326,12 +333,7 @@ impl TerminalWindowState {
             } else {
                 "\u{1F916}".to_string()
             };
-            let title = if self.device_yolo {
-                format!("\u{1F525} {}", base)
-            } else {
-                base
-            };
-            window.set_title(&title);
+            window.set_title(&base);
         }
     }
 
@@ -736,26 +738,28 @@ impl TerminalWindowState {
         self.cached_line_height.set(line_height);
     }
 
-    /// Render the window
-    pub fn render(&mut self) {
+    /// Render the window. Returns true if HID nav keys were consumed during
+    /// this frame, signalling the caller to schedule a follow-up redraw so that
+    /// any resulting state changes become visible immediately.
+    pub fn render(&mut self) -> bool {
         self.process_notifications();
         self.process_terminal_responses();
 
         if !self.is_visible() {
-            return;
+            return false;
         }
 
         let Some(ref window) = self.window else {
-            return;
+            return false;
         };
         let Some(ref gl_context) = self.gl_context else {
-            return;
+            return false;
         };
         let Some(ref gl_surface) = self.gl_surface else {
-            return;
+            return false;
         };
         let Some(ref glow_context) = self.glow_context else {
-            return;
+            return false;
         };
 
         let scroll_offset = self.scroll_offset.load(Ordering::Relaxed) as usize;
@@ -764,7 +768,7 @@ impl TerminalWindowState {
         let has_selection_for_menu = self.has_selection();
 
         let Some(ref mut egui_glow) = self.egui_glow else {
-            return;
+            return false;
         };
 
         let selection = match (self.selection_start, self.selection_end) {
@@ -796,6 +800,7 @@ impl TerminalWindowState {
                 s.bell_active,
                 s.claude_activity,
                 s.finished_in_background,
+                s.yolo_active,
             ))
             .collect();
         let active_session_idx = self.session_manager.active_session_index();
@@ -813,6 +818,13 @@ impl TerminalWindowState {
 
         let device_name = self.device_name.clone();
         let firmware_version = self.firmware_version.clone();
+
+        let had_hid_keys = !self.pending_hid_nav_keys.is_empty();
+
+        // Check if the active tab has a pending YOLO confirmation
+        let yolo_pending_session_id = self.session_manager.active_session()
+            .filter(|s| s.yolo_pending_confirmation)
+            .map(|s| s.id);
 
         let mut render_params = RenderParams {
             scroll_offset,
@@ -857,6 +869,11 @@ impl TerminalWindowState {
                 .show(ctx, |ui| {
                     render_terminal_content(ui, ctx, &mut render_params, &mut new_actions);
                 });
+
+            // YOLO confirmation panel (if pending for active tab)
+            if let Some(sid) = yolo_pending_session_id {
+                render_yolo_confirmation_panel(ctx, sid, color_scheme, &mut new_actions);
+            }
 
             // Hyperlink tooltip
             render_hyperlink_tooltip(ctx, &self.hovered_hyperlink);
@@ -919,6 +936,8 @@ impl TerminalWindowState {
 
         egui_glow.paint(window);
         gl_surface.swap_buffers(gl_context).unwrap();
+
+        had_hid_keys
     }
 }
 

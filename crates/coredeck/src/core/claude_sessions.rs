@@ -350,6 +350,85 @@ fn fetch_sessions_uncached(project_path: &Path) -> Vec<ClaudeSession> {
     sessions
 }
 
+/// Detect a plan-mode fork of a parent session.
+///
+/// When Claude Code exits plan mode, it creates a new `.jsonl` file (the "fork")
+/// whose line 2 contains `"sessionId": "<parent-uuid>"` referencing the original
+/// session and `"planContent"` with the approved plan text.
+///
+/// Returns the new (forked) session ID if found, or `None`.
+pub fn detect_plan_fork(dir: &Path, parent_session_id: &str) -> Option<String> {
+    let project_path = get_project_storage_path(dir)?;
+    detect_plan_fork_in(project_path, parent_session_id)
+}
+
+/// Inner implementation that scans a concrete directory for plan-mode forks.
+fn detect_plan_fork_in(project_path: PathBuf, parent_session_id: &str) -> Option<String> {
+    let entries = std::fs::read_dir(&project_path).ok()?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let file_stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Skip the parent file itself
+        if file_stem == parent_session_id {
+            continue;
+        }
+
+        // Read line 2
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let reader = BufReader::new(file);
+        let mut lines_iter = reader.lines();
+
+        // Skip line 1
+        if lines_iter.next().is_none() {
+            continue;
+        }
+
+        let line2 = match lines_iter.next() {
+            Some(Ok(l)) => l,
+            _ => continue,
+        };
+
+        // Parse only the fork-relevant fields
+        let parsed: ForkDetectLine = match serde_json::from_str(&line2) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Check: sessionId matches parent AND planContent is present
+        if parsed.session_id.as_deref() == Some(parent_session_id)
+            && parsed.plan_content.is_some()
+        {
+            return Some(file_stem.to_string());
+        }
+    }
+
+    None
+}
+
+/// Minimal struct for detecting plan-mode fork files.
+/// Only deserializes the two fields we need from line 2 of a `.jsonl` file.
+#[derive(Deserialize)]
+struct ForkDetectLine {
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    #[serde(rename = "planContent")]
+    plan_content: Option<serde_json::Value>,
+}
+
 /// Get session count for a directory (uses cached data from get_sessions_for_directory).
 ///
 /// Returns 0 if no sessions found or on error.
@@ -502,5 +581,69 @@ mod tests {
     fn test_extract_first_prompt_file_history_snapshot() {
         let line = r#"{"type":"file-history-snapshot","messageId":"abc"}"#;
         assert_eq!(extract_first_prompt(line), None);
+    }
+
+    #[test]
+    fn test_detect_plan_fork_finds_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_id = "aaaa-bbbb-parent";
+        let fork_id = "cccc-dddd-fork";
+
+        // Create parent .jsonl (should be skipped)
+        std::fs::write(
+            dir.path().join(format!("{}.jsonl", parent_id)),
+            "{\"type\":\"file-history-snapshot\"}\n{\"type\":\"user\",\"message\":{\"content\":\"hello\"}}\n",
+        ).unwrap();
+
+        // Create fork .jsonl — line 2 has sessionId referencing parent + planContent
+        std::fs::write(
+            dir.path().join(format!("{}.jsonl", fork_id)),
+            format!(
+                "{{\"type\":\"file-history-snapshot\"}}\n{{\"type\":\"user\",\"sessionId\":\"{}\",\"planContent\":\"## Plan\\nDo stuff\",\"message\":{{\"content\":\"Implement the following plan:\"}}}}\n",
+                parent_id
+            ),
+        ).unwrap();
+
+        // Create unrelated .jsonl (should be skipped)
+        std::fs::write(
+            dir.path().join("eeee-unrelated.jsonl"),
+            "{\"type\":\"file-history-snapshot\"}\n{\"type\":\"user\",\"message\":{\"content\":\"unrelated\"}}\n",
+        ).unwrap();
+
+        let result = detect_plan_fork_in(dir.path().to_path_buf(), parent_id);
+        assert_eq!(result, Some(fork_id.to_string()));
+    }
+
+    #[test]
+    fn test_detect_plan_fork_no_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_id = "aaaa-bbbb-parent";
+
+        // Only the parent file exists
+        std::fs::write(
+            dir.path().join(format!("{}.jsonl", parent_id)),
+            "{\"type\":\"file-history-snapshot\"}\n{\"type\":\"user\",\"message\":{\"content\":\"hello\"}}\n",
+        ).unwrap();
+
+        let result = detect_plan_fork_in(dir.path().to_path_buf(), parent_id);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_detect_plan_fork_ignores_session_id_without_plan_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_id = "aaaa-bbbb-parent";
+
+        // File has sessionId matching parent but NO planContent
+        std::fs::write(
+            dir.path().join("ffff-no-plan.jsonl"),
+            format!(
+                "{{\"type\":\"file-history-snapshot\"}}\n{{\"type\":\"user\",\"sessionId\":\"{}\",\"message\":{{\"content\":\"resumed\"}}}}\n",
+                parent_id
+            ),
+        ).unwrap();
+
+        let result = detect_plan_fork_in(dir.path().to_path_buf(), parent_id);
+        assert_eq!(result, None);
     }
 }

@@ -25,7 +25,7 @@ Returned by `GET /api/status`.
 | `device_name` | string \| null | Device product name (if available) |
 | `firmware_version` | string \| null | Firmware version string (if connected) |
 | `device_mode` | [DeviceMode](#devicemode) | Current operating mode |
-| `device_yolo` | boolean | YOLO toggle switch state |
+| `device_yolo` | boolean | YOLO (auto-approve) hardware toggle state. Read-only — controlled exclusively by the physical switch on the device |
 | `ws_locked` | boolean | Whether a WebSocket client holds the exclusive lock |
 
 ## DisplayUpdateRequest
@@ -154,7 +154,7 @@ Single byte with bit fields:
 | Bits | Field | Values |
 |------|-------|--------|
 | 1:0 | mode | 0=Default, 1=Accept, 2=Plan |
-| 2 | yolo | 0=off, 1=on |
+| 2 | yolo | 0=off, 1=on (hardware switch, read-only) |
 | 7:3 | reserved | 0 |
 
 ## DeviceInfo

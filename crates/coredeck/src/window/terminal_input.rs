@@ -7,7 +7,7 @@ use super::input::{
 use super::terminal::{TerminalAction, TerminalWindowState};
 use arboard::Clipboard;
 use tracing::debug;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
 #[cfg(target_os = "macos")]
@@ -206,6 +206,29 @@ impl TerminalWindowState {
 
                     #[cfg(target_os = "macos")]
                     {
+                        // Ensure the NSView is the first responder so that
+                        // keyboard events (including from USB devices like the
+                        // encoder) reach winit after focus changes.
+                        if let Some(ref window) = self.window {
+                            use raw_window_handle::HasWindowHandle;
+                            if let Ok(handle) = window.window_handle() {
+                                use raw_window_handle::RawWindowHandle;
+                                if let RawWindowHandle::AppKit(appkit_handle) = handle.as_raw() {
+                                    let view = appkit_handle.ns_view.as_ptr();
+                                    #[allow(deprecated)]
+                                    unsafe {
+                                        use objc::{msg_send, sel, sel_impl};
+                                        let ns_window: cocoa::base::id =
+                                            msg_send![view as cocoa::base::id, window];
+                                        if ns_window != cocoa::base::nil {
+                                            let _: () = msg_send![ns_window,
+                                                makeFirstResponder: view as cocoa::base::id];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         let has_selection = self.has_selection();
                         let has_clipboard = arboard::Clipboard::new()
                             .ok()
@@ -213,6 +236,35 @@ impl TerminalWindowState {
                             .map(|t| !t.is_empty())
                             .unwrap_or(false);
                         update_edit_menu_state(has_selection, has_clipboard);
+                    }
+                }
+            }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                if !text.is_empty() && !self.settings_modal.is_open {
+                    if let Some(session) = self.session_manager.active_session() {
+                        if session.is_running {
+                            self.scroll_to_bottom();
+                            self.clear_selection();
+                            self.send_to_pty(text.as_bytes());
+                        } else if session.is_new_tab() {
+                            // Encoder push sends Enter via IME on macOS;
+                            // route it to the new-tab UI as a nav key.
+                            for byte in text.bytes() {
+                                let key = match byte {
+                                    b'\r' | b'\n' => Some(egui::Key::Enter),
+                                    0x1b => Some(egui::Key::Escape),
+                                    _ => None,
+                                };
+                                if let Some(k) = key {
+                                    self.pending_hid_nav_keys.push(k);
+                                }
+                            }
+                            if !self.pending_hid_nav_keys.is_empty() {
+                                if let Some(ref window) = self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                        }
                     }
                 }
             }

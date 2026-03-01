@@ -1,4 +1,4 @@
-//! PTY I/O methods for TerminalWindowState
+//! PTY I/O methods (input routing and output processing) for TerminalWindowState
 
 use super::terminal::TerminalWindowState;
 use crate::core::sessions::SessionId;
@@ -23,8 +23,15 @@ impl TerminalWindowState {
     pub fn send_to_session_pty(&self, session_id: SessionId, data: &[u8]) {
         if let Some(session) = self.session_manager.get_session(session_id) {
             if let Some(ref tx) = session.pty_input_tx {
-                let _ = tx.send(data.to_vec());
+                match tx.send(data.to_vec()) {
+                    Ok(()) => debug!("PTY input sent to session {}: {} bytes", session_id, data.len()),
+                    Err(e) => tracing::warn!("PTY input send failed for session {}: {}", session_id, e),
+                }
+            } else {
+                tracing::warn!("No PTY input tx for session {}", session_id);
             }
+        } else {
+            tracing::warn!("Session {} not found for PTY send", session_id);
         }
     }
 

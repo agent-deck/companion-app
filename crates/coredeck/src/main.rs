@@ -696,6 +696,17 @@ impl App {
                 self.terminal_window.update_window_title();
                 self.send_hid_for_active_session();
                 self.start_claude_for_session(session_id, path, resume_session, event_loop);
+                // Set YOLO state for newly created session
+                if self.terminal_window.device_yolo {
+                    let focused = self.terminal_window.is_focused();
+                    if let Some(s) = self.terminal_window.session_manager.get_session_mut(session_id) {
+                        if focused {
+                            s.yolo_active = true;
+                        } else {
+                            s.yolo_pending_confirmation = true;
+                        }
+                    }
+                }
                 // Save tabs after opening a directory
                 self.save_tabs();
             }
@@ -897,6 +908,17 @@ impl App {
                     }
                 }
             }
+            TerminalAction::YoloConfirm(session_id) => {
+                if let Some(s) = self.terminal_window.session_manager.get_session_mut(session_id) {
+                    s.yolo_active = true;
+                    s.yolo_pending_confirmation = false;
+                }
+            }
+            TerminalAction::YoloDeny(session_id) => {
+                if let Some(s) = self.terminal_window.session_manager.get_session_mut(session_id) {
+                    s.yolo_pending_confirmation = false;
+                }
+            }
         }
     }
 
@@ -1054,6 +1076,7 @@ impl App {
             }
             AppEvent::DeviceStateChanged { mode, yolo } => {
                 debug!("Device state changed: mode={}, yolo={}", mode, yolo);
+                let was_yolo = self.terminal_window.device_yolo;
                 {
                     let mut state = self.state.write();
                     state.device_mode = mode;
@@ -1061,6 +1084,31 @@ impl App {
                 }
                 self.terminal_window.device_yolo = yolo;
                 self.terminal_window.update_window_title();
+
+                // YOLO state transitions for per-tab activation
+                if yolo && !was_yolo {
+                    // YOLO just turned ON
+                    let active_id = self.terminal_window.session_manager.active_session_id();
+                    let focused = self.terminal_window.is_focused();
+                    for s in self.terminal_window.session_manager.iter_mut() {
+                        if s.is_new_tab() {
+                            continue;
+                        }
+                        if Some(s.id) == active_id && focused {
+                            s.yolo_active = true;
+                        } else {
+                            s.yolo_pending_confirmation = true;
+                        }
+                    }
+                } else if !yolo && was_yolo {
+                    // YOLO just turned OFF — clear all tabs
+                    for s in self.terminal_window.session_manager.iter_mut() {
+                        s.yolo_active = false;
+                        s.yolo_pending_confirmation = false;
+                        s.last_yolo_answer_fingerprint = None;
+                        s.yolo_pending_answer = None;
+                    }
+                }
 
                 // Check if the app recently sent a SetMode command. If so, this
                 // StateReport is a confirmation (or stale echo) — not a user button
@@ -1491,12 +1539,24 @@ impl ApplicationHandler for App {
                     self.terminal_window.handle_resize(size.width, size.height);
                 }
                 WindowEvent::RedrawRequested => {
-                    self.terminal_window.render();
+                    let had_hid_keys = self.terminal_window.render();
 
                     // Process any terminal actions
                     let actions = self.terminal_window.take_pending_actions();
+                    let had_actions = !actions.is_empty();
                     for action in actions {
                         self.handle_terminal_action(action, event_loop);
+                    }
+
+                    // HID nav keys and terminal actions bypass egui's input
+                    // system, so egui won't auto-schedule a follow-up frame.
+                    // Request one ourselves so that any state change (e.g.
+                    // new-tab view transition, session start) is visible
+                    // immediately.
+                    if had_hid_keys || had_actions {
+                        if let Some(ref window) = self.terminal_window.window {
+                            window.request_redraw();
+                        }
                     }
                     return;
                 }

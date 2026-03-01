@@ -1,6 +1,7 @@
 //! Terminal rendering logic
 //!
-//! Contains the main render function and terminal content rendering helpers.
+//! Contains the main render function, terminal content rendering helpers,
+//! tab bar with YOLO indicators, and confirmation panel overlay.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -69,6 +70,7 @@ pub type SessionRenderData = (
     bool,
     crate::core::sessions::ClaudeActivity,
     bool,
+    bool, // yolo_active
 );
 
 /// Parameters for rendering the terminal window
@@ -155,7 +157,7 @@ pub fn render_tab_bar(
                 ui.set_clip_rect(ui.max_rect());
 
                 // Render only tabs that fit
-                for (idx, (id, title, _is_new, is_running, working_dir, is_loading, terminal_title, _bell_active, claude_activity, finished_in_background)) in sessions_data.iter().take(max_visible_tabs).enumerate() {
+                for (idx, (id, title, _is_new, is_running, working_dir, is_loading, terminal_title, _bell_active, claude_activity, finished_in_background, yolo_active)) in sessions_data.iter().take(max_visible_tabs).enumerate() {
                     render_single_tab(
                         ui,
                         ctx,
@@ -169,6 +171,7 @@ pub fn render_tab_bar(
                         terminal_title,
                         claude_activity,
                         *finished_in_background,
+                        *yolo_active,
                         active_session_idx,
                         full_tab_width,
                         color_scheme,
@@ -278,6 +281,7 @@ fn render_single_tab(
     terminal_title: &Option<String>,
     claude_activity: &crate::core::sessions::ClaudeActivity,
     finished_in_background: bool,
+    yolo_active: bool,
     active_session_idx: usize,
     full_tab_width: f32,
     color_scheme: ColorScheme,
@@ -434,18 +438,25 @@ fn render_single_tab(
             // Calculate available width for title
             let available_width = ui.available_width();
 
-            // Measure actual text width using galley
+            // Fire emoji prefix for YOLO tabs (measured separately for truncation)
             let font_id = egui::FontId::proportional(11.0);
+            let fire_prefix = if yolo_active { "\u{1F525} " } else { "" };
+            let fire_width = if yolo_active {
+                ui.fonts(|f| f.layout_no_wrap(fire_prefix.to_string(), font_id.clone(), text_color).size().x)
+            } else {
+                0.0
+            };
+
+            let title_budget = available_width - fire_width;
             let full_text_width = ui.fonts(|f| {
                 f.layout_no_wrap(display_title.clone(), font_id.clone(), text_color).size().x
             });
 
-            let truncated_title = if full_text_width > available_width && display_title.len() > 3 {
-                // Binary search for the right truncation point
+            let truncated_title = if full_text_width > title_budget && display_title.len() > 3 {
                 let ellipsis_width = ui.fonts(|f| {
                     f.layout_no_wrap("...".to_string(), font_id.clone(), text_color).size().x
                 });
-                let target_width = available_width - ellipsis_width;
+                let target_width = title_budget - ellipsis_width;
 
                 let mut end = display_title.len();
                 while end > 0 {
@@ -456,7 +467,6 @@ fn render_single_tab(
                     if test_width <= target_width {
                         break;
                     }
-                    // Step back by char boundary
                     end = display_title[..end].char_indices().last().map(|(i, _)| i).unwrap_or(0);
                 }
 
@@ -471,17 +481,45 @@ fn render_single_tab(
 
             // Center the title in remaining space
             ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
-                // Add underline if Claude finished working in background
-                let mut rich_text = egui::RichText::new(truncated_title)
-                    .size(11.0)
-                    .color(text_color);
-                if finished_in_background && !is_active {
-                    rich_text = rich_text.underline();
+                let underline = finished_in_background && !is_active;
+
+                if yolo_active {
+                    // Use LayoutJob for multi-colored text: orange fire + normal title
+                    let fire_color = egui::Color32::from_rgb(0xFF, 0x63, 0x00); // vivid orange-red
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(
+                        fire_prefix,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: font_id.clone(),
+                            color: fire_color,
+                            ..Default::default()
+                        },
+                    );
+                    job.append(
+                        &truncated_title,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: font_id.clone(),
+                            color: text_color,
+                            underline: if underline {
+                                egui::Stroke::new(1.0, text_color)
+                            } else {
+                                egui::Stroke::NONE
+                            },
+                            ..Default::default()
+                        },
+                    );
+                    ui.add(egui::Label::new(job).selectable(false));
+                } else {
+                    let mut rich_text = egui::RichText::new(truncated_title)
+                        .size(11.0)
+                        .color(text_color);
+                    if underline {
+                        rich_text = rich_text.underline();
+                    }
+                    ui.add(egui::Label::new(rich_text).selectable(false));
                 }
-                ui.add(
-                    egui::Label::new(rich_text)
-                        .selectable(false),
-                );
             });
         });
     }
@@ -1165,6 +1203,63 @@ pub fn render_device_popup(
 }
 
 /// Handle settings modal result
+/// Render YOLO confirmation panel at the top of the terminal area
+pub fn render_yolo_confirmation_panel(
+    ctx: &egui::Context,
+    session_id: SessionId,
+    color_scheme: ColorScheme,
+    new_actions: &mut Vec<TerminalAction>,
+) {
+    egui::Area::new(egui::Id::new("yolo_confirmation"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, TAB_BAR_HEIGHT + 4.0))
+        .show(ctx, |ui| {
+            let amber_bg = egui::Color32::from_rgb(0xB4, 0x5D, 0x00);
+            egui::Frame::default()
+                .fill(amber_bg)
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(16.0, 8.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("\u{1F525} Enable Armed (auto-approve) mode for this tab?")
+                                    .size(13.0)
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .selectable(false),
+                        );
+                        let enable_btn = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("Enable")
+                                    .size(12.0)
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(0x2E, 0x7D, 0x32))
+                            .rounding(4.0),
+                        );
+                        if enable_btn.clicked() {
+                            new_actions.push(TerminalAction::YoloConfirm(session_id));
+                        }
+                        let skip_btn = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("Skip")
+                                    .size(12.0)
+                                    .color(color_scheme.foreground()),
+                            )
+                            .fill(egui::Color32::from_rgba_unmultiplied(128, 128, 128, 80))
+                            .rounding(4.0),
+                        );
+                        if skip_btn.clicked() {
+                            new_actions.push(TerminalAction::YoloDeny(session_id));
+                        }
+                    });
+                });
+        });
+}
+
 pub fn handle_settings_modal_result(
     result: SettingsModalResult,
     new_actions: &mut Vec<TerminalAction>,

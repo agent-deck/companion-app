@@ -1,6 +1,7 @@
-//! Notification processing and terminal response forwarding for TerminalWindowState
+//! Notification processing, terminal response forwarding, and YOLO auto-answer for TerminalWindowState
 
 use super::terminal::{TerminalAction, TerminalWindowState};
+use crate::core::claude_sessions::detect_plan_fork;
 use crate::core::sessions::{ClaudeActivity, SessionId};
 use tracing::{debug, info};
 use wezterm_term::Alert;
@@ -176,6 +177,11 @@ impl TerminalWindowState {
                     session_info.finished_in_background = true;
                 }
 
+                // Clear YOLO fingerprint when activity stops working (so next prompt can be answered)
+                if was_working && !activity.is_working() && session_info.yolo_active {
+                    session_info.last_yolo_answer_fingerprint = None;
+                }
+
                 session_info.claude_activity = activity;
 
                 // Only trigger HID update when something actually changed
@@ -191,6 +197,39 @@ impl TerminalWindowState {
 
         for session_id in sessions_needing_resolution {
             self.try_resolve_session_id(session_id);
+        }
+
+        // Periodic plan-fork detection (~every 10s)
+        if self.last_fork_check.elapsed().as_secs() >= 10 {
+            self.last_fork_check = std::time::Instant::now();
+
+            // Collect candidates: running sessions with a known claude_session_id that haven't been fork-checked
+            let candidates: Vec<(SessionId, std::path::PathBuf, String)> = self
+                .session_manager
+                .iter()
+                .filter(|s| s.is_running && !s.fork_checked)
+                .filter_map(|s| {
+                    let cid = s.claude_session_id.as_ref()?;
+                    if cid.is_empty() {
+                        return None;
+                    }
+                    Some((s.id, s.working_directory.clone(), cid.clone()))
+                })
+                .collect();
+
+            for (sid, working_dir, claude_id) in candidates {
+                if let Some(forked_id) = detect_plan_fork(&working_dir, &claude_id) {
+                    if let Some(session) = self.session_manager.get_session_mut(sid) {
+                        info!(
+                            "Detected plan fork for session {}: {} -> {}",
+                            sid, claude_id, forked_id
+                        );
+                        session.claude_session_id = Some(forked_id);
+                        session.fork_checked = true;
+                    }
+                    self.pending_actions.push(TerminalAction::SaveTabs);
+                }
+            }
         }
 
         crate::update_working_session_count(self.session_manager.working_session_count());
@@ -304,6 +343,82 @@ impl TerminalWindowState {
                     tabs,
                     active,
                 });
+            }
+        }
+
+        // YOLO auto-answer: two-phase approach with delay.
+        // Phase 1: detect prompts. If no prompt visible, clear stale fingerprint so the
+        //          next (possibly identical) prompt can be answered. If a new prompt is
+        //          found, schedule the answer with a short delay.
+        // Phase 2: send scheduled answers whose delay has elapsed.
+        if self.device_yolo {
+            let delay = std::time::Duration::from_millis(100);
+
+            // Phase 1: detect new prompts → schedule pending answers
+            // Skip sessions with a pending answer already queued
+            let candidates: Vec<_> = self.session_manager.iter()
+                .filter(|s| s.yolo_active && s.is_running && s.yolo_pending_answer.is_none())
+                .map(|s| s.id)
+                .collect();
+
+            let mut new_detections: Vec<(SessionId, Vec<u8>, u64)> = Vec::new();
+            let mut cleared_fingerprints: Vec<SessionId> = Vec::new();
+            for sid in &candidates {
+                if let Some(s) = self.session_manager.get_session(*sid) {
+                    let session = s.session.lock();
+                    let det = session.detect_yolo_prompt();
+                    match det {
+                        Some(d) => {
+                            if s.last_yolo_answer_fingerprint == Some(d.fingerprint) {
+                                // Same prompt still on screen — skip
+                            } else {
+                                debug!("YOLO session {}: detected prompt, option={}", sid, d.answer_number);
+                                // Send Enter — cursor is already on option 1 (first Yes)
+                                let bytes = vec![b'\r'];
+                                new_detections.push((*sid, bytes, d.fingerprint));
+                            }
+                        }
+                        None => {
+                            // No prompt on screen — clear fingerprint so the next
+                            // prompt (even with identical text) will be detected
+                            if s.last_yolo_answer_fingerprint.is_some() {
+                                cleared_fingerprints.push(*sid);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for sid in cleared_fingerprints {
+                if let Some(s) = self.session_manager.get_session_mut(sid) {
+                    s.last_yolo_answer_fingerprint = None;
+                }
+            }
+
+            for (sid, bytes, fp) in new_detections {
+                if let Some(s) = self.session_manager.get_session_mut(sid) {
+                    s.yolo_pending_answer = Some((bytes, fp, std::time::Instant::now() + delay));
+                }
+            }
+
+            // Phase 2: send answers whose delay has elapsed
+            let ready: Vec<_> = self.session_manager.iter()
+                .filter(|s| {
+                    s.yolo_pending_answer.as_ref()
+                        .map(|(_, _, at)| std::time::Instant::now() >= *at)
+                        .unwrap_or(false)
+                })
+                .map(|s| s.id)
+                .collect();
+
+            for sid in ready {
+                if let Some(s) = self.session_manager.get_session_mut(sid) {
+                    if let Some((bytes, fp, _)) = s.yolo_pending_answer.take() {
+                        s.last_yolo_answer_fingerprint = Some(fp);
+                        info!("YOLO session {}: sending answer {:?}", sid, String::from_utf8_lossy(&bytes));
+                        self.send_to_session_pty(sid, &bytes);
+                    }
+                }
             }
         }
     }

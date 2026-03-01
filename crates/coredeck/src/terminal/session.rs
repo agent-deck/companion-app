@@ -6,6 +6,8 @@ use crate::hid::protocol::DeviceMode;
 use crate::terminal::config::CoreDeckTermConfig;
 use crate::terminal::notifications::NotificationHandler;
 use parking_lot::Mutex;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::sync::{mpsc, Arc};
 use wezterm_term::color::ColorPalette;
@@ -27,6 +29,14 @@ impl Write for PtyForwardWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// Result of detecting a YOLO-answerable permission prompt
+pub struct YoloPromptDetection {
+    /// The number to type (e.g., 1 for "1. Yes")
+    pub answer_number: u8,
+    /// Hash of the prompt content for deduplication
+    pub fingerprint: u64,
 }
 
 /// A terminal session wrapping WezTerm's terminal emulator.
@@ -368,6 +378,124 @@ impl Session {
         }
 
         args_fallback.or(bold_fallback).or(question_fallback)
+    }
+
+    /// Detect a YOLO-answerable permission prompt on the terminal screen.
+    ///
+    /// Scans the bottom of the visible area for Claude Code permission prompts:
+    /// 1. Find "Esc to cancel" hints line (confirms permission prompt)
+    /// 2. Skip "ctrl-g to edit" (plan approval, not a permission prompt)
+    /// 3. Collect numbered option lines (`N. text`), find first starting with "Yes"
+    /// 4. Find "Do you want" or "want to proceed" question line
+    /// 5. Compute fingerprint (hash of question + options text) for dedup
+    /// 6. Return the option number + fingerprint
+    pub fn detect_yolo_prompt(&self) -> Option<YoloPromptDetection> {
+        let mut term = self.terminal.lock();
+        let screen = term.screen_mut();
+        let total_lines = screen.scrollback_rows();
+        let physical_rows = screen.physical_rows;
+
+        let bottom_phys = total_lines.saturating_sub(1);
+
+        // Phase 1: Find the hints line ("Esc to cancel") scanning upward
+        let mut hints_offset = None;
+        for offset in 0..physical_rows.min(30) {
+            let phys_idx = bottom_phys.saturating_sub(offset);
+            if phys_idx >= total_lines {
+                continue;
+            }
+            let line = screen.line_mut(phys_idx);
+            let mut line_text = String::new();
+            for cell in line.visible_cells() {
+                line_text.push_str(cell.str());
+            }
+            let trimmed = line_text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Plan approval prompt — not a permission prompt
+            if trimmed.contains("ctrl-g to edit") {
+                return None;
+            }
+            if trimmed.contains("Esc to cancel") || trimmed.contains("esc to cancel") {
+                hints_offset = Some(offset);
+                break;
+            }
+        }
+
+        let hints_offset = hints_offset?;
+
+        // Phase 2: Scan upward from hints line, collecting numbered options.
+        // Detection is structural: hints line + numbered options with a "Yes" choice.
+        // The question text (if found) is used only for fingerprinting.
+        let mut options: Vec<(u8, String)> = Vec::new(); // (number, text)
+        let mut fingerprint_material = String::new();
+
+        for offset in (hints_offset + 1)..physical_rows.min(30) {
+            let phys_idx = bottom_phys.saturating_sub(offset);
+            if phys_idx >= total_lines {
+                break;
+            }
+            let line = screen.line_mut(phys_idx);
+            let mut line_text = String::new();
+            for cell in line.visible_cells() {
+                line_text.push_str(cell.str());
+            }
+            let trimmed = line_text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // Stop at separator (only after we've found at least one option)
+            if !options.is_empty()
+                && trimmed.chars().all(|c| is_horizontal_rule_char(c) || c == ' ')
+            {
+                break;
+            }
+
+            // Check for numbered option line: "N. text" or "❯ N. text"
+            let stripped = trimmed.trim_start_matches('❯').trim_start();
+            if let Some(digit_end) = stripped.find(|c: char| !c.is_ascii_digit()) {
+                if digit_end > 0 && stripped[digit_end..].starts_with(". ") {
+                    if let Ok(num) = stripped[..digit_end].parse::<u8>() {
+                        let option_text = stripped[digit_end + 2..].trim().to_string();
+                        fingerprint_material.push_str(stripped);
+                        fingerprint_material.push('\n');
+                        options.push((num, option_text));
+                        continue;
+                    }
+                }
+            }
+
+            // Any non-option line above the options — include in fingerprint and stop
+            if !options.is_empty() {
+                fingerprint_material.push_str(trimmed);
+                break;
+            }
+        }
+
+        // Must have at least one option
+        if options.is_empty() {
+            return None;
+        }
+
+        // Find "Yes" option with the lowest number (options are collected bottom-to-top)
+        let yes_option = options.iter()
+            .filter(|(_, text)| text.starts_with("Yes"))
+            .min_by_key(|(num, _)| *num)?;
+
+        // Compute fingerprint from prompt content only. The fingerprint prevents
+        // re-answering the SAME prompt still on screen. It is cleared by the caller
+        // when the prompt disappears, allowing the next prompt (even with identical
+        // text) to be answered.
+        let mut hasher = DefaultHasher::new();
+        fingerprint_material.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+
+        Some(YoloPromptDetection {
+            answer_number: yes_option.0,
+            fingerprint,
+        })
     }
 
     /// Poll for terminal responses that need to be forwarded to the PTY.
