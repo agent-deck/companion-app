@@ -34,14 +34,18 @@ pub fn compact_text(s: &str) -> String {
         }
 
         // " tokens" removed unless at end of string
-        if bytes[i] == b' ' && i + 7 <= len && &s[i..i + 7] == " tokens" && i + 7 < len {
+        if bytes[i] == b' '
+            && i + 7 <= len
+            && bytes[i + 1..i + 7] == *b"tokens"
+            && i + 7 < len
+        {
             i += 7;
             continue;
         }
         // " token" (not followed by 's') removed unless at end
         if bytes[i] == b' '
             && i + 6 <= len
-            && &s[i..i + 6] == " token"
+            && bytes[i + 1..i + 6] == *b"token"
             && (i + 6 >= len || bytes[i + 6] != b's')
             && i + 6 < len
         {
@@ -49,13 +53,13 @@ pub fn compact_text(s: &str) -> String {
             continue;
         }
         // "tokens" at start or after non-space, removed unless at end
-        if i + 6 <= len && &s[i..i + 6] == "tokens" && i + 6 < len {
+        if i + 6 <= len && bytes[i..i + 6] == *b"tokens" && i + 6 < len {
             i += 6;
             continue;
         }
         // "token" (not followed by 's'), removed unless at end
         if i + 5 <= len
-            && &s[i..i + 5] == "token"
+            && bytes[i..i + 5] == *b"token"
             && (i + 5 >= len || bytes[i + 5] != b's')
             && i + 5 < len
         {
@@ -176,5 +180,14 @@ mod tests {
     fn test_compact_no_double_strip() {
         // Make sure we don't eat "tokens" when it's an actual word at the end
         assert_eq!(compact_text("count tokens"), "count\u{2009}tokens");
+    }
+
+    #[test]
+    fn test_compact_multibyte_no_panic() {
+        // Ellipsis (U+2026, 3 bytes) near "token"-length offsets must not
+        // cause a panic from slicing inside a multi-byte character.
+        assert_eq!(compact_text("Proofing…"), "Proofing…");
+        assert_eq!(compact_text("Pro…ofing"), "Pro…ofing");
+        assert_eq!(compact_text("日本語テスト"), "日本語テスト");
     }
 }
